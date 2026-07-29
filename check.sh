@@ -1,0 +1,1 @@
+compute-sanitizer ./build/micro-vllm
