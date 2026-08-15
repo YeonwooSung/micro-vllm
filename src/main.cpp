@@ -109,7 +109,8 @@ int loadWeights(Weights &weights) {
     // probably for some additonal info when necessary.
     // Every value is a JSON containing three keys - dtype, shape and offsets. dtype says what data type the tensor is stored in.
     // shape says the dimensions of a tensor and offsets say where the tensor is stored, within the tensors data section.
-    // Every shape is a list of ints of unknown length and every offsets value is a vector of exactly two ints. First element says where the tensor begins and last element says where the tensor ends.
+    // Every shape is a list of ints of unknown length and every offsets value is a vector of exactly two ints.
+    // First element says where the tensor begins and last element says where the tensor ends.
     std::unordered_map<std::string, uint64_t> offsets;
     json header_json = json::parse(header);
     uint64_t max_offset = 0;
@@ -575,7 +576,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // allocator for pagedattn
+    // Allocator for pagedattn
+    // To prevent the memory fragmentation, we allocate a single large buffer for K and V cache and then manage it ourselves.
     __nv_bfloat16 *kv_cache;
     cudaMalloc(&kv_cache, KV_CACHE_SIZE_BYTES);
     std::vector<int> free_blocks(NUM_BLOCKS);
