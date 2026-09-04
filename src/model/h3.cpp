@@ -107,10 +107,49 @@ public:
         const int64_t fc1_b = static_cast<int64_t>(ffn) * 2 * hidden * 2;
         const int64_t fc2_b = static_cast<int64_t>(hidden) * ffn * 2;
         const int64_t expect = qkv_b + out_b + fc1_b + fc2_b;
-        const int tokens = 4;
+
+        const int req_w = hp.width > 0 ? hp.width : cfg_.h3.default_width;
+        const int req_h = hp.height > 0 ? hp.height : cfg_.h3.default_height;
+        const int req_f = hp.frames > 0 ? hp.frames : cfg_.h3.default_frames;
+        H3VaeGeom vg = h3_vae_geom(req_w, req_h, req_f, cfg_.h3.vae_spatial, cfg_.h3.vae_latent_ch);
+        const int C = vg.latent_ch > 0 ? vg.latent_ch : 24;
+        const int nlat = std::max(vg.latent_t * vg.latent_h * vg.latent_w, 1);
+        const int64_t zN = static_cast<int64_t>(C) * nlat;
+        std::vector<float> z(static_cast<size_t>(zN), 0.f);
+        uint64_t rng = hp.seed ? hp.seed : 42ull;
+        for (int64_t i = 0; i < zN; ++i)
+            z[static_cast<size_t>(i)] = gauss01(rng);
+
+        const int cap = 256;
+        int step = (nlat + cap - 1) / cap;
+        if (step < 1)
+            step = 1;
+        const int tokens = std::max((nlat + step - 1) / step, 1);
         std::vector<float> latent(static_cast<size_t>(tokens) * hidden, 0.f);
-        for (size_t i = 0; i < latent.size(); ++i)
-            latent[i] = 0.02f * static_cast<float>(static_cast<int>(i % 17) - 8);
+        auto pack_z = [&]() {
+            for (int i = 0; i < tokens; ++i) {
+                const int idx = std::min(i * step, nlat - 1);
+                float *tok = latent.data() + static_cast<size_t>(i) * hidden;
+                for (int d = 0; d < hidden; ++d)
+                    tok[d] = z[static_cast<size_t>(d % C) * nlat + idx];
+            }
+        };
+        auto unpack_z = [&]() {
+            for (int i = 0; i < tokens; ++i) {
+                const int idx = std::min(i * step, nlat - 1);
+                const float *tok = latent.data() + static_cast<size_t>(i) * hidden;
+                for (int c = 0; c < C; ++c) {
+                    float acc = 0.f;
+                    int n = 0;
+                    for (int d = c; d < hidden; d += C) {
+                        acc += tok[d];
+                        ++n;
+                    }
+                    z[static_cast<size_t>(c) * nlat + idx] = n > 0 ? acc / static_cast<float>(n) : 0.f;
+                }
+            }
+        };
+        pack_z();
 
         int streamed = 0;
         int computed = 0;
@@ -137,19 +176,12 @@ public:
                 blocks_.release(b);
             }
         }
+        if (computed)
+            unpack_z();
         float checksum = 0.f;
         for (float v : latent)
             checksum += v * v;
 
-        const int req_w = hp.width > 0 ? hp.width : cfg_.h3.default_width;
-        const int req_h = hp.height > 0 ? hp.height : cfg_.h3.default_height;
-        const int req_f = hp.frames > 0 ? hp.frames : cfg_.h3.default_frames;
-        H3VaeGeom vg = h3_vae_geom(req_w, req_h, req_f, cfg_.h3.vae_spatial, cfg_.h3.vae_latent_ch);
-        const int64_t zN = static_cast<int64_t>(vg.latent_ch) * vg.latent_t * vg.latent_h * vg.latent_w;
-        std::vector<float> z(static_cast<size_t>(zN > 0 ? zN : 1), 0.f);
-        uint64_t rng = hp.seed ? hp.seed : 42ull;
-        for (int64_t i = 0; i < zN; ++i)
-            z[static_cast<size_t>(i)] = gauss01(rng);
         std::vector<float> rgb(static_cast<size_t>(vg.frames) * vg.height * vg.width * 3, 0.f);
         vae_.decode(z.data(), vg, rgb.data());
         vae_.geom = vg;
@@ -210,9 +242,10 @@ public:
             err.clear();
         }
         out.note = computed ? std::string("checkpoint: ") + dit_tag +
-                                  " DiT residual on streamed BF16 matrices"
+                                  " DiT residual on VAE latent tokens"
                             : "dry-run: DiT blocks streamed from SSD (2-slot)";
         out.note += vae_.from_checkpoint ? " vae=real" : " vae=synth";
+        out.note += " latent_tokens=" + std::to_string(tokens);
         err.clear();
         return Status::Ok;
     }

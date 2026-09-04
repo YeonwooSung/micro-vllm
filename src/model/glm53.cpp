@@ -141,11 +141,32 @@ public:
         }
         int pos = 0;
 
+        std::vector<float> vis;
+        int nvis = 0;
+        int vis_i = 0;
+        const int vod = !vit_proj_.empty() ? vit_proj_.O : H;
+        if (gp.image_rgb && gp.image_w > 0 && gp.image_h > 0 && gp.image_token >= 0 &&
+            (!vit_patch_.empty() || cfg_.vision.layers > 0 || cfg_.vision.hidden > 0)) {
+            const int cap = 64;
+            vis.assign(static_cast<size_t>(cap) * std::max(vod, 1), 0.f);
+            nvis = glm_vit_embed(gp.image_rgb, gp.image_w, gp.image_h, cfg_.vision,
+                                 vit_patch_.empty() ? nullptr : &vit_patch_,
+                                 vit_proj_.empty() ? nullptr : &vit_proj_, vis.data(), cap);
+        }
+
         auto embed_tok = [&](int id) {
             int tid = id;
             if (tid < 0 || tid >= cfg_.vocab)
                 tid = 0;
-            std::memcpy(h, embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
+            if (nvis > 0 && id == gp.image_token) {
+                const float *src = vis.data() + static_cast<size_t>(vis_i % nvis) * vod;
+                std::memcpy(h, src, static_cast<size_t>(std::min(H, vod)) * sizeof(float));
+                if (H > vod)
+                    std::memset(h + vod, 0, static_cast<size_t>(H - vod) * sizeof(float));
+                ++vis_i;
+            } else {
+                std::memcpy(h, embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
+            }
             for (int m = 1; m < M; ++m)
                 std::memset(streams.data() + static_cast<size_t>(m) * H, 0, H * sizeof(float));
         };
@@ -162,8 +183,10 @@ public:
             if (!full && cfg_.kda.heads > 0) {
                 kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l],
                          &wfb_[l], wdt_[l].data(), static_cast<int>(wdt_[l].size()),
-                         alog_[l].data(), &wg_[l], &wo_[l],
-                         on_[l].empty() ? nullptr : on_[l].data(),
+                         alog_[l].data(), &wg_[l],
+                         (l < static_cast<int>(wgb_.size()) && !wgb_[l].empty()) ? &wgb_[l]
+                                                                                : nullptr,
+                         &wo_[l], on_[l].empty() ? nullptr : on_[l].data(),
                          S[l].data(), y.data(), cfg_.rms_eps,
                          l < static_cast<int>(conv_q_.size()) && !conv_q_[l].empty()
                              ? conv_q_[l].data()
@@ -259,10 +282,20 @@ public:
             std::vector<float> act(static_cast<size_t>(C) * M * H, 0.f);
             for (int c = 0; c < C; ++c) {
                 int tid = prompt[i + static_cast<size_t>(c)];
+                const int raw = tid;
                 if (tid < 0 || tid >= cfg_.vocab)
                     tid = 0;
-                std::memcpy(act.data() + static_cast<size_t>(c) * M * H,
-                            embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
+                float *dst = act.data() + static_cast<size_t>(c) * M * H;
+                if (nvis > 0 && raw == gp.image_token) {
+                    const float *src = vis.data() + static_cast<size_t>(vis_i % nvis) * vod;
+                    std::memcpy(dst, src, static_cast<size_t>(std::min(H, vod)) * sizeof(float));
+                    if (H > vod)
+                        std::memset(dst + vod, 0, static_cast<size_t>(H - vod) * sizeof(float));
+                    ++vis_i;
+                } else {
+                    std::memcpy(dst, embed_.data() + static_cast<size_t>(tid) * H,
+                                H * sizeof(float));
+                }
             }
             for (int l = 0; l < L; ++l) {
                 for (int c = 0; c < C; ++c) {
@@ -303,18 +336,12 @@ public:
 
         out.tokens.clear();
         out.prompt_tokens = static_cast<int>(prompt.size());
+        uint64_t rng = gp.seed ? gp.seed : 1ull;
         for (int ntok = 0; ntok < gp.max_new_tokens; ++ntok) {
             std::vector<float> n(H), logits(cfg_.vocab);
             quant::rmsnorm(h, norm_.data(), n.data(), H, cfg_.rms_eps);
             lm_head_.gemm(logits.data(), n.data(), 1);
-            int next = 0;
-            float best = logits[0];
-            for (int i = 1; i < cfg_.vocab; ++i) {
-                if (logits[i] > best) {
-                    best = logits[i];
-                    next = i;
-                }
-            }
+            int next = sample_token(logits.data(), cfg_.vocab, gp.temperature, gp.top_p, &rng);
             out.tokens.push_back(next);
             if (is_stop_token(next, cfg_, gp.eos))
                 break;
@@ -562,6 +589,8 @@ private:
                         mla_g_[i], hbits, err);
             overlay_mat(files, P + "layers." + std::to_string(i) + ".self_attn.g_a_proj.weight",
                         wg_[i], bits, err);
+            overlay_mat(files, P + "layers." + std::to_string(i) + ".self_attn.g_b_proj.weight",
+                        wgb_[i], bits, err);
             overlay_mat(files, P + "layers." + std::to_string(i) + ".self_attn.f_a_proj.weight",
                         wfa_[i], bits, err);
             overlay_mat(files, P + "layers." + std::to_string(i) + ".self_attn.f_b_proj.weight",
@@ -618,6 +647,22 @@ private:
                             P + "layers." + std::to_string(i) +
                                 ".mlp.shared_experts.down_proj.weight",
                             shared_down_[i], bits, err);
+            }
+        }
+        {
+            const char *pnames[] = {"model.visual.patch_embed.proj.weight",
+                                    "model.vision.patch_embed.proj.weight",
+                                    "visual.patch_embed.proj.weight", nullptr};
+            for (int n = 0; pnames[n]; ++n) {
+                if (overlay_mat(files, pnames[n], vit_patch_, bits, err) == Status::Ok)
+                    break;
+            }
+            const char *mnames[] = {"model.visual.merger.proj.weight",
+                                    "model.vision.merger.proj.weight",
+                                    "visual.merger.proj.weight", nullptr};
+            for (int n = 0; mnames[n]; ++n) {
+                if (overlay_mat(files, mnames[n], vit_proj_, bits, err) == Status::Ok)
+                    break;
             }
         }
         err.clear();
@@ -830,6 +875,7 @@ private:
         const int mbits = rt_.mla_bits;
         const int nh = cfg_.mla.n_heads;
         const int qk = cfg_.mla.qk_nope;
+        const int qr = cfg_.mla.qk_rope;
         const int vh = cfg_.mla.v_head;
         const int ql = cfg_.mla.q_lora;
         const int kv = cfg_.mla.kv_lora;
@@ -843,6 +889,7 @@ private:
         wv_.resize(L);
         wo_.resize(L);
         wg_.resize(L);
+        wgb_.resize(L);
         wfa_.resize(L);
         wfb_.resize(L);
         wdt_.resize(L);
@@ -887,7 +934,12 @@ private:
             wk_[l] = qmat_xavier(std::max(std::max(P, cfg_.mla.kv_lora), 1), H, 210 + l, bits);
             wv_[l] = qmat_xavier(std::max(P, 1), H, 220 + l, bits);
             wo_[l] = qmat_xavier(H, std::max(P, H), 230 + l, bits);
-            wg_[l] = qmat_xavier(std::max(P, 1), H, 240 + l, bits);
+            if (!cfg_.kda.full_rank_gate) {
+                wg_[l] = qmat_xavier(std::max(cfg_.kda.head_dim, 1), H, 240 + l, bits);
+                wgb_[l] = qmat_xavier(std::max(P, 1), std::max(cfg_.kda.head_dim, 1), 245 + l, bits);
+            } else {
+                wg_[l] = qmat_xavier(std::max(P, 1), H, 240 + l, bits);
+            }
             wfa_[l] = qmat_xavier(cfg_.kda.head_dim, H, 250 + l, bits);
             wfb_[l] = qmat_xavier(P, cfg_.kda.head_dim, 260 + l, bits);
             wdt_[l].assign(P, 0.f);
@@ -906,8 +958,8 @@ private:
             const bool full = (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
             if (full && ql > 0 && kv > 0 && qk > 0) {
                 mla_qa_[l] = qmat_xavier(ql, H, 400 + l, mbits);
-                mla_qb_[l] = qmat_xavier(nh * qk, ql, 410 + l, mbits);
-                mla_kva_[l] = qmat_xavier(kv, H, 420 + l, mbits);
+                mla_qb_[l] = qmat_xavier(nh * (qk + qr), ql, 410 + l, mbits);
+                mla_kva_[l] = qmat_xavier(kv + qr, H, 420 + l, mbits);
                 mla_kt_[l] = qmat_xavier(nh * kv, qk, 430 + l, mbits);
                 mla_v_[l] = qmat_xavier(nh * vh, kv, 440 + l, mbits);
                 mla_o_[l] = qmat_xavier(H, nh * vh, 450 + l, hbits);
@@ -916,6 +968,13 @@ private:
                 ones(mla_qa_ln_[l], ql);
                 ones(mla_kva_ln_[l], kv);
             }
+        }
+        if (cfg_.vision.layers > 0 || cfg_.vision.hidden > 0) {
+            const int vp = cfg_.vision.patch > 0 ? cfg_.vision.patch : 14;
+            const int vh = cfg_.vision.hidden > 0 ? cfg_.vision.hidden : 32;
+            const int oh = cfg_.vision.out_hidden > 0 ? cfg_.vision.out_hidden : H;
+            vit_patch_ = qmat_xavier(vh, 3 * vp * vp, 500, bits);
+            vit_proj_ = qmat_xavier(oh, vh, 501, bits);
         }
     }
 
@@ -929,8 +988,9 @@ private:
     quant::QuantMat lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wdt_, alog_, on_, router_, router_bias_,
         mhc_alpha_, conv_q_, conv_k_, conv_v_;
-    std::vector<quant::QuantMat> wq_, wk_, wv_, wo_, wg_, wfa_, wfb_, wb_, mlp_gate_, mlp_up_,
+    std::vector<quant::QuantMat> wq_, wk_, wv_, wo_, wg_, wgb_, wfa_, wfb_, wb_, mlp_gate_, mlp_up_,
         mlp_down_, shared_gate_, shared_up_, shared_down_;
+    quant::QuantMat vit_patch_, vit_proj_;
     std::vector<quant::QuantMat> mla_qa_, mla_qb_, mla_kva_, mla_kt_, mla_v_, mla_o_, mla_g_;
     std::vector<std::vector<float>> mla_qa_ln_, mla_kva_ln_;
     std::vector<quant::QuantMat> dsa_wq_, dsa_wk_, dsa_wp_, dsa_kg_;

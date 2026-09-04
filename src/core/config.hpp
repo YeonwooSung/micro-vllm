@@ -36,6 +36,7 @@ struct MlaConfig {
     int v_head = 0;
     bool nope = true;
     bool output_gate = true;
+    float rope_theta = 10000.f;
 };
 
 struct AttnResConfig {

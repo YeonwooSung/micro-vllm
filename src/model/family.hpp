@@ -16,10 +16,15 @@ struct GenParams {
     int max_new_tokens = 32;
     float temperature = 0.f;
     float top_p = 1.f;
+    uint64_t seed = 1;
     int eos = -1;
     bool apply_template = true;
     bool think = false;
     std::string reasoning_effort;
+    const float *image_rgb = nullptr; // HWC [0,1]; GLM ViT when image_token matches
+    int image_w = 0;
+    int image_h = 0;
+    int image_token = -1;
 };
 
 struct GenResult {
@@ -81,7 +86,8 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda,
               const quant::QuantMat *w_q, const quant::QuantMat *w_k, const quant::QuantMat *w_v,
               const quant::QuantMat *w_b, const quant::QuantMat *w_fa, const quant::QuantMat *w_fb,
               const float *dt_bias, int dt_n, const float *a_log, const quant::QuantMat *w_g,
-              const quant::QuantMat *w_o, const float *out_norm, float *S, float *y, float eps,
+              const quant::QuantMat *w_gb, const quant::QuantMat *w_o, const float *out_norm,
+              float *S, float *y, float eps,
               const float *conv_q = nullptr, const float *conv_k = nullptr,
               const float *conv_v = nullptr, float *win_q = nullptr, float *win_k = nullptr,
               float *win_v = nullptr);
@@ -89,11 +95,12 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda,
 // Causal depthwise conv: shift window, write x[p] into the last tap, then x[p] <- taps · window.
 void kda_short_conv(float *x, const float *taps, float *window, int channels, int k);
 
-// Absorbed NoPE MLA. Cache stride is kv_lora+qk_rope (L then raw R).
+// Absorbed MLA. Cache stride is kv_lora+qk_rope (L then R).
 // score_j = (W_k^T q_nope) · c_j + q_rot · R_j ;  out = W_v (Σ a_j c_j).
+// When qk_rope>0 and rope_theta>0, RoPE is applied to q_rot and cached k_pe.
 // w_kt is [n_heads * kv_lora, qk_nope], w_v is [n_heads * v_head, kv_lora].
-// w_g is optional (K3 output gate). Missing absorbed KV (kva/kt/v/cache) falls back
-// to a dense Q/O stand-in.
+// w_kva is [kv_lora+qk_rope, hidden]. w_g is optional (K3 output gate).
+// Missing absorbed KV (kva/kt/v/cache) falls back to a dense Q/O stand-in.
 void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::QuantMat *w_qa,
               const float *qa_ln, const quant::QuantMat *w_qb, const quant::QuantMat *w_kva,
               const float *kva_ln, const quant::QuantMat *w_kt, const quant::QuantMat *w_v,
@@ -126,6 +133,17 @@ void mhc_mix(float *streams, int hidden, int mult, const float *alpha, int iters
 // Top-k on `choice`. Mix weights come from `mix` (official: unbiased σ) or
 // from `choice` when mix is null. Selected weights are clipped at 0 and L1-normalized.
 int moe_topk(const float *choice, int n, int k, int *idx, float *w, const float *mix = nullptr);
+
+// temperature<=0 is greedy argmax. top_p in (0,1) is nucleus. rng is splitmix state.
+int sample_token(const float *logits, int vocab, float temperature, float top_p, uint64_t *rng);
+
+void apply_rope(float *x, int n, int pos, float theta);
+
+// GLM ViT: RGB HWC [0,1] -> up to out_cap tokens. Stride is proj->O, or
+// vision.out_hidden, or patch->O. Returns token count (0 if skipped).
+int glm_vit_embed(const float *rgb, int width, int height, const VisionConfig &v,
+                  const quant::QuantMat *patch, const quant::QuantMat *proj, float *out,
+                  int out_cap);
 
 // Unique expert ids from C tokens × topk, sorted. Returns count.
 int moe_union_ids(const int *idx, int n_tok, int topk, int *out, int out_cap);

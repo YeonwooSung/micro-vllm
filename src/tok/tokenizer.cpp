@@ -833,13 +833,19 @@ Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msg
     const int cl = id_of("<|close|>");
     const int sep = id_of("<|sep|>");
     const int eom = id_of("<|end_of_msg|>");
-    auto open_tag = [&](const char *tag, const char *role) {
+    auto open_tag = [&](const char *tag, const char *role, const char *name = nullptr) {
         ids.push_back(op);
         xtml_append_encode(*this, tag, ids);
         if (role) {
             xtml_append_encode(*this, " role", ids);
             xtml_append_encode(*this, "=\"", ids);
             xtml_append_encode(*this, role, ids);
+            xtml_append_encode(*this, "\"", ids);
+        }
+        if (name && *name) {
+            xtml_append_encode(*this, " name", ids);
+            xtml_append_encode(*this, "=\"", ids);
+            xtml_append_encode(*this, name, ids);
             xtml_append_encode(*this, "\"", ids);
         }
         ids.push_back(sep);
@@ -852,6 +858,21 @@ Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msg
 
     for (const auto &m : msgs) {
         std::string role = m.role == "developer" ? "system" : m.role;
+        const char *tname = m.tool_name.empty() ? nullptr : m.tool_name.c_str();
+        if (role == "tool" || role == "tool_result") {
+            open_tag("tool_result", nullptr, tname);
+            xtml_append_encode(*this, m.content, ids);
+            close_tag("tool_result");
+            ids.push_back(eom);
+            continue;
+        }
+        if (role == "tool_call") {
+            open_tag("tool_call", nullptr, tname);
+            xtml_append_encode(*this, m.content, ids);
+            close_tag("tool_call");
+            ids.push_back(eom);
+            continue;
+        }
         if (role == "assistant") {
             open_tag("message", "assistant");
             if (!m.reasoning.empty()) {
@@ -859,9 +880,15 @@ Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msg
                 xtml_append_encode(*this, m.reasoning, ids);
                 close_tag("think");
             }
-            open_tag("response", nullptr);
-            xtml_append_encode(*this, m.content, ids);
-            close_tag("response");
+            if (tname) {
+                open_tag("tool_call", nullptr, tname);
+                xtml_append_encode(*this, m.content, ids);
+                close_tag("tool_call");
+            } else {
+                open_tag("response", nullptr);
+                xtml_append_encode(*this, m.content, ids);
+                close_tag("response");
+            }
             close_tag("message");
             ids.push_back(eom);
             continue;
@@ -879,6 +906,20 @@ Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msg
 std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> &msgs,
                                   bool think, const std::string &effort) const {
     if (family == Family::Glm53) {
+        auto expand_images = [](std::string s) {
+            const std::string needle = "<image>";
+            const std::string wrap = "<|begin_of_image|><image><|end_of_image|>";
+            size_t pos = 0;
+            while ((pos = s.find(needle, pos)) != std::string::npos) {
+                if (pos >= 18 && s.compare(pos - 18, 18, "<|begin_of_image|>") == 0) {
+                    pos += needle.size();
+                    continue;
+                }
+                s.replace(pos, needle.size(), wrap);
+                pos += wrap.size();
+            }
+            return s;
+        };
         std::string p = "[gMASK]<sop>";
         if (think) {
             std::string label = "Max";
@@ -892,7 +933,7 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
             if (m.role == "system")
                 p += "<|system|>" + m.content;
             else if (m.role == "user")
-                p += "<|user|>" + m.content;
+                p += "<|user|>" + expand_images(m.content);
             else if (m.role == "assistant")
                 p += "<|assistant|><think></think>" + m.content;
             else if (m.role == "tool")
@@ -919,8 +960,38 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
                 p += tag;
                 p += "<|sep|>";
             };
+            auto open_named = [&](const char *tag, const char *role, const char *name) {
+                p += "<|open|>";
+                p += tag;
+                if (role) {
+                    p += " role=\"";
+                    p += role;
+                    p += "\"";
+                }
+                if (name && *name) {
+                    p += " name=\"";
+                    p += name;
+                    p += "\"";
+                }
+                p += "<|sep|>";
+            };
             for (const auto &m : msgs) {
                 std::string role = m.role == "developer" ? "system" : m.role;
+                const char *tname = m.tool_name.empty() ? nullptr : m.tool_name.c_str();
+                if (role == "tool" || role == "tool_result") {
+                    open_named("tool_result", nullptr, tname);
+                    p += m.content;
+                    close("tool_result");
+                    p += "<|end_of_msg|>";
+                    continue;
+                }
+                if (role == "tool_call") {
+                    open_named("tool_call", nullptr, tname);
+                    p += m.content;
+                    close("tool_call");
+                    p += "<|end_of_msg|>";
+                    continue;
+                }
                 if (role == "assistant") {
                     open("message", "assistant");
                     if (!m.reasoning.empty()) {
@@ -928,9 +999,15 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
                         p += m.reasoning;
                         close("think");
                     }
-                    open("response", nullptr);
-                    p += m.content;
-                    close("response");
+                    if (tname) {
+                        open_named("tool_call", nullptr, tname);
+                        p += m.content;
+                        close("tool_call");
+                    } else {
+                        open("response", nullptr);
+                        p += m.content;
+                        close("response");
+                    }
                     close("message");
                     p += "<|end_of_msg|>";
                     continue;

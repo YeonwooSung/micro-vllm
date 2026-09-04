@@ -45,8 +45,9 @@ void kda_short_conv(float *x, const float *taps, float *window, int channels, in
 void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
               const quant::QuantMat *w_k, const quant::QuantMat *w_v, const quant::QuantMat *w_b,
               const quant::QuantMat *w_fa, const quant::QuantMat *w_fb, const float *dt_bias,
-              int dt_n, const float *a_log, const quant::QuantMat *w_g, const quant::QuantMat *w_o,
-              const float *out_norm, float *S, float *y, float eps, const float *conv_q,
+              int dt_n, const float *a_log, const quant::QuantMat *w_g,
+              const quant::QuantMat *w_gb, const quant::QuantMat *w_o, const float *out_norm,
+              float *S, float *y, float eps, const float *conv_q,
               const float *conv_k, const float *conv_v, float *win_q, float *win_k, float *win_v) {
     const int H = kda.heads;
     const int D = kda.head_dim;
@@ -58,7 +59,7 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     const int kn = orows(w_k, P);
     const int vn = orows(w_v, P);
     const int bn = (w_b && !w_b->empty()) ? w_b->O : H;
-    const int gn = orows(w_g, P);
+    const int gn = (w_gb && !w_gb->empty()) ? orows(w_gb, P) : orows(w_g, P);
     const int zn = orows(w_fb, P);
     const int on = (w_o && !w_o->empty() && w_o->I > P) ? w_o->I : P;
     std::vector<float> q(qn, 0.f), k(kn, 0.f), v(vn, 0.f), b(bn, 0.f), z(zn, 0.f), g(gn, 0.f),
@@ -110,10 +111,15 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
         w_b->gemm(b.data(), x, 1);
     else
         std::fill(b.begin(), b.end(), 0.f);
-    if (w_g && !w_g->empty())
+    if (w_g && !w_g->empty() && w_gb && !w_gb->empty()) {
+        std::vector<float> ga(static_cast<size_t>(std::max(w_g->O, 1)), 0.f);
+        w_g->gemm(ga.data(), x, 1);
+        w_gb->gemm(g.data(), ga.data(), 1);
+    } else if (w_g && !w_g->empty()) {
         w_g->gemm(g.data(), x, 1);
-    else
+    } else {
         std::fill(g.begin(), g.end(), 0.f);
+    }
 
     const float gmin = kda.gate_lower_bound;
     for (int h = 0; h < H; ++h) {
@@ -287,6 +293,85 @@ int moe_topk(const float *choice, int n, int k, int *idx, float *w, const float 
             w[i] = 1.f / static_cast<float>(k);
     }
     return k;
+}
+
+void apply_rope(float *x, int n, int pos, float theta) {
+    if (!x || n < 2 || theta <= 0.f)
+        return;
+    const int pairs = n / 2;
+    for (int i = 0; i < pairs; ++i) {
+        float freq = std::pow(theta, -2.f * static_cast<float>(i) / static_cast<float>(n));
+        float ang = static_cast<float>(pos) * freq;
+        float c = std::cos(ang), s = std::sin(ang);
+        float a = x[2 * i], b = x[2 * i + 1];
+        x[2 * i] = a * c - b * s;
+        x[2 * i + 1] = a * s + b * c;
+    }
+}
+
+int sample_token(const float *logits, int vocab, float temperature, float top_p, uint64_t *rng) {
+    if (!logits || vocab <= 0)
+        return 0;
+    if (temperature <= 0.f) {
+        int best = 0;
+        for (int i = 1; i < vocab; ++i)
+            if (logits[i] > logits[best])
+                best = i;
+        return best;
+    }
+    std::vector<float> p(static_cast<size_t>(vocab));
+    float m = logits[0];
+    for (int i = 1; i < vocab; ++i)
+        if (logits[i] > m)
+            m = logits[i];
+    float sum = 0.f;
+    for (int i = 0; i < vocab; ++i) {
+        p[static_cast<size_t>(i)] = std::exp((logits[i] - m) / temperature);
+        sum += p[static_cast<size_t>(i)];
+    }
+    if (!(sum > 0.f))
+        return 0;
+    for (int i = 0; i < vocab; ++i)
+        p[static_cast<size_t>(i)] /= sum;
+    if (top_p > 0.f && top_p < 1.f) {
+        std::vector<int> ord(static_cast<size_t>(vocab));
+        for (int i = 0; i < vocab; ++i)
+            ord[static_cast<size_t>(i)] = i;
+        std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+            return p[static_cast<size_t>(a)] > p[static_cast<size_t>(b)];
+        });
+        float acc = 0.f;
+        for (int i = 0; i < vocab; ++i) {
+            acc += p[static_cast<size_t>(ord[static_cast<size_t>(i)])];
+            if (acc >= top_p) {
+                for (int j = i + 1; j < vocab; ++j)
+                    p[static_cast<size_t>(ord[static_cast<size_t>(j)])] = 0.f;
+                break;
+            }
+        }
+        float s2 = 0.f;
+        for (int i = 0; i < vocab; ++i)
+            s2 += p[static_cast<size_t>(i)];
+        if (s2 > 0.f) {
+            for (int i = 0; i < vocab; ++i)
+                p[static_cast<size_t>(i)] /= s2;
+        }
+    }
+    uint64_t s = rng ? *rng : 1ull;
+    s += 0x9E3779B97F4A7C15ull;
+    s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ull;
+    s = (s ^ (s >> 27)) * 0x94D049BB133111EBull;
+    s ^= s >> 31;
+    if (rng)
+        *rng = s;
+    float u = static_cast<float>((s >> 11) * (1.0 / 9007199254740992.0));
+    float c = 0.f;
+    for (int i = 0; i < vocab; ++i) {
+        c += p[static_cast<size_t>(i)];
+        if (u <= c)
+            return i;
+    }
+    return vocab - 1;
 }
 
 int moe_union_ids(const int *idx, int n_tok, int topk, int *out, int out_cap) {
@@ -588,6 +673,12 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
     w_kva->gemm(crow, x, 1);
     if (kva_ln)
         quant::rmsnorm(crow, kva_ln, crow, L, eps);
+    if (R > 0 && mla.rope_theta > 0.f)
+        apply_rope(crow + L, R, pos, mla.rope_theta);
+    if (R > 0 && mla.rope_theta > 0.f) {
+        for (int h = 0; h < H; ++h)
+            apply_rope(q.data() + static_cast<size_t>(h) * QH + QK, R, pos, mla.rope_theta);
+    }
 
     std::vector<int> ts;
     if (selected && n_sel > 0) {
@@ -641,6 +732,99 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
         w_o->gemm(y, ctx.data(), 1);
     else
         std::memset(y, 0, static_cast<size_t>(hidden) * sizeof(float));
+}
+
+int glm_vit_embed(const float *rgb, int width, int height, const VisionConfig &v,
+                  const quant::QuantMat *patch, const quant::QuantMat *proj, float *out,
+                  int out_cap) {
+    if (!rgb || !out || out_cap <= 0 || width <= 0 || height <= 0)
+        return 0;
+    const int P = v.patch > 0 ? v.patch : 14;
+    const int isz = v.image_size > 0 ? v.image_size : std::max(width, P);
+    const int merge = v.merge > 0 ? v.merge : 1;
+    const int gh = std::max(isz / P, 1);
+    const int gw = std::max(isz / P, 1);
+    const int Vh = (patch && !patch->empty()) ? patch->O : (v.hidden > 0 ? v.hidden : 32);
+    const int pin = 3 * P * P;
+    std::vector<float> patches(static_cast<size_t>(gh) * gw * Vh, 0.f);
+    std::vector<float> raw(static_cast<size_t>(pin), 0.f);
+    for (int py = 0; py < gh; ++py) {
+        for (int px = 0; px < gw; ++px) {
+            for (int dy = 0; dy < P; ++dy) {
+                int sy = (py * P + dy) * height / std::max(isz, 1);
+                if (sy >= height)
+                    sy = height - 1;
+                for (int dx = 0; dx < P; ++dx) {
+                    int sx = (px * P + dx) * width / std::max(isz, 1);
+                    if (sx >= width)
+                        sx = width - 1;
+                    const float *pix = rgb + (static_cast<size_t>(sy) * width + sx) * 3;
+                    const int o = (dy * P + dx) * 3;
+                    raw[static_cast<size_t>(o)] = pix[0];
+                    raw[static_cast<size_t>(o + 1)] = pix[1];
+                    raw[static_cast<size_t>(o + 2)] = pix[2];
+                }
+            }
+            float *dst = patches.data() + static_cast<size_t>(py * gw + px) * Vh;
+            if (patch && !patch->empty() && patch->I == pin)
+                patch->gemm(dst, raw.data(), 1);
+            else {
+                float m = 0.f;
+                for (int i = 0; i < pin; ++i)
+                    m += raw[static_cast<size_t>(i)];
+                m /= static_cast<float>(pin);
+                for (int i = 0; i < Vh; ++i)
+                    dst[i] = m;
+            }
+        }
+    }
+    std::vector<float> merged = patches;
+    int nh = gh, nw = gw;
+    if (merge > 1) {
+        const int mh = std::max(gh / merge, 1);
+        const int mw = std::max(gw / merge, 1);
+        merged.assign(static_cast<size_t>(mh) * mw * Vh, 0.f);
+        for (int y = 0; y < mh; ++y) {
+            for (int x = 0; x < mw; ++x) {
+                float *d = merged.data() + static_cast<size_t>(y * mw + x) * Vh;
+                int cnt = 0;
+                for (int dy = 0; dy < merge; ++dy) {
+                    for (int dx = 0; dx < merge; ++dx) {
+                        const int sy = y * merge + dy;
+                        const int sx = x * merge + dx;
+                        if (sy >= gh || sx >= gw)
+                            continue;
+                        const float *s = patches.data() + static_cast<size_t>(sy * gw + sx) * Vh;
+                        for (int i = 0; i < Vh; ++i)
+                            d[i] += s[i];
+                        ++cnt;
+                    }
+                }
+                if (cnt > 0) {
+                    for (int i = 0; i < Vh; ++i)
+                        d[i] /= static_cast<float>(cnt);
+                }
+            }
+        }
+        nh = mh;
+        nw = mw;
+    }
+    const int ntok = nh * nw;
+    const int take = std::min(ntok, out_cap);
+    const int Od = (proj && !proj->empty()) ? proj->O : (v.out_hidden > 0 ? v.out_hidden : Vh);
+    for (int t = 0; t < take; ++t) {
+        float *dst = out + static_cast<size_t>(t) * Od;
+        const float *src = merged.data() + static_cast<size_t>(t) * Vh;
+        if (proj && !proj->empty())
+            proj->gemm(dst, src, 1);
+        else {
+            const int n = std::min(Od, Vh);
+            std::memcpy(dst, src, static_cast<size_t>(n) * sizeof(float));
+            if (Od > n)
+                std::memset(dst + n, 0, static_cast<size_t>(Od - n) * sizeof(float));
+        }
+    }
+    return take;
 }
 
 } // namespace mvllm

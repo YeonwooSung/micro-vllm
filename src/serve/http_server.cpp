@@ -449,6 +449,11 @@ Status HttpServer::serve_forever(std::string &err) {
                     max_tokens = 0;
                 GenParams gp;
                 gp.max_new_tokens = max_tokens;
+                extract_json_number(body, "temperature", gp.temperature);
+                extract_json_number(body, "top_p", gp.top_p);
+                int seed = 0;
+                if (extract_json_int(body, "seed", seed) && seed >= 0)
+                    gp.seed = static_cast<uint64_t>(seed);
                 extract_json_string(body, "reasoning_effort", gp.reasoning_effort);
                 bool enable_thinking = false;
                 if (path == "/v1/chat/completions" && engine_->family() == Family::Glm53)
@@ -597,6 +602,9 @@ bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &ou
         ChatMessage msg;
         extract_json_string(slice, "role", msg.role);
         extract_json_string(slice, "content", msg.content);
+        if (!extract_json_string(slice, "tool_name", msg.tool_name))
+            extract_json_string(slice, "name", msg.tool_name);
+        extract_json_string(slice, "reasoning", msg.reasoning);
         if (!msg.role.empty())
             out.push_back(msg);
         i = end + 1;
@@ -627,6 +635,29 @@ bool extract_json_int(const std::string &body, const char *key, int &out) {
                     } catch (...) {
                         return false;
                     }
+                }
+            }
+        }
+        pos += 1;
+    }
+    return false;
+}
+
+bool extract_json_number(const std::string &body, const char *key, float &out) {
+    if (!key)
+        return false;
+    std::string pat = std::string("\"") + key + "\"";
+    size_t pos = 0;
+    while ((pos = body.find(pat, pos)) != std::string::npos) {
+        size_t i = skip_ws(body, pos + pat.size());
+        if (i < body.size() && body[i] == ':') {
+            i = skip_ws(body, i + 1);
+            if (i < body.size()) {
+                char *end = nullptr;
+                float v = std::strtof(body.c_str() + i, &end);
+                if (end && end != body.c_str() + i) {
+                    out = v;
+                    return true;
                 }
             }
         }

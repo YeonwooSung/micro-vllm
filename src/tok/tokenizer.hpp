@@ -13,6 +13,7 @@ struct ChatMessage {
     std::string role;
     std::string content;
     std::string reasoning; // past assistant think body; empty = none
+    std::string tool_name; // XTML tool_call / tool_result name=
 };
 
 class Tokenizer {

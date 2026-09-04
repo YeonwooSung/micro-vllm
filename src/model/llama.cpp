@@ -1,6 +1,7 @@
 #include "family.hpp"
 #include "../quant/quant.hpp"
 
+#include <cstdint>
 #include <cstring>
 #include <random>
 #include <sstream>
@@ -76,18 +77,12 @@ public:
             step(t);
         out.tokens.clear();
         out.prompt_tokens = static_cast<int>(prompt.size());
+        uint64_t rng = gp.seed ? gp.seed : 1ull;
         for (int k = 0; k < gp.max_new_tokens; ++k) {
             std::vector<float> logits(cfg_.vocab);
             quant::rmsnorm(h.data(), norm_.data(), n.data(), H, cfg_.rms_eps);
             quant::matmul_f32(logits.data(), n.data(), lm_head_.data(), 1, H, cfg_.vocab);
-            int next = 0;
-            float best = logits[0];
-            for (int i = 1; i < cfg_.vocab; ++i) {
-                if (logits[i] > best) {
-                    best = logits[i];
-                    next = i;
-                }
-            }
+            int next = sample_token(logits.data(), cfg_.vocab, gp.temperature, gp.top_p, &rng);
             out.tokens.push_back(next);
             if (is_stop_token(next, cfg_, gp.eos))
                 break;

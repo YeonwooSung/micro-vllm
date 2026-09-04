@@ -14,6 +14,7 @@
 #include "tok/tokenizer.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -324,6 +325,16 @@ static void test_http_helpers() {
     bool th = false;
     CHECK(extract_json_bool("{\"enable_thinking\":true}", "enable_thinking", th) && th);
     CHECK(extract_json_bool("{\"enable_thinking\":false}", "enable_thinking", th) && !th);
+    float temp = 0.f, topp = 0.f;
+    CHECK(extract_json_number("{\"temperature\":0.7,\"top_p\":0.9}", "temperature", temp) &&
+          std::fabs(temp - 0.7f) < 1e-5f);
+    CHECK(extract_json_number("{\"temperature\":0.7,\"top_p\":0.9}", "top_p", topp) &&
+          std::fabs(topp - 0.9f) < 1e-5f);
+    std::vector<ChatMessage> tools;
+    CHECK(extract_chat_messages(
+        "{\"messages\":[{\"role\":\"tool\",\"content\":\"sunny\",\"name\":\"get_weather\"}]}",
+        tools));
+    CHECK(tools.size() == 1 && tools[0].role == "tool" && tools[0].tool_name == "get_weather");
 }
 
 static std::string gpt2_byte_token(int b) {
@@ -382,6 +393,8 @@ static void test_tokenizer() {
     CHECK(ids.size() == 3 && ids[0] == static_cast<int>('a') && ids[1] == 300 &&
           ids[2] == static_cast<int>('b'));
 
+    std::string glmimg = tk.apply_chat(Family::Glm53, {{"user", "see <image> now"}}, false);
+    CHECK(glmimg.find("<|begin_of_image|><image><|end_of_image|>") != std::string::npos);
     std::string glm = tk.apply_chat(Family::Glm53, {{"user", "hi"}}, false);
     CHECK(glm.find("[gMASK]<sop>") == 0);
     CHECK(glm.find("<|user|>hi") != std::string::npos);
@@ -493,6 +506,24 @@ static void test_k3_xtml() {
     tk.decode(hist, hs);
     CHECK(hs.find("hmm") != std::string::npos);
     CHECK(hs.find("ok") != std::string::npos);
+
+    ChatMessage tc;
+    tc.role = "assistant";
+    tc.tool_name = "get_weather";
+    tc.content = "{\"q\":\"sf\"}";
+    ChatMessage tr;
+    tr.role = "tool";
+    tr.tool_name = "get_weather";
+    tr.content = "sunny";
+    std::string tools = tk.apply_chat(Family::KimiK3, {{"user", "w?"}, tc, tr}, false);
+    CHECK(tools.find("<|open|>tool_call name=\"get_weather\"<|sep|>") != std::string::npos);
+    CHECK(tools.find("<|open|>tool_result name=\"get_weather\"<|sep|>") != std::string::npos);
+    std::vector<int> tids;
+    CHECK(tk.encode_chat(Family::KimiK3, {{"user", "w?"}, tc, tr}, false, tids) == Status::Ok);
+    std::string td;
+    tk.decode(tids, td);
+    CHECK(td.find("get_weather") != std::string::npos);
+    CHECK(td.find("sunny") != std::string::npos);
 }
 
 static void test_tiktoken_model() {
@@ -1109,6 +1140,8 @@ static void test_h3_checkpoint() {
     CHECK(hr.blocks_streamed == 4);
     CHECK(eh.block_hits() + eh.block_misses() > 0);
     CHECK(hr.note.find("CPU DiT") != std::string::npos);
+    CHECK(hr.note.find("latent_tokens=") != std::string::npos);
+    CHECK(hr.note.find("VAE latent") != std::string::npos);
     CHECK(hr.blocks_streamed == 4);
     CHECK(hr.vae_used);
     CHECK(hr.frames == 5);
@@ -1313,7 +1346,7 @@ static void test_kda_short_conv() {
     kda.head_dim = 4;
     std::vector<float> xin(8, 0.1f), S(2 * 4 * 4, 0.f), y(8, 0.f), on(4, 2.f);
     kda_step(xin.data(), 8, kda, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
-             nullptr, nullptr, nullptr, on.data(), S.data(), y.data(), 1e-6f);
+             nullptr, nullptr, nullptr, nullptr, on.data(), S.data(), y.data(), 1e-6f);
     for (float v : y)
         CHECK(std::isfinite(v));
 
@@ -1415,6 +1448,27 @@ static void test_mla_absorb() {
         nr += yr[i] * yr[i];
     }
     CHECK(nr > 0.f);
+    mlar.rope_theta = 10000.f;
+    MlaConfig mlar0 = mlar;
+    mlar0.rope_theta = 0.f;
+    std::vector<float> yr0(hidden), yr1(hidden), ytmp(hidden);
+    std::vector<float> c0(cacher.size(), 0.f), c1(cacher.size(), 0.f);
+    mla_step(x.data(), hidden, mlar0, &qa, qa_ln.data(), &qbr, &kvar, kva_ln.data(), &kt, &vv, &wo,
+             nullptr, c0.data(), 0, ytmp.data(), 1e-5f);
+    mla_step(x.data(), hidden, mlar, &qa, qa_ln.data(), &qbr, &kvar, kva_ln.data(), &kt, &vv, &wo,
+             nullptr, c1.data(), 0, ytmp.data(), 1e-5f);
+    for (int i = 0; i < hidden; ++i)
+        x[i] = ((i % 5) - 2) * 0.15f;
+    mla_step(x.data(), hidden, mlar0, &qa, qa_ln.data(), &qbr, &kvar, kva_ln.data(), &kt, &vv, &wo,
+             nullptr, c0.data(), 1, yr0.data(), 1e-5f);
+    mla_step(x.data(), hidden, mlar, &qa, qa_ln.data(), &qbr, &kvar, kva_ln.data(), &kt, &vv, &wo,
+             nullptr, c1.data(), 1, yr1.data(), 1e-5f);
+    float rd = 0.f;
+    for (int i = 0; i < hidden; ++i) {
+        CHECK(std::isfinite(yr0[i]) && std::isfinite(yr1[i]));
+        rd += (yr0[i] - yr1[i]) * (yr0[i] - yr1[i]);
+    }
+    CHECK(rd > 1e-8f);
 
     quant::QuantMat kt8, vv8;
     mla_absorb_kvb(kv_b.data(), H, QK, Vh, L, kt8, vv8, 8);
@@ -1442,6 +1496,8 @@ static void test_mla_generate() {
       "q_lora_rank": 16,
       "kv_lora_rank": 16,
       "qk_nope_head_dim": 8,
+      "qk_rope_head_dim": 4,
+      "rope_theta": 10000,
       "v_head_dim": 8,
       "num_experts": 2,
       "num_experts_per_token": 1,
@@ -1774,6 +1830,72 @@ static void test_gpu_backend() {
     CHECK(gpu::device() == Device::Cpu);
 }
 
+static void test_sample_and_rope() {
+    using namespace mvllm;
+    float logits[4] = {0.f, 3.f, 1.f, 2.f};
+    uint64_t rng = 1;
+    CHECK(sample_token(logits, 4, 0.f, 1.f, &rng) == 1);
+    int t = sample_token(logits, 4, 0.8f, 0.9f, &rng);
+    CHECK(t >= 0 && t < 4);
+    float x[4] = {1.f, 0.f, 0.f, 1.f};
+    apply_rope(x, 4, 0, 10000.f);
+    CHECK_NEAR(x[0], 1.f, 1e-5);
+    CHECK_NEAR(x[1], 0.f, 1e-5);
+    float y[4] = {1.f, 0.f, 0.f, 1.f};
+    apply_rope(y, 4, 3, 10000.f);
+    CHECK(std::fabs(y[0] - 1.f) > 1e-4f);
+
+    KdaConfig kda;
+    kda.heads = 1;
+    kda.head_dim = 4;
+    kda.full_rank_gate = false;
+    std::vector<float> ga_w(4 * 8, 0.1f), gb_w(4 * 4, 0.2f), go_w(8 * 4, 0.05f);
+    std::vector<float> qw(4 * 8, 0.15f), kw(4 * 8, 0.12f), vw(4 * 8, 0.18f);
+    quant::QuantMat ga, gb, go, wq, wk, wv;
+    ga.from_f32(ga_w.data(), 4, 8, 32);
+    gb.from_f32(gb_w.data(), 4, 4, 32);
+    go.from_f32(go_w.data(), 8, 4, 32);
+    wq.from_f32(qw.data(), 4, 8, 32);
+    wk.from_f32(kw.data(), 4, 8, 32);
+    wv.from_f32(vw.data(), 4, 8, 32);
+    std::vector<float> xin(8, 0.3f), S(16, 0.f), y0(8, 0.f), y1(8, 0.f), on(4, 1.f);
+    kda_step(xin.data(), 8, kda, &wq, &wk, &wv, nullptr, nullptr, nullptr, nullptr, 0, nullptr, &ga,
+             nullptr, &go, on.data(), S.data(), y0.data(), 1e-6f);
+    std::fill(S.begin(), S.end(), 0.f);
+    kda_step(xin.data(), 8, kda, &wq, &wk, &wv, nullptr, nullptr, nullptr, nullptr, 0, nullptr, &ga,
+             &gb, &go, on.data(), S.data(), y1.data(), 1e-6f);
+    float gd = 0.f;
+    for (int i = 0; i < 8; ++i) {
+        CHECK(std::isfinite(y0[i]) && std::isfinite(y1[i]));
+        gd += (y0[i] - y1[i]) * (y0[i] - y1[i]);
+    }
+    CHECK(gd > 1e-10f);
+
+    VisionConfig v;
+    v.patch = 4;
+    v.image_size = 8;
+    v.merge = 1;
+    v.hidden = 8;
+    v.out_hidden = 8;
+    std::vector<float> rgb(static_cast<size_t>(8 * 8 * 3), 0.5f);
+    std::vector<float> pw(static_cast<size_t>(8 * 3 * 4 * 4), 0.02f), pr(static_cast<size_t>(8 * 8), 0.1f);
+    for (size_t i = 0; i < pw.size(); ++i)
+        pw[i] = ((static_cast<int>(i) % 5) - 2) * 0.03f;
+    quant::QuantMat patch, proj;
+    patch.from_f32(pw.data(), 8, 3 * 4 * 4, 32);
+    proj.from_f32(pr.data(), 8, 8, 32);
+    std::vector<float> vout(static_cast<size_t>(4 * 8), 0.f);
+    int ntok = glm_vit_embed(rgb.data(), 8, 8, v, &patch, &proj, vout.data(), 4);
+    CHECK(ntok == 4);
+    float vn = 0.f;
+    for (float a : vout) {
+        CHECK(std::isfinite(a));
+        vn += a * a;
+    }
+    CHECK(vn > 0.f);
+    CHECK(glm_vit_embed(nullptr, 8, 8, v, &patch, &proj, vout.data(), 4) == 0);
+}
+
 int main() {
     test_quant();
     test_quant_mat();
@@ -1800,6 +1922,7 @@ int main() {
     test_mla_generate();
     test_h3_vae();
     test_gpu_backend();
+    test_sample_and_rope();
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
 }

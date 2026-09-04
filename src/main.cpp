@@ -15,6 +15,7 @@ void usage() {
         << "  micro-vllm info     --model DIR\n"
         << "  micro-vllm smoke    --model DIR\n"
         << "  micro-vllm generate --model DIR --prompt TEXT [--n N] [--chat] [--think|--no-think]\n"
+        << "                      [--temp T] [--top-p P] [--seed S]\n"
         << "  micro-vllm serve    --model DIR [--host H] [--port P]\n"
         << "  micro-vllm video    --model DIR --prompt TEXT [-o FILE]\n"
         << "\n"
@@ -108,6 +109,14 @@ int main(int argc, char **argv) {
         gp.eos = engine.config().eos;
         gp.apply_template = has(argc, argv, "--chat");
         gp.think = has(argc, argv, "--think");
+        if (const std::string t = arg(argc, argv, "--temp"); !t.empty())
+            gp.temperature = std::stof(t);
+        if (const std::string t = arg(argc, argv, "--temperature"); !t.empty())
+            gp.temperature = std::stof(t);
+        if (const std::string t = arg(argc, argv, "--top-p"); !t.empty())
+            gp.top_p = std::stof(t);
+        if (const std::string t = arg(argc, argv, "--seed"); !t.empty())
+            gp.seed = static_cast<uint64_t>(std::stoull(t));
         if (has(argc, argv, "--no-think"))
             gp.think = false;
         else if (gp.apply_template && engine.family() == mvllm::Family::Glm53 &&

@@ -185,7 +185,8 @@ public:
                     kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                              &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                              static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
-                             &d_.wo[l], d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
+                             nullptr, &d_.wo[l],
+                             d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
                              S[l].data(), y.data(),
                              cfg_.rms_eps,
                              l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
@@ -288,7 +289,7 @@ public:
                         kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                                  &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                                  static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
-                                 &d_.wo[l],
+                                 nullptr, &d_.wo[l],
                                  d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
                                  S[l].data(), y.data(),
                                  cfg_.rms_eps,
@@ -374,18 +375,12 @@ public:
         }
 
         out.tokens.clear();
+        uint64_t rng = gp.seed ? gp.seed : 1ull;
         for (int n = 0; n < gp.max_new_tokens; ++n) {
             std::vector<float> nrm(H), logits(cfg_.vocab);
             quant::rmsnorm(h.data(), d_.norm.data(), nrm.data(), H, cfg_.rms_eps);
             d_.lm_head.gemm(logits.data(), nrm.data(), 1);
-            int next = 0;
-            float best = logits[0];
-            for (int i = 1; i < cfg_.vocab; ++i) {
-                if (logits[i] > best) {
-                    best = logits[i];
-                    next = i;
-                }
-            }
+            int next = sample_token(logits.data(), cfg_.vocab, gp.temperature, gp.top_p, &rng);
             out.tokens.push_back(next);
             if (is_stop_token(next, cfg_, gp.eos))
                 break;

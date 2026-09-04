@@ -126,8 +126,9 @@ void apply_family_defaults(ModelConfig &cfg) {
             cfg.mla.kv_lora = 512;
         if (!cfg.mla.qk_nope && full)
             cfg.mla.qk_nope = 256;
-        cfg.mla.qk_rope = 0;
-        cfg.mla.nope = true;
+        if (!cfg.mla.qk_rope)
+            cfg.mla.qk_rope = 0;
+        cfg.mla.nope = cfg.mla.qk_rope == 0;
         cfg.mla.output_gate = false;
         if (!cfg.mla.n_heads && full)
             cfg.mla.n_heads = 96;
@@ -172,6 +173,7 @@ void apply_family_defaults(ModelConfig &cfg) {
     default:
         break;
     }
+    cfg.mla.rope_theta = cfg.rope_theta;
 }
 
 Family sniff_family(const std::string &model_dir, std::string *model_type) {

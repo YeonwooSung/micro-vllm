@@ -78,6 +78,11 @@ Status Engine::generate_chat(const std::vector<ChatMessage> &msgs, const GenPara
     if (ids.empty())
         ids.push_back(cfg_.bos);
     GenParams g2 = gp;
+    if (g2.image_token < 0) {
+        int img = tok_.id_of("<image>");
+        if (img >= 0)
+            g2.image_token = img;
+    }
     if (g2.eos < 0 && family_ == Family::KimiK3) {
         int eom = tok_.id_of("<|end_of_msg|>");
         if (eom >= 0)
