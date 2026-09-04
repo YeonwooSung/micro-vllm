@@ -32,6 +32,7 @@ public:
     bool loaded() const { return loaded_; }
     bool rank_bpe() const { return rank_bpe_; }
     bool kimi() const { return kimi_; }
+    bool from_tiktoken() const { return from_tiktoken_; }
 
 private:
     void bpe_piece(const unsigned char *p, int a, int b, std::vector<int> &ids) const;
@@ -44,6 +45,7 @@ private:
     bool loaded_ = false;
     bool rank_bpe_ = false;
     bool kimi_ = false;
+    bool from_tiktoken_ = false;
     int vocab_size_ = 0;
     std::unordered_map<std::string, int> token_to_id_;
     std::unordered_map<std::string, int> merges_;

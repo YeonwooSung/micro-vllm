@@ -469,6 +469,38 @@ static void test_k3_xtml() {
     CHECK(hs.find("ok") != std::string::npos);
 }
 
+static void test_tiktoken_model() {
+    using namespace mvllm;
+    std::string dir = tmpdir();
+    // raw bytes "h","i","hi" -> aA== / aQ== / aGk=
+    write_file(dir + "/tiktoken.model", "aA== 0\naQ== 1\naGk= 2\n");
+    write_file(dir + "/tokenizer_config.json", R"({
+      "added_tokens_decoder": {
+        "10": {"content": "<|open|>", "special": true},
+        "11": {"content": "<|close|>", "special": true},
+        "12": {"content": "<|sep|>", "special": true},
+        "13": {"content": "<|end_of_msg|>", "special": true}
+      }
+    })");
+    Tokenizer tk;
+    std::string err;
+    CHECK(tk.load(dir, err) == Status::Ok);
+    CHECK(tk.from_tiktoken());
+    CHECK(tk.rank_bpe());
+    CHECK(tk.kimi());
+    CHECK(tk.has_xtml());
+    CHECK(tk.id_of("<|open|>") == 10);
+    std::vector<int> ids;
+    CHECK(tk.encode("hi", ids) == Status::Ok);
+    CHECK(ids.size() == 1 && ids[0] == 2);
+    std::string back;
+    CHECK(tk.decode(ids, back) == Status::Ok && back == "hi");
+    CHECK(tk.encode("h", ids) == Status::Ok);
+    CHECK(ids.size() == 1 && ids[0] == 0);
+    CHECK(tk.encode_chat(Family::KimiK3, {{"user", "hi"}}, false, ids) == Status::Ok);
+    CHECK(!ids.empty() && ids[0] == 10);
+}
+
 static void test_glm_eos_ids() {
     using namespace mvllm;
     std::string dir = tmpdir();
@@ -1443,6 +1475,7 @@ int main() {
     test_http_helpers();
     test_tokenizer();
     test_k3_xtml();
+    test_tiktoken_model();
     test_glm_eos_ids();
     test_config_and_families();
     test_offload_generate();

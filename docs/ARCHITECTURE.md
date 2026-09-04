@@ -134,6 +134,8 @@ Not absorbed yet:
 - K3 K3CHAT1 gateway wire / tool-call XTML (prompt chat uses segmented XTML)
 
 Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise.
+A K3 HF dir with only `tiktoken.model` (+ optional `tokenizer_config.json`)
+loads without a synthesized `tokenizer.json`.
 Kimi pretok sniffs `\\p{Han}`. GLM chat is `[gMASK]<sop><|user|>…<|assistant|><think></think>`.
 K3 chat is segmented XTML (`<|open|>` / `<|sep|>` / `<|close|>` / `<|end_of_msg|>`)
 when those specials exist; otherwise `<|im_start|>role`. HTTP

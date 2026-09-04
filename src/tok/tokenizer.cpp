@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -27,6 +28,39 @@ std::string read_file(const std::string &path) {
 bool file_exists(const std::string &path) {
     std::ifstream in(path);
     return static_cast<bool>(in);
+}
+
+int b64_digit(unsigned char c) {
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A';
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 26;
+    if (c >= '0' && c <= '9')
+        return c - '0' + 52;
+    if (c == '+')
+        return 62;
+    if (c == '/')
+        return 63;
+    return -1;
+}
+
+bool b64_decode(const std::string &in, std::string &out) {
+    out.clear();
+    int val = 0, valb = -8;
+    for (unsigned char c : in) {
+        if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t')
+            break;
+        int d = b64_digit(c);
+        if (d < 0)
+            return false;
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xff));
+            valb -= 8;
+        }
+    }
+    return true;
 }
 
 int json_id(const json &v) {
@@ -374,6 +408,7 @@ Status Tokenizer::load(const std::string &model_dir, std::string &err) {
     loaded_ = false;
     rank_bpe_ = false;
     kimi_ = false;
+    from_tiktoken_ = false;
 
     for (int i = 0; i < 1024; ++i)
         cp2byte_[i] = -1;
@@ -390,12 +425,122 @@ Status Tokenizer::load(const std::string &model_dir, std::string &err) {
             cp2byte_[cp] = static_cast<int16_t>(b);
     }
 
-    std::string path = model_dir;
-    if (!path.empty() && path.back() != '/')
-        path += '/';
-    path += "tokenizer.json";
+    std::string dir = model_dir;
+    if (!dir.empty() && dir.back() != '/')
+        dir += '/';
+    const std::string path = dir + "tokenizer.json";
+    const std::string tt_path = dir + "tiktoken.model";
+
+    auto seal = [&]() {
+        int max_id = -1;
+        for (const auto &kv : token_to_id_)
+            if (kv.second > max_id)
+                max_id = kv.second;
+        if (max_id >= 0) {
+            id_to_token_.assign(static_cast<size_t>(max_id) + 1, std::string());
+            id_added_.assign(static_cast<size_t>(max_id) + 1, 0);
+            for (const auto &kv : token_to_id_)
+                id_to_token_[static_cast<size_t>(kv.second)] = kv.first;
+            for (const auto &sp : specials_)
+                if (sp.second >= 0 && static_cast<size_t>(sp.second) < id_added_.size())
+                    id_added_[static_cast<size_t>(sp.second)] = 1;
+        }
+        std::sort(specials_.begin(), specials_.end(),
+                  [](const auto &a, const auto &b) { return a.first.size() > b.first.size(); });
+        vocab_size_ = static_cast<int>(id_to_token_.size());
+        loaded_ = true;
+    };
 
     if (!file_exists(path)) {
+        if (file_exists(tt_path)) {
+            std::ifstream in(tt_path);
+            if (!in) {
+                err = "cannot open tiktoken.model";
+                return Status::IoError;
+            }
+            std::string line;
+            int ntok = 0;
+            int max_rank = -1;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                if (line.empty())
+                    continue;
+                auto sp = line.find(' ');
+                if (sp == std::string::npos)
+                    continue;
+                std::string raw;
+                if (!b64_decode(line.substr(0, sp), raw)) {
+                    err = "tiktoken.model: bad base64";
+                    return Status::ParseError;
+                }
+                int rank = std::atoi(line.c_str() + sp + 1);
+                if (rank < 0)
+                    continue;
+                std::string key;
+                key.reserve(raw.size() * 2);
+                for (unsigned char b : raw)
+                    key += byte2str_[b];
+                token_to_id_[key] = rank;
+                if (rank > max_rank)
+                    max_rank = rank;
+                ++ntok;
+            }
+            if (ntok <= 0) {
+                err = "tiktoken.model: empty vocab";
+                return Status::ParseError;
+            }
+            int num_base = max_rank + 1;
+            json tc;
+            std::string tcraw = read_file(dir + "tokenizer_config.json");
+            if (!tcraw.empty()) {
+                tc = json::parse(tcraw, nullptr, false);
+                if (tc.is_discarded())
+                    tc = json::object();
+            }
+            const json *dec = nullptr;
+            if (tc.is_object() && tc.contains("added_tokens_decoder") &&
+                tc["added_tokens_decoder"].is_object())
+                dec = &tc["added_tokens_decoder"];
+            for (int i = num_base; i < num_base + 256; ++i) {
+                std::string content = "<|reserved_token_" + std::to_string(i) + "|>";
+                if (dec && dec->contains(std::to_string(i))) {
+                    const json &ent = (*dec)[std::to_string(i)];
+                    if (ent.is_object() && ent.contains("content") && ent["content"].is_string())
+                        content = ent["content"].get<std::string>();
+                }
+                if (content.empty())
+                    continue;
+                token_to_id_[content] = i;
+                specials_.push_back({content, i});
+            }
+            if (dec) {
+                for (auto it = dec->begin(); it != dec->end(); ++it) {
+                    int id = std::atoi(it.key().c_str());
+                    if (id < 0 || !it.value().is_object())
+                        continue;
+                    if (!it.value().contains("content") || !it.value()["content"].is_string())
+                        continue;
+                    std::string content = it.value()["content"].get<std::string>();
+                    if (content.empty())
+                        continue;
+                    token_to_id_[content] = id;
+                    bool have = false;
+                    for (const auto &sp : specials_)
+                        if (sp.second == id) {
+                            have = true;
+                            break;
+                        }
+                    if (!have)
+                        specials_.push_back({content, id});
+                }
+            }
+            rank_bpe_ = true;
+            kimi_ = true;
+            from_tiktoken_ = true;
+            seal();
+            return Status::Ok;
+        }
         id_to_token_.resize(256);
         for (int i = 0; i < 256; ++i) {
             std::string t(1, static_cast<char>(static_cast<unsigned char>(i)));
@@ -476,23 +621,7 @@ Status Tokenizer::load(const std::string &model_dir, std::string &err) {
         }
     }
 
-    int max_id = -1;
-    for (const auto &kv : token_to_id_)
-        if (kv.second > max_id)
-            max_id = kv.second;
-    if (max_id >= 0) {
-        id_to_token_.assign(static_cast<size_t>(max_id) + 1, std::string());
-        id_added_.assign(static_cast<size_t>(max_id) + 1, 0);
-        for (const auto &kv : token_to_id_)
-            id_to_token_[static_cast<size_t>(kv.second)] = kv.first;
-        for (const auto &sp : specials_)
-            if (sp.second >= 0 && static_cast<size_t>(sp.second) < id_added_.size())
-                id_added_[static_cast<size_t>(sp.second)] = 1;
-    }
-    std::sort(specials_.begin(), specials_.end(),
-              [](const auto &a, const auto &b) { return a.first.size() > b.first.size(); });
-    vocab_size_ = static_cast<int>(id_to_token_.size());
-    loaded_ = true;
+    seal();
     return Status::Ok;
 }
 
