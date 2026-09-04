@@ -1,0 +1,495 @@
+#include "config.hpp"
+
+#define JSON_USE_IMPLICIT_CONVERSIONS 0
+#include "json.hpp"
+
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+
+namespace mvllm {
+namespace {
+
+using json = nlohmann::json;
+
+std::string read_file(const std::string &path) {
+    std::ifstream in(path);
+    if (!in)
+        return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+int jnum(const json &o, const char *k, int fallback) {
+    if (!o.contains(k) || o[k].is_null())
+        return fallback;
+    if (o[k].is_number_integer())
+        return o[k].get<int>();
+    if (o[k].is_number())
+        return static_cast<int>(o[k].get<double>());
+    return fallback;
+}
+
+float jfloat(const json &o, const char *k, float fallback) {
+    if (!o.contains(k) || o[k].is_null())
+        return fallback;
+    if (o[k].is_number())
+        return static_cast<float>(o[k].get<double>());
+    return fallback;
+}
+
+std::string jstr(const json &o, const char *k, const std::string &fallback = {}) {
+    if (!o.contains(k) || !o[k].is_string())
+        return fallback;
+    return o[k].get<std::string>();
+}
+
+const json &text_object(const json &root) {
+    if (root.contains("text_config") && root["text_config"].is_object())
+        return root["text_config"];
+    return root;
+}
+
+} // namespace
+
+void apply_family_defaults(ModelConfig &cfg) {
+    // Full-size constants only apply when the checkpoint omitted geometry
+    // (or is the released model). Tiny fixtures must keep their own ranks.
+    const bool full = cfg.hidden == 0 || cfg.hidden >= 1024;
+    switch (cfg.family) {
+    case Family::KimiK3:
+        if (!cfg.hidden)
+            cfg.hidden = 7168;
+        if (!cfg.n_layers)
+            cfg.n_layers = 93;
+        if (!cfg.moe.n_experts && full)
+            cfg.moe.n_experts = 896;
+        if (!cfg.moe.topk)
+            cfg.moe.topk = 16;
+        if (!cfg.moe.intermediate)
+            cfg.moe.intermediate = 3072;
+        if (!cfg.moe.latent)
+            cfg.moe.latent = 3584;
+        if (!cfg.moe.n_shared)
+            cfg.moe.n_shared = 2;
+        cfg.moe.situ_b1 = cfg.moe.situ_b1 ? cfg.moe.situ_b1 : 4.f;
+        cfg.moe.situ_b2 = cfg.moe.situ_b2 ? cfg.moe.situ_b2 : 25.f;
+        if (!cfg.kda.heads)
+            cfg.kda.heads = full ? 96 : 2;
+        if (!cfg.kda.head_dim)
+            cfg.kda.head_dim = full ? 128 : 16;
+        if (!cfg.kda.conv_k)
+            cfg.kda.conv_k = 4;
+        cfg.kda.full_rank_gate = true;
+        if (!cfg.mla.n_heads)
+            cfg.mla.n_heads = full ? 96 : 4;
+        if (!cfg.mla.q_lora && full)
+            cfg.mla.q_lora = 1536;
+        if (!cfg.mla.kv_lora && full)
+            cfg.mla.kv_lora = 512;
+        if (!cfg.mla.qk_nope && full)
+            cfg.mla.qk_nope = 128;
+        if (!cfg.mla.v_head && full)
+            cfg.mla.v_head = 128;
+        if (!cfg.mla.qk_rope && full)
+            cfg.mla.qk_rope = 64;
+        cfg.mla.nope = true;
+        cfg.mla.output_gate = true;
+        if (!cfg.attn_res.block_size)
+            cfg.attn_res.block_size = 12;
+        break;
+    case Family::Glm53:
+        if (!cfg.hidden)
+            cfg.hidden = 4096;
+        if (!cfg.n_layers)
+            cfg.n_layers = 45;
+        if (!cfg.vocab && full)
+            cfg.vocab = 154880;
+        if (!cfg.first_dense)
+            cfg.first_dense = 3;
+        if (!cfg.dense_intermediate && full)
+            cfg.dense_intermediate = 12288;
+        if (!cfg.moe.n_experts && full)
+            cfg.moe.n_experts = 288;
+        if (!cfg.moe.topk)
+            cfg.moe.topk = 8;
+        if (!cfg.moe.intermediate)
+            cfg.moe.intermediate = 2048;
+        if (!cfg.moe.n_shared)
+            cfg.moe.n_shared = 1;
+        if (cfg.moe.routed_scale == 1.f)
+            cfg.moe.routed_scale = 2.5f;
+        if (!cfg.mla.q_lora && full)
+            cfg.mla.q_lora = 1536;
+        if (!cfg.mla.kv_lora && full)
+            cfg.mla.kv_lora = 512;
+        if (!cfg.mla.qk_nope && full)
+            cfg.mla.qk_nope = 256;
+        cfg.mla.qk_rope = 0;
+        cfg.mla.nope = true;
+        cfg.mla.output_gate = false;
+        if (!cfg.mla.n_heads && full)
+            cfg.mla.n_heads = 96;
+        if (!cfg.mla.v_head && full)
+            cfg.mla.v_head = 256;
+        if (!cfg.mhc.mult)
+            cfg.mhc.mult = 4;
+        if (!cfg.mhc.iters)
+            cfg.mhc.iters = 20;
+        if (!cfg.dsa.kpool)
+            cfg.dsa.kpool = 4;
+        cfg.kda.full_rank_gate = false;
+        if (!cfg.kda.conv_k)
+            cfg.kda.conv_k = 4;
+        break;
+    case Family::H3:
+        if (!cfg.h3.dit_layers)
+            cfg.h3.dit_layers = 50;
+        if (!cfg.h3.default_width)
+            cfg.h3.default_width = 864;
+        if (!cfg.h3.default_height)
+            cfg.h3.default_height = 480;
+        if (!cfg.h3.stream_slots)
+            cfg.h3.stream_slots = 2;
+        break;
+    case Family::Llama:
+        if (!cfg.hidden)
+            cfg.hidden = 2048;
+        if (!cfg.n_layers)
+            cfg.n_layers = 16;
+        if (!cfg.vocab)
+            cfg.vocab = 128256;
+        if (!cfg.n_q_heads)
+            cfg.n_q_heads = 32;
+        if (!cfg.n_kv_heads)
+            cfg.n_kv_heads = 8;
+        if (!cfg.head_dim)
+            cfg.head_dim = 64;
+        if (!cfg.dense_intermediate)
+            cfg.dense_intermediate = 8192;
+        break;
+    default:
+        break;
+    }
+}
+
+Family sniff_family(const std::string &model_dir, std::string *model_type) {
+    std::string raw = read_file(model_dir + "/config.json");
+    if (raw.empty()) {
+        // MiniMax-H3 snapshots often advertise themselves via layout files.
+        if (!read_file(model_dir + "/config.json").size()) {
+            std::ifstream dit(model_dir + "/transformer/config.json");
+            if (dit)
+                raw = "{}";
+        }
+    }
+    std::string blob = raw;
+    // Also peek at a few sibling markers.
+    if (blob.empty()) {
+        std::ifstream marker(model_dir + "/configuration.json");
+        if (marker)
+            blob = std::string((std::istreambuf_iterator<char>(marker)), {});
+    }
+
+    auto lower_has = [&](const char *s) {
+        std::string t = blob;
+        for (char &c : t)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        return t.find(s) != std::string::npos;
+    };
+
+    json root = json::object();
+    if (!raw.empty()) {
+        try {
+            root = json::parse(raw);
+        } catch (...) {
+            root = json::object();
+        }
+    }
+    std::string mt = jstr(root, "model_type");
+    std::string arch;
+    if (root.contains("architectures") && root["architectures"].is_array() &&
+        !root["architectures"].empty() && root["architectures"][0].is_string())
+        arch = root["architectures"][0].get<std::string>();
+    if (model_type)
+        *model_type = mt.empty() ? arch : mt;
+
+    auto has = [&](const std::string &s, const char *p) {
+        return s.find(p) != std::string::npos;
+    };
+
+    if (has(mt, "kimi") || has(arch, "Kimi") || has(mt, "kimi_linear") ||
+        has(arch, "KimiLinear"))
+        return Family::KimiK3;
+    if (has(mt, "glm") || has(arch, "Glm") || has(arch, "GLM") ||
+        root.contains("text_config")) {
+        // GLM-5.3 is the K3-shaped hybrid; GLM-5.2 is also glm* but we treat
+        // hybrid/kda markers as 5.3.
+        if (root.contains("linear_attn_config") || text_object(root).contains("linear_attn_config") ||
+            text_object(root).contains("layer_types") || has(mt, "5.3") || has(arch, "5.3") ||
+            has(mt, "glm4") || has(arch, "Glm4"))
+            return Family::Glm53;
+        if (has(mt, "glm") || has(arch, "Glm"))
+            return Family::Glm53;
+    }
+    if (has(mt, "llama") || has(arch, "Llama"))
+        return Family::Llama;
+    if (has(mt, "minimax") || has(arch, "MiniMax") || has(mt, "h3") || lower_has("dit") ||
+        lower_has("minimax-h3") || lower_has("transformer_blocks"))
+        return Family::H3;
+
+    // Directory name fallback.
+    std::string dir = model_dir;
+    for (char &c : dir)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    if (dir.find("kimi") != std::string::npos || dir.find("k3") != std::string::npos)
+        return Family::KimiK3;
+    if (dir.find("glm") != std::string::npos)
+        return Family::Glm53;
+    if (dir.find("minimax") != std::string::npos || dir.find("h3") != std::string::npos)
+        return Family::H3;
+    if (dir.find("llama") != std::string::npos)
+        return Family::Llama;
+    return Family::Unknown;
+}
+
+Status load_model_config(const std::string &model_dir, ModelConfig &out, std::string &err) {
+    out = ModelConfig{};
+    std::string mt;
+    out.family = sniff_family(model_dir, &mt);
+    out.model_type = mt;
+
+    std::string raw = read_file(model_dir + "/config.json");
+    if (raw.empty() && out.family == Family::H3) {
+        apply_family_defaults(out);
+        out.architecture = "MiniMaxH3";
+        return Status::Ok;
+    }
+    if (raw.empty()) {
+        err = "missing config.json in " + model_dir;
+        return Status::NotFound;
+    }
+
+    json root;
+    try {
+        root = json::parse(raw);
+    } catch (const std::exception &e) {
+        err = std::string("config.json parse: ") + e.what();
+        return Status::ParseError;
+    }
+
+    const json &text = text_object(root);
+    out.architecture = jstr(root, "model_type", mt);
+    if (root.contains("architectures") && root["architectures"].is_array() &&
+        !root["architectures"].empty() && root["architectures"][0].is_string())
+        out.architecture = root["architectures"][0].get<std::string>();
+
+    out.hidden = jnum(text, "hidden_size", 0);
+    out.n_layers = jnum(text, "num_hidden_layers", 0);
+    out.vocab = jnum(text, "vocab_size", 0);
+    if (text.contains("first_k_dense_replace")) {
+        out.first_dense = jnum(text, "first_k_dense_replace", 0);
+    } else if (text.contains("mlp_layer_types") && text["mlp_layer_types"].is_array()) {
+        out.first_dense = static_cast<int>(text["mlp_layer_types"].size());
+        int i = 0;
+        for (const auto &kind : text["mlp_layer_types"]) {
+            if (kind.is_string() && kind.get<std::string>().find("sparse") != std::string::npos) {
+                out.first_dense = i;
+                break;
+            }
+            ++i;
+        }
+    } else {
+        out.first_dense = 0;
+    }
+    out.dense_intermediate = jnum(text, "intermediate_size", 0);
+    out.max_position = jnum(text, "max_position_embeddings", 0);
+    out.rms_eps = jfloat(text, "rms_norm_eps", 1e-5f);
+    out.rope_theta = jfloat(text, "rope_theta", 10000.f);
+    if (text.contains("rope_parameters") && text["rope_parameters"].is_object())
+        out.rope_theta = jfloat(text["rope_parameters"], "rope_theta", out.rope_theta);
+    out.bos = jnum(text, "bos_token_id", 0);
+    out.eos = jnum(text, "eos_token_id", 0);
+
+    out.mla.n_heads = jnum(text, "num_attention_heads", 0);
+    out.mla.q_lora = jnum(text, "q_lora_rank", 0);
+    out.mla.kv_lora = jnum(text, "kv_lora_rank", 0);
+    out.mla.qk_nope = jnum(text, "qk_nope_head_dim", 0);
+    out.mla.qk_rope = jnum(text, "qk_rope_head_dim", 0);
+    out.mla.v_head = jnum(text, "v_head_dim", 0);
+    out.n_q_heads = jnum(text, "num_attention_heads", 0);
+    out.n_kv_heads = jnum(text, "num_key_value_heads", out.n_q_heads);
+    out.head_dim = out.hidden && out.n_q_heads ? out.hidden / out.n_q_heads : 0;
+
+    out.moe.n_experts = jnum(text, "num_experts", jnum(text, "n_routed_experts", 0));
+    out.moe.topk = jnum(text, "num_experts_per_token", jnum(text, "num_experts_per_tok", 0));
+    out.moe.intermediate = jnum(text, "moe_intermediate_size", 0);
+    out.moe.latent = jnum(text, "routed_expert_hidden_size", 0);
+    out.moe.n_shared = jnum(text, "num_shared_experts", jnum(text, "n_shared_experts", 0));
+    out.moe.routed_scale = jfloat(text, "routed_scaling_factor", 1.f);
+    out.moe.situ_b1 = jfloat(text, "activation_situ_beta", 4.f);
+    out.moe.situ_b2 = jfloat(text, "activation_situ_linear_beta", 25.f);
+    out.moe.swiglu_limit = jfloat(text, "swiglu_limit", 0.f);
+
+    out.attn_res.block_size = jnum(text, "attn_res_block_size", 0);
+    out.dsa.topk = jnum(text, "index_topk", 0);
+    out.dsa.n_heads = jnum(text, "index_n_heads", 0);
+    out.dsa.head_dim = jnum(text, "index_head_dim", 0);
+    out.dsa.kpool = jnum(text, "index_kpool", out.dsa.kpool);
+    if (text.contains("index_kpool_always_select_tail")) {
+        if (text["index_kpool_always_select_tail"].is_boolean())
+            out.dsa.always_select_tail = text["index_kpool_always_select_tail"].get<bool>();
+        else
+            out.dsa.always_select_tail = jnum(text, "index_kpool_always_select_tail", 1) != 0;
+    }
+
+    if (text.contains("linear_attn_config") && text["linear_attn_config"].is_object()) {
+        const json &la = text["linear_attn_config"];
+        out.kda.heads = jnum(la, "num_heads", jnum(text, "linear_num_heads", 0));
+        out.kda.head_dim = jnum(la, "head_dim", jnum(text, "linear_head_dim", 0));
+        out.kda.conv_k = jnum(la, "short_conv_kernel_size",
+                              jnum(text, "linear_conv_kernel_dim", 4));
+        out.kda.gate_lower_bound = jfloat(la, "gate_lower_bound", -5.f);
+        out.kda.full_rank_gate = true;
+        if (la.contains("use_full_rank_gate") && la["use_full_rank_gate"].is_boolean())
+            out.kda.full_rank_gate = la["use_full_rank_gate"].get<bool>();
+    } else {
+        out.kda.heads = jnum(text, "linear_num_heads", out.kda.heads);
+        out.kda.head_dim = jnum(text, "linear_head_dim", out.kda.head_dim);
+        out.kda.conv_k = jnum(text, "linear_conv_kernel_dim", out.kda.conv_k ? out.kda.conv_k : 4);
+    }
+
+    out.mhc.mult = jnum(text, "hc_mult", 0);
+    out.mhc.iters = jnum(text, "hc_iters", jnum(text, "hc_sinkhorn_iters", 20));
+    out.mhc.eps = jfloat(text, "hc_eps", 1e-6f);
+    out.dsa.topk = jnum(text, "index_topk", 0);
+    out.dsa.n_heads = jnum(text, "index_n_heads", 0);
+    out.dsa.head_dim = jnum(text, "index_head_dim", 0);
+    out.dsa.kpool = jnum(text, "index_kpool", 4);
+
+    if (root.contains("vision_config") && root["vision_config"].is_object()) {
+        const json &v = root["vision_config"];
+        out.vision.layers = jnum(v, "num_hidden_layers", 0);
+        out.vision.hidden = jnum(v, "hidden_size", 0);
+        out.vision.heads = jnum(v, "num_attention_heads", 0);
+        out.vision.intermediate = jnum(v, "intermediate_size", 0);
+        out.vision.patch = jnum(v, "patch_size", 14);
+        out.vision.image_size = jnum(v, "image_size", 448);
+        out.vision.merge = jnum(v, "spatial_merge_size", 2);
+        out.vision.out_hidden = jnum(v, "out_hidden_size", out.hidden);
+    }
+
+    // Layer kinds.
+    out.is_kda.assign(out.n_layers > 0 ? out.n_layers : 0, 0);
+    out.is_full.assign(out.n_layers > 0 ? out.n_layers : 0, 0);
+    if (text.contains("layer_types") && text["layer_types"].is_array()) {
+        const json &types = text["layer_types"];
+        for (int i = 0; i < out.n_layers && i < static_cast<int>(types.size()); ++i) {
+            if (!types[i].is_string())
+                continue;
+            std::string s = types[i].get<std::string>();
+            if (s.find("linear") != std::string::npos) {
+                out.is_kda[i] = 1;
+                out.is_full[i] = 0;
+            } else {
+                out.is_kda[i] = 0;
+                out.is_full[i] = 1;
+            }
+        }
+    } else if (text.contains("linear_attn_config") &&
+               text["linear_attn_config"].contains("kda_layers") &&
+               text["linear_attn_config"]["kda_layers"].is_array()) {
+        out.is_full.assign(out.n_layers, 1);
+        out.is_kda.assign(out.n_layers, 0);
+        for (const auto &v : text["linear_attn_config"]["kda_layers"]) {
+            int idx = v.is_number() ? v.get<int>() : -1;
+            // HF lists are often 1-based in K3 tiny config.
+            if (idx >= 1 && idx <= out.n_layers) {
+                out.is_kda[idx - 1] = 1;
+                out.is_full[idx - 1] = 0;
+            } else if (idx >= 0 && idx < out.n_layers) {
+                out.is_kda[idx] = 1;
+                out.is_full[idx] = 0;
+            }
+        }
+    } else if (out.family == Family::KimiK3 && out.n_layers > 0) {
+        // Default K3: every 4th + last are MLA; the rest are KDA.
+        out.is_kda.assign(out.n_layers, 1);
+        out.is_full.assign(out.n_layers, 0);
+        for (int i = 3; i < out.n_layers; i += 4) {
+            out.is_kda[i] = 0;
+            out.is_full[i] = 1;
+        }
+        out.is_kda[out.n_layers - 1] = 0;
+        out.is_full[out.n_layers - 1] = 1;
+    } else if (out.family == Family::Glm53 && out.n_layers > 0) {
+        // (KDA KDA KDA FULL) repeating.
+        out.is_kda.assign(out.n_layers, 1);
+        out.is_full.assign(out.n_layers, 0);
+        for (int i = 3; i < out.n_layers; i += 4) {
+            out.is_kda[i] = 0;
+            out.is_full[i] = 1;
+        }
+    }
+
+    if (out.family == Family::Unknown)
+        out.family = sniff_family(model_dir, nullptr);
+    apply_family_defaults(out);
+    if (out.family == Family::Unknown) {
+        err = "could not detect model family in " + model_dir;
+        return Status::Unsupported;
+    }
+    return Status::Ok;
+}
+
+RuntimeConfig runtime_from_env() {
+    RuntimeConfig rt;
+    auto get = [](const char *k) -> const char * {
+        return std::getenv(k);
+    };
+    if (const char *v = get("MVLLM_DEVICE")) {
+        std::string s(v);
+        if (s == "cuda")
+            rt.device = Device::Cuda;
+        else if (s == "hip")
+            rt.device = Device::Hip;
+        else if (s == "metal")
+            rt.device = Device::Metal;
+        else
+            rt.device = Device::Cpu;
+    }
+    if (const char *v = get("MVLLM_BITS"))
+        rt.dense_bits = std::atoi(v);
+    if (const char *v = get("MVLLM_HEAD_BITS"))
+        rt.head_bits = std::atoi(v);
+    if (const char *v = get("MVLLM_MLA_BITS"))
+        rt.mla_bits = std::atoi(v);
+    if (const char *v = get("MVLLM_EXPERT_GB"))
+        rt.expert_gb = std::atof(v);
+    if (const char *v = get("MVLLM_LOAD_THREADS"))
+        rt.loader_threads = std::atoi(v);
+    if (const char *v = get("MVLLM_DIRECT"))
+        rt.o_direct = std::atoi(v) != 0;
+    if (const char *v = get("MVLLM_PIPE"))
+        rt.pipe = std::atoi(v) != 0;
+    if (const char *v = get("MVLLM_PORT"))
+        rt.host_port = std::atoi(v);
+    if (const char *v = get("K3_EXPERT_GB"))
+        rt.expert_gb = std::atof(v);
+    if (const char *v = get("GLM53_EXPERT_GB"))
+        rt.expert_gb = std::atof(v);
+    if (const char *v = get("K3_BITS"))
+        rt.dense_bits = std::atoi(v);
+    if (const char *v = get("K3_MLA_BITS"))
+        rt.mla_bits = std::atoi(v);
+    if (const char *v = get("GLM53_MLA_BITS"))
+        rt.mla_bits = std::atoi(v);
+    if (const char *v = get("GLM53_BITS"))
+        rt.dense_bits = std::atoi(v);
+    return rt;
+}
+
+} // namespace mvllm

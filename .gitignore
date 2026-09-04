@@ -68,6 +68,10 @@ vcpkg_installed/
 Testing/
 .cache/
 
+# runtime-generated expert / DiT packs
+.mvllm_*.bin
+**/.mvllm_*.bin
+
 # vscode
 .vscode/
 

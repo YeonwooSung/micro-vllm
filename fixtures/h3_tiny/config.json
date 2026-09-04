@@ -1,0 +1,4 @@
+{
+  "model_type": "minimax_h3",
+  "architectures": ["MiniMaxH3"]
+}
