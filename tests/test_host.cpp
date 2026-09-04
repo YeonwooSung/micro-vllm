@@ -2,6 +2,7 @@
 #include "engine.hpp"
 #include "io/file_io.hpp"
 #include "io/safetensors.hpp"
+#include "io/shard_probe.hpp"
 #include "model/h3_vae.hpp"
 #include "quant/quant.hpp"
 #include "quant/weight.hpp"
@@ -230,6 +231,13 @@ static void test_expert_store() {
     ExpertKey keys[2] = {{1, 0}, {1, 3}};
     CHECK(store.prefetch(keys, 2, err) == Status::Ok);
     store.close();
+
+    // 8 GiB / 4 KiB / 2 layers would be ~1M slots without the n_experts cap.
+    CHECK(expert_store_slots_per_layer(2, 4, 4096, 8LL * 1024 * 1024 * 1024) == 4);
+    CHECK(expert_store_slots_per_layer(2, 4, 4096, 4096) == 1);
+    CHECK(expert_store_slots_per_layer(93, 896, 14LL * 1024 * 1024, 8LL * 1024 * 1024 * 1024) > 0);
+    CHECK(expert_store_slots_per_layer(93, 896, 14LL * 1024 * 1024, 8LL * 1024 * 1024 * 1024) <=
+          896);
 }
 
 static void test_block_store() {
@@ -1089,6 +1097,55 @@ static void test_h3_checkpoint() {
     CHECK(hr.width == 32 && hr.height == 32);
 }
 
+static void test_shard_probe() {
+    using namespace mvllm;
+    CHECK(k3_expert_slot_bytes(32, 32) == 2 * (32 * 16 + 32 * 1) + 32 * 16 + 32 * 1);
+    CHECK(glm53_expert_slot_bytes(64, 64) == 3 * (64 * 64 / 2 + 64 * 64 / 64 * 4));
+
+    std::string dir = tmpdir();
+    write_file(dir + "/config.json", R"({
+      "model_type": "kimi_linear",
+      "architectures": ["KimiLinearForCausalLM"],
+      "hidden_size": 32,
+      "num_hidden_layers": 2,
+      "vocab_size": 32,
+      "num_experts": 2,
+      "moe_intermediate_size": 32,
+      "routed_expert_hidden_size": 32
+    })");
+    const int64_t w1p = 32ll * 16, w1s = 32ll;
+    auto u8 = [&](size_t n) { return std::vector<uint8_t>(n, 0); };
+    using T = std::tuple<std::string, std::string, std::vector<int64_t>, std::vector<uint8_t>>;
+    std::vector<T> ts;
+    const char *mats[3] = {"w1", "w2", "w3"};
+    const char *half[2] = {"packed", "scale"};
+    const int64_t want[6] = {w1p, w1s, w1p, w1s, w1p, w1s};
+    for (int e = 0; e < 2; ++e) {
+        for (int k = 0; k < 6; ++k) {
+            std::string name = "language_model.model.layers.1.block_sparse_moe.experts." +
+                               std::to_string(e) + "." + mats[k / 2] + ".weight_" + half[k & 1];
+            ts.push_back({name, "U8", {want[k]}, u8(static_cast<size_t>(want[k]))});
+        }
+    }
+    write_safetensors_file(dir + "/model-00001-of-00001.safetensors", ts);
+
+    ShardReport r;
+    RuntimeConfig rt;
+    rt.expert_gb = 8;
+    std::string err;
+    CHECK(probe_shards(dir, rt, r, err) == Status::Ok);
+    CHECK(r.family == Family::KimiK3);
+    CHECK(r.prefix == "language_model.");
+    CHECK(r.prefix_ok);
+    CHECK(r.n_experts_seen == 2);
+    CHECK(r.n_layers_seen == 2);
+    CHECK(r.slot_bytes == k3_expert_slot_bytes(32, 32));
+    CHECK(r.slots_per_layer <= 2);
+    CHECK(r.shards_ok);
+    std::string text = format_shard_report(r);
+    CHECK(text.find("prefix=language_model.") != std::string::npos);
+}
+
 static void test_dsa() {
     using namespace mvllm;
     DsaConfig d;
@@ -1484,6 +1541,7 @@ int main() {
     test_h3_checkpoint();
     test_kda_short_conv();
     test_dsa();
+    test_shard_probe();
     test_moe_union();
     test_dense_bits_generate();
     test_mla_absorb();

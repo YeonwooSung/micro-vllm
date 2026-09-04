@@ -33,6 +33,7 @@ set(MVLLM_HOST_SOURCES
     src/core/config.cpp
     src/io/file_io.cpp
     src/io/safetensors.cpp
+    src/io/shard_probe.cpp
     src/quant/quant.cpp
     src/quant/weight.cpp
     src/store/expert_store.cpp

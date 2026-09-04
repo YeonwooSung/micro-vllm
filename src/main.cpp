@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "io/shard_probe.hpp"
 #include "serve/http_server.hpp"
 
 #include <cstdio>
@@ -12,6 +13,7 @@ void usage() {
     std::cerr
         << "micro-vllm — consumer-hardware inference server\n"
         << "  micro-vllm info     --model DIR\n"
+        << "  micro-vllm smoke    --model DIR\n"
         << "  micro-vllm generate --model DIR --prompt TEXT [--n N] [--chat] [--think|--no-think]\n"
         << "  micro-vllm serve    --model DIR [--host H] [--port P]\n"
         << "  micro-vllm video    --model DIR --prompt TEXT [-o FILE]\n"
@@ -61,6 +63,18 @@ int main(int argc, char **argv) {
         rt.host = h;
     if (const std::string g = arg(argc, argv, "--expert-gb"); !g.empty())
         rt.expert_gb = std::stod(g);
+
+    if (cmd == "smoke") {
+        mvllm::ShardReport rep;
+        std::string serr;
+        mvllm::Status sst = mvllm::probe_shards(model, rt, rep, serr);
+        if (sst != mvllm::Status::Ok) {
+            std::cerr << "smoke failed: " << serr << "\n";
+            return 1;
+        }
+        std::cout << mvllm::format_shard_report(rep);
+        return rep.shards_ok ? 0 : 1;
+    }
 
     mvllm::Engine engine;
     std::string err;

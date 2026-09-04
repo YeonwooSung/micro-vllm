@@ -7,6 +7,20 @@
 
 namespace mvllm {
 
+int expert_store_slots_per_layer(int n_layers, int n_experts, int64_t expert_bytes,
+                                 int64_t capacity_bytes) {
+    if (n_layers <= 0 || n_experts <= 0 || expert_bytes <= 0 || capacity_bytes < 0)
+        return 0;
+    const int64_t slot_bytes = (expert_bytes + 4095) & ~int64_t{4095};
+    const int64_t denom = slot_bytes * static_cast<int64_t>(n_layers);
+    int64_t slots = denom > 0 ? capacity_bytes / denom : 1;
+    if (slots < 1)
+        slots = 1;
+    if (slots > n_experts)
+        slots = n_experts;
+    return static_cast<int>(slots);
+}
+
 Status ExpertStore::open(int n_layers, int n_experts, int64_t expert_bytes, int64_t capacity_bytes,
                          std::string &err) {
     close();
@@ -18,22 +32,18 @@ Status ExpertStore::open(int n_layers, int n_experts, int64_t expert_bytes, int6
         err = "expert capacity overflow";
         return Status::InvalidArgument;
     }
+    if (static_cast<int64_t>(n_layers) > 2000000 / std::max(n_experts, 1)) {
+        err = "expert table too large";
+        return Status::InvalidArgument;
+    }
 
     n_layers_ = n_layers;
     n_experts_ = n_experts;
     expert_bytes_ = expert_bytes;
     capacity_bytes_ = capacity_bytes;
 
-    // posix_memalign slots are 4 KiB-rounded; budget against that, and never
-    // keep more than one copy of every expert on a layer.
-    const int64_t slot_bytes = (expert_bytes + 4095) & ~int64_t{4095};
-    const int64_t denom = slot_bytes * static_cast<int64_t>(n_layers);
-    int64_t slots = denom > 0 ? capacity_bytes / denom : 1;
-    if (slots < 1)
-        slots = 1;
-    if (slots > n_experts)
-        slots = n_experts;
-    slots_per_layer_ = static_cast<int>(slots);
+    slots_per_layer_ = expert_store_slots_per_layer(n_layers, n_experts, expert_bytes,
+                                                    capacity_bytes);
 
     clock_ = 1;
     stats_ = {};

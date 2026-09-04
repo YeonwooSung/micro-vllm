@@ -125,9 +125,13 @@ MLA (full-attn layers): absorbed NoPE. Cache is `kv_lora`-wide.
 folded at load (`mla_absorb_kvb`). `mla_bits` quantizes q/kv; `head_bits`
 quantizes o/g. Missing MLA tensors keep the dense Q/O stand-in.
 
+`micro-vllm smoke --model DIR` opens safetensors **headers only**, reports
+prefix, expert counts, slot bytes, and LRU slots that fit in `expert_gb`.
+It does not allocate the expert cache.
+
 Not absorbed yet:
 
-- Real safetensors shard tables (1.5 TB K3 / 195 GB GLM53)
+- Walking a live 1.5 TB / 195 GB dump on this machine (smoke is the dry path)
 - Metal / CUDA expert GEMM and H3 DiT compute
 - Official 36-block 2048-d VAE without a fixture (synth mix is the host path)
 - Audio VAE

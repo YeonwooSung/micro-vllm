@@ -62,6 +62,8 @@ class ExpertStore {
 public:
     Status open(int n_layers, int n_experts, int64_t expert_bytes, int64_t capacity_bytes,
                 std::string &err);
+    int slots_per_layer() const { return slots_per_layer_; }
+    int n_experts() const { return n_experts_; }
     void close();
 
     // Prefer O_DIRECT / F_NOCACHE when the OS opened a twin fd.
@@ -133,5 +135,9 @@ private:
     bool use_direct_ = true;
     std::mutex mu_;
 };
+
+// LRU slots per layer: budget against 4 KiB-aligned blobs, never more than n_experts.
+int expert_store_slots_per_layer(int n_layers, int n_experts, int64_t expert_bytes,
+                                 int64_t capacity_bytes);
 
 } // namespace mvllm
