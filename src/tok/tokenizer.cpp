@@ -571,6 +571,83 @@ Status Tokenizer::decode(const std::vector<int> &ids, std::string &text) const {
     return Status::Ok;
 }
 
+int Tokenizer::id_of(const std::string &content) const {
+    auto it = token_to_id_.find(content);
+    if (it == token_to_id_.end())
+        return -1;
+    return it->second;
+}
+
+bool Tokenizer::has_xtml() const {
+    return id_of("<|open|>") >= 0 && id_of("<|close|>") >= 0 && id_of("<|sep|>") >= 0 &&
+           id_of("<|end_of_msg|>") >= 0;
+}
+
+namespace {
+
+void xtml_append_encode(const Tokenizer &tk, const std::string &s, std::vector<int> &ids) {
+    if (s.empty())
+        return;
+    std::vector<int> piece;
+    tk.encode(s, piece);
+    ids.insert(ids.end(), piece.begin(), piece.end());
+}
+
+} // namespace
+
+Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
+                              std::vector<int> &ids) const {
+    ids.clear();
+    if (family != Family::KimiK3 || !has_xtml())
+        return encode(apply_chat(family, msgs, think), ids);
+
+    const int op = id_of("<|open|>");
+    const int cl = id_of("<|close|>");
+    const int sep = id_of("<|sep|>");
+    const int eom = id_of("<|end_of_msg|>");
+    auto open_tag = [&](const char *tag, const char *role) {
+        ids.push_back(op);
+        xtml_append_encode(*this, tag, ids);
+        if (role) {
+            xtml_append_encode(*this, " role", ids);
+            xtml_append_encode(*this, "=\"", ids);
+            xtml_append_encode(*this, role, ids);
+            xtml_append_encode(*this, "\"", ids);
+        }
+        ids.push_back(sep);
+    };
+    auto close_tag = [&](const char *tag) {
+        ids.push_back(cl);
+        xtml_append_encode(*this, tag, ids);
+        ids.push_back(sep);
+    };
+
+    for (const auto &m : msgs) {
+        std::string role = m.role == "developer" ? "system" : m.role;
+        if (role == "assistant") {
+            open_tag("message", "assistant");
+            if (!m.reasoning.empty()) {
+                open_tag("think", nullptr);
+                xtml_append_encode(*this, m.reasoning, ids);
+                close_tag("think");
+            }
+            open_tag("response", nullptr);
+            xtml_append_encode(*this, m.content, ids);
+            close_tag("response");
+            close_tag("message");
+            ids.push_back(eom);
+            continue;
+        }
+        open_tag("message", role.c_str());
+        xtml_append_encode(*this, m.content, ids);
+        close_tag("message");
+        ids.push_back(eom);
+    }
+    open_tag("message", "assistant");
+    open_tag(think ? "think" : "response", nullptr);
+    return Status::Ok;
+}
+
 std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> &msgs,
                                   bool think) const {
     if (family == Family::Glm53) {
@@ -591,6 +668,48 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
         return p;
     }
     if (family == Family::KimiK3) {
+        if (has_xtml()) {
+            std::string p;
+            auto open = [&](const char *tag, const char *role) {
+                p += "<|open|>";
+                p += tag;
+                if (role) {
+                    p += " role=\"";
+                    p += role;
+                    p += "\"";
+                }
+                p += "<|sep|>";
+            };
+            auto close = [&](const char *tag) {
+                p += "<|close|>";
+                p += tag;
+                p += "<|sep|>";
+            };
+            for (const auto &m : msgs) {
+                std::string role = m.role == "developer" ? "system" : m.role;
+                if (role == "assistant") {
+                    open("message", "assistant");
+                    if (!m.reasoning.empty()) {
+                        open("think", nullptr);
+                        p += m.reasoning;
+                        close("think");
+                    }
+                    open("response", nullptr);
+                    p += m.content;
+                    close("response");
+                    close("message");
+                    p += "<|end_of_msg|>";
+                    continue;
+                }
+                open("message", role.c_str());
+                p += m.content;
+                close("message");
+                p += "<|end_of_msg|>";
+            }
+            open("message", "assistant");
+            open(think ? "think" : "response", nullptr);
+            return p;
+        }
         std::string p;
         for (const auto &m : msgs) {
             std::string role = m.role == "developer" ? "system" : m.role;

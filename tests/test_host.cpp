@@ -382,6 +382,85 @@ static void test_tokenizer() {
     CHECK(k3.find("<|im_start|>assistant") != std::string::npos);
 }
 
+static void test_k3_xtml() {
+    using namespace mvllm;
+    std::string dir = tmpdir();
+    std::string vocab;
+    for (int b = 0; b < 256; ++b) {
+        if (b)
+            vocab += ",";
+        vocab += "\"" + json_escape(gpt2_byte_token(b)) + "\":" + std::to_string(b);
+    }
+    write_file(dir + "/tokenizer.json",
+               std::string("{\"model\":{\"type\":\"BPE\",\"vocab\":{") + vocab +
+                   "},\"merges\":[]},\"added_tokens\":["
+                   "{\"id\":300,\"content\":\"<|open|>\"},"
+                   "{\"id\":301,\"content\":\"<|close|>\"},"
+                   "{\"id\":302,\"content\":\"<|sep|>\"},"
+                   "{\"id\":303,\"content\":\"<|end_of_msg|>\"}"
+                   "]}");
+    Tokenizer tk;
+    std::string err;
+    CHECK(tk.load(dir, err) == Status::Ok);
+    CHECK(tk.has_xtml());
+    CHECK(tk.id_of("<|open|>") == 300 && tk.id_of("<|end_of_msg|>") == 303);
+
+    std::string rendered = tk.apply_chat(Family::KimiK3, {{"user", "hi"}}, false);
+    CHECK(rendered.find("<|open|>message role=\"user\"<|sep|>hi<|close|>message<|sep|><|end_of_msg|>") !=
+          std::string::npos);
+    CHECK(rendered.find("<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>") !=
+          std::string::npos);
+    std::string thinkp = tk.apply_chat(Family::KimiK3, {{"user", "hi"}}, true);
+    CHECK(thinkp.find("<|open|>think<|sep|>") != std::string::npos);
+
+    std::vector<int> ids;
+    CHECK(tk.encode_chat(Family::KimiK3, {{"user", "hi"}}, false, ids) == Status::Ok);
+    CHECK(!ids.empty() && ids[0] == 300);
+    int n_open = 0, n_sep = 0, n_close = 0, n_eom = 0;
+    for (int id : ids) {
+        n_open += id == 300;
+        n_close += id == 301;
+        n_sep += id == 302;
+        n_eom += id == 303;
+    }
+    CHECK(n_open == 3); // user message, assistant message, response
+    CHECK(n_close == 1);
+    CHECK(n_eom == 1);
+    CHECK(n_sep >= 4);
+
+    // Segmented attr encode is the contract: " role" / "=\"" / role / "\"" are
+    // separate encode() calls, not one string.
+    std::vector<int> glued, a, b, c, d;
+    tk.encode(" role=\"user\"", glued);
+    tk.encode(" role", a);
+    tk.encode("=\"", b);
+    tk.encode("user", c);
+    tk.encode("\"", d);
+    std::vector<int> segs = a;
+    segs.insert(segs.end(), b.begin(), b.end());
+    segs.insert(segs.end(), c.begin(), c.end());
+    segs.insert(segs.end(), d.begin(), d.end());
+    bool found = false;
+    for (size_t i = 0; i + segs.size() <= ids.size(); ++i) {
+        if (std::equal(segs.begin(), segs.end(), ids.begin() + static_cast<std::ptrdiff_t>(i))) {
+            found = true;
+            break;
+        }
+    }
+    CHECK(found);
+
+    ChatMessage past;
+    past.role = "assistant";
+    past.content = "ok";
+    past.reasoning = "hmm";
+    std::vector<int> hist;
+    CHECK(tk.encode_chat(Family::KimiK3, {{"user", "q"}, past}, false, hist) == Status::Ok);
+    std::string hs;
+    tk.decode(hist, hs);
+    CHECK(hs.find("hmm") != std::string::npos);
+    CHECK(hs.find("ok") != std::string::npos);
+}
+
 static void test_config_and_families() {
     using namespace mvllm;
     std::string err;
@@ -1332,6 +1411,7 @@ int main() {
     test_safetensors();
     test_http_helpers();
     test_tokenizer();
+    test_k3_xtml();
     test_config_and_families();
     test_offload_generate();
     test_glm53_container();

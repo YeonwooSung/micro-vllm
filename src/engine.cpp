@@ -64,16 +64,24 @@ Status Engine::generate(const std::string &prompt, const GenParams &gp, GenResul
 
 Status Engine::generate_chat(const std::vector<ChatMessage> &msgs, const GenParams &gp,
                              GenResult &out, std::string &err) {
-    std::string prompt = tok_.apply_chat(family_, msgs, gp.think);
     std::vector<int> ids;
-    Status st = tok_.encode(prompt, ids);
+    Status st = tok_.encode_chat(family_, msgs, gp.think, ids);
     if (st != Status::Ok) {
         err = "tokenize failed";
         return st;
     }
+    if (family_ == Family::KimiK3 && cfg_.bos >= 0 &&
+        (ids.empty() || ids.front() != cfg_.bos))
+        ids.insert(ids.begin(), cfg_.bos);
     if (ids.empty())
         ids.push_back(cfg_.bos);
-    st = generate_ids(ids, gp, out, err);
+    GenParams g2 = gp;
+    if (g2.eos < 0 && family_ == Family::KimiK3) {
+        int eom = tok_.id_of("<|end_of_msg|>");
+        if (eom >= 0)
+            g2.eos = eom;
+    }
+    st = generate_ids(ids, g2, out, err);
     if (st != Status::Ok)
         return st;
     std::string text;

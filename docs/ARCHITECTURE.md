@@ -131,11 +131,13 @@ Not absorbed yet:
 - Metal / CUDA expert GEMM and H3 DiT compute
 - Official 36-block 2048-d VAE without a fixture (synth mix is the host path)
 - Audio VAE
-- K3 XTML/K3CHAT1 framed chat (current path is `<|im_start|>`)
+- K3 K3CHAT1 gateway wire / tool-call XTML (prompt chat uses segmented XTML)
 
 Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise.
 Kimi pretok sniffs `\\p{Han}`. GLM chat is `[gMASK]<sop><|user|>…<|assistant|><think></think>`.
-K3 chat is `<|im_start|>role`. HTTP `/v1/chat/completions` applies the family template.
+K3 chat is segmented XTML (`<|open|>` / `<|sep|>` / `<|close|>` / `<|end_of_msg|>`)
+when those specials exist; otherwise `<|im_start|>role`. HTTP
+`/v1/chat/completions` applies the family template.
 
 Prefill is layer-major: a chunk of tokens walks each layer, then union-MoE loads
 each routed expert once for the chunk (`prefill=layer`). Decode stays C=1.
