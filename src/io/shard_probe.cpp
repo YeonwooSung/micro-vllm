@@ -128,7 +128,10 @@ Status probe_shards(const std::string &model_dir, const RuntimeConfig &rt, Shard
         for (int i = 0; h3_tails[i]; ++i) {
             files.clear();
             std::string dir = model_dir + h3_tails[i];
-            if (io::st_open_dir(dir, files, err) != Status::Ok || files.empty())
+            Status ost = io::st_open_dir(dir, files, err);
+            if (ost == Status::ParseError)
+                return ost;
+            if (ost != Status::Ok || files.empty())
                 continue;
             if (io::st_find_dir(files, "blocks.0.attn.qkv_proj.weight").tensor) {
                 out.root = dir;
@@ -138,8 +141,9 @@ Status probe_shards(const std::string &model_dir, const RuntimeConfig &rt, Shard
             io::st_close_dir(files);
         }
     } else {
-        if (io::st_open_dir(model_dir, files, err) != Status::Ok)
-            files.clear();
+        Status ost = io::st_open_dir(model_dir, files, err);
+        if (ost != Status::Ok)
+            return ost;
         out.root = model_dir;
     }
 

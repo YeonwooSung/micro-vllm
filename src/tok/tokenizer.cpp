@@ -121,8 +121,12 @@ int u8_put(char *o, uint32_t cp) {
 }
 
 bool is_han(uint32_t c) {
-    return (c >= 0x3400 && c <= 0x4dbf) || (c >= 0x4e00 && c <= 0x9fff) ||
-           (c >= 0xf900 && c <= 0xfaff) || (c >= 0x20000 && c <= 0x2a6df);
+    return c == 0x3005 || c == 0x3007 || (c >= 0x2e80 && c <= 0x2fdf) ||
+           (c >= 0x31c0 && c <= 0x31ef) || (c >= 0x3400 && c <= 0x4dbf) ||
+           (c >= 0x4e00 && c <= 0x9fff) || (c >= 0xf900 && c <= 0xfaff) ||
+           (c >= 0x20000 && c <= 0x2a6df) || (c >= 0x2a700 && c <= 0x2b73f) ||
+           (c >= 0x2b740 && c <= 0x2b81f) || (c >= 0x2b820 && c <= 0x2ceaf) ||
+           (c >= 0x2ceb0 && c <= 0x2ebe0) || (c >= 0x30000 && c <= 0x323af);
 }
 
 bool is_nl(uint32_t c) { return c == '\r' || c == '\n'; }
@@ -135,26 +139,87 @@ bool is_space(uint32_t c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == 0xa0 || c == 0x3000;
 }
 
+bool is_cjk_punct(uint32_t c) {
+    if (c == 0x3005 || c == 0x3007)
+        return false;
+    if (c >= 0x3000 && c <= 0x303f)
+        return true;
+    if (c >= 0x2010 && c <= 0x2027)
+        return true;
+    if ((c >= 0xff01 && c <= 0xff20) || (c >= 0xff3b && c <= 0xff40) ||
+        (c >= 0xff5b && c <= 0xff65))
+        return true;
+    return false;
+}
+
 bool is_letter(uint32_t c, bool exclude_han) {
     if (exclude_han && is_han(c))
         return false;
     if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
         return true;
+    if (c >= 0xff21 && c <= 0xff3a)
+        return true;
+    if (c >= 0xff41 && c <= 0xff5a)
+        return true;
     if (c < 0xc0)
         return false;
-    if (is_num(c) || is_space(c) || is_nl(c))
+    if (is_num(c) || is_space(c) || is_nl(c) || is_cjk_punct(c))
         return false;
     if (c == 0xd7 || c == 0xf7)
         return false;
     if (is_han(c))
-        return true; // \p{L} includes Han unless excluded
+        return !exclude_han;
     return c >= 0xc0;
+}
+
+bool is_upper(uint32_t c) {
+    if (c >= 'A' && c <= 'Z')
+        return true;
+    if (c >= 0xff21 && c <= 0xff3a)
+        return true;
+    if (c >= 0xc0 && c <= 0xd6)
+        return true;
+    if (c >= 0xd8 && c <= 0xde)
+        return true;
+    return false;
+}
+
+bool is_lower(uint32_t c) {
+    if (c >= 'a' && c <= 'z')
+        return true;
+    if (c >= 0xff41 && c <= 0xff5a)
+        return true;
+    if (c >= 0xdf && c <= 0xf6)
+        return true;
+    if (c >= 0xf8 && c <= 0xff)
+        return true;
+    return false;
 }
 
 uint32_t low_ascii(uint32_t c) {
     if (c >= 'A' && c <= 'Z')
         return c + 32;
     return c;
+}
+
+int contraction_len(const uint32_t *cp, int i, int n) {
+    if (i >= n || cp[i] != '\'')
+        return 0;
+    if (i + 1 >= n)
+        return 0;
+    uint32_t d = low_ascii(cp[i + 1]);
+    if (i + 2 < n) {
+        uint32_t d2 = low_ascii(cp[i + 2]);
+        if ((d == 'r' && d2 == 'e') || (d == 'v' && d2 == 'e') || (d == 'l' && d2 == 'l'))
+            return 3;
+    }
+    if (d == 's' || d == 't' || d == 'm' || d == 'd')
+        return 2;
+    return 0;
+}
+
+bool is_word_prefix(uint32_t c) {
+    return !is_nl(c) && !is_letter(c, true) && !is_num(c) && !is_han(c);
 }
 
 } // namespace
@@ -319,13 +384,45 @@ void Tokenizer::pretok_kimi(const uint32_t *cp, const int *off, int n, const uns
             bpe_piece(p, off[start], off[i], ids);
             continue;
         }
-        if (is_letter(c, true)) {
+        // o200k letter word: optional leading non-L/N, Lu*/Ll+ or Lu+/Ll*, then contraction.
+        {
             int j = i;
-            while (j < n && is_letter(cp[j], true))
+            if (j < n && is_word_prefix(cp[j]) && j + 1 < n && is_letter(cp[j + 1], true))
                 ++j;
-            i = j;
-            bpe_piece(p, off[start], off[i], ids);
-            continue;
+            if (j < n && is_letter(cp[j], true)) {
+                const int word0 = j;
+                if (is_lower(cp[j]) || (is_upper(cp[j]) && j + 1 < n && is_lower(cp[j + 1]))) {
+                    while (j < n && is_upper(cp[j]))
+                        ++j;
+                    if (j < n && is_lower(cp[j])) {
+                        while (j < n && is_lower(cp[j]))
+                            ++j;
+                    } else if (word0 == j) {
+                        while (j < n && is_letter(cp[j], true))
+                            ++j;
+                    }
+                } else if (is_upper(cp[j])) {
+                    while (j < n && is_upper(cp[j]))
+                        ++j;
+                    while (j < n && is_lower(cp[j]))
+                        ++j;
+                } else {
+                    while (j < n && is_letter(cp[j], true))
+                        ++j;
+                }
+                j += contraction_len(cp, j, n);
+                i = j;
+                bpe_piece(p, off[start], off[i], ids);
+                continue;
+            }
+        }
+        {
+            int cl = contraction_len(cp, i, n);
+            if (cl > 0) {
+                i += cl;
+                bpe_piece(p, off[start], off[i], ids);
+                continue;
+            }
         }
         if (is_num(c)) {
             int j = i, k = 0;
@@ -340,10 +437,12 @@ void Tokenizer::pretok_kimi(const uint32_t *cp, const int *off, int n, const uns
         {
             int j = i;
             if (c == ' ' && j + 1 < n && !is_space(cp[j + 1]) && !is_letter(cp[j + 1], true) &&
-                !is_num(cp[j + 1]))
+                !is_num(cp[j + 1]) && !is_han(cp[j + 1]))
                 ++j;
-            if (j < n && !is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j])) {
-                while (j < n && !is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]))
+            if (j < n && !is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]) &&
+                !is_han(cp[j])) {
+                while (j < n && !is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]) &&
+                       !is_han(cp[j]))
                     ++j;
                 while (j < n && is_nl(cp[j]))
                     ++j;

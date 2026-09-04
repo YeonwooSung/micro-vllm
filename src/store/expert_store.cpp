@@ -68,7 +68,31 @@ Status ExpertStore::open(int n_layers, int n_experts, int64_t expert_bytes, int6
     return Status::Ok;
 }
 
+void ExpertStore::prefetch_one_async(ExpertKey key) {
+    wait_prefetch(prefetch_err_);
+    prefetch_err_.clear();
+    prefetch_st_ = Status::Ok;
+    prefetch_th_ = std::thread([this, key]() {
+        std::string err;
+        prefetch_st_ = prefetch(&key, 1, err);
+        if (prefetch_st_ != Status::Ok)
+            prefetch_err_ = err;
+    });
+}
+
+Status ExpertStore::wait_prefetch(std::string &err) {
+    if (prefetch_th_.joinable())
+        prefetch_th_.join();
+    if (prefetch_st_ != Status::Ok && err.empty())
+        err = prefetch_err_;
+    return prefetch_st_;
+}
+
 void ExpertStore::close() {
+    {
+        std::string ignored;
+        wait_prefetch(ignored);
+    }
     for (Layer &layer : layers_) {
         for (Slot &slot : layer.slots) {
             if (slot.base) {
@@ -85,6 +109,14 @@ void ExpertStore::close() {
             fds.push_back(m.fd);
         if (m.direct_fd >= 0)
             fds.push_back(m.direct_fd);
+        for (Piece &p : m.pieces) {
+            if (p.fd >= 0)
+                fds.push_back(p.fd);
+            if (p.direct_fd >= 0)
+                fds.push_back(p.direct_fd);
+            p.fd = -1;
+            p.direct_fd = -1;
+        }
         m.fd = -1;
         m.direct_fd = -1;
     }

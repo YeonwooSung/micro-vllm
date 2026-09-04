@@ -116,21 +116,26 @@ Wired (host tests cover the store path):
 
 - K3/GLM53 pack experts to `model_dir/.mvllm_*_experts.bin`, `register_expert`,
   then `lookup`/`release` on every routed expert. RAM `experts_` is cleared.
-- `prefetch_tail` loads expert `j+1..k` of the same layer. Store mutex is
-  dropped during `pread` so that I/O can overlap the current matmul.
+- After `lookup(j)` a helper thread `pread`s expert `j+1` while the current
+  GEMM runs. Store mutex is dropped during `pread`. The whole tail is not
+  prefetched up front (that thrashed a small LRU).
 - LRU budget is `MVLLM_EXPERT_GB`; slots capped at `n_experts`.
 - Darwin `F_NOCACHE`, Linux `O_DIRECT` + aligned window read.
 - H3: `acquire(b)` pins first, then `prefetch(b+1)` into the other slot.
 - MXFP4 IDOT (`matmul_mxfp4_i8`, NEON/AVX2). K3 uses it when `I % 32 == 0`.
 
-MLA (full-attn layers): absorbed NoPE. Cache is `kv_lora`-wide.
-`score_j = (W_kᵀ q) · c_j`, `out = W_v (Σ a_j c_j)`. `kv_b_proj` is
-folded at load (`mla_absorb_kvb`). `mla_bits` quantizes q/kv; `head_bits`
-quantizes o/g. Missing MLA tensors keep the dense Q/O stand-in.
+MLA (full-attn layers): absorbed NoPE. Cache stride is `kv_lora+qk_rope`
+(K3 `qk_rope=64`; GLM `0`). `score_j = (W_kᵀ q) · c_j + q_rot · R_j`,
+`out = W_v (Σ a_j c_j)`. `kv_b_proj` is folded at load (`mla_absorb_kvb`).
+`mla_bits` quantizes q/kv; `head_bits` quantizes o/g. Missing absorbed KV
+keeps the dense Q/O stand-in.
 
-`micro-vllm smoke --model DIR` opens safetensors **headers only**, reports
-prefix, expert counts, slot bytes, and LRU slots that fit in `expert_gb`.
-It does not allocate the expert cache.
+KDA `o_norm` is the official shared `[head_dim]` scale (not `[heads, head_dim]`).
+GLM mHC keeps M residual streams (stream 0 is the layer view; others stay
+mixed) and overlays `mhc.weight` / `hyper_connection.weight` when present.
+
+`micro-vllm smoke` fails on unreadable/corrupt shards. An empty dir is still
+the synthetic-pack success path.
 
 Metal / CUDA expert GEMM and H3 DiT (host engine, not `kernels.cu`):
 

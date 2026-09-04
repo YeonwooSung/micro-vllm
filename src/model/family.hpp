@@ -75,22 +75,25 @@ public:
 std::unique_ptr<FamilyEngine> make_engine(Family family);
 
 // CPU ops shared by K3 / GLM53.
+// out_norm is the official shared GDN scale [head_dim] (not packed [heads, head_dim]).
+// dt_n is the length of dt_bias: P, n_heads (broadcast), or 0.
 void kda_step(const float *x, int hidden, const KdaConfig &kda,
               const quant::QuantMat *w_q, const quant::QuantMat *w_k, const quant::QuantMat *w_v,
               const quant::QuantMat *w_b, const quant::QuantMat *w_fa, const quant::QuantMat *w_fb,
-              const float *dt_bias, const float *a_log, const quant::QuantMat *w_g,
+              const float *dt_bias, int dt_n, const float *a_log, const quant::QuantMat *w_g,
               const quant::QuantMat *w_o, const float *out_norm, float *S, float *y, float eps,
               const float *conv_q = nullptr, const float *conv_k = nullptr,
               const float *conv_v = nullptr, float *win_q = nullptr, float *win_k = nullptr,
               float *win_v = nullptr);
 
-// Causal depthwise conv: x[p] <- taps[p, :] · window, then shift window.
+// Causal depthwise conv: shift window, write x[p] into the last tap, then x[p] <- taps · window.
 void kda_short_conv(float *x, const float *taps, float *window, int channels, int k);
 
 // Absorbed NoPE MLA. Cache stride is kv_lora+qk_rope (L then raw R).
 // score_j = (W_k^T q_nope) · c_j + q_rot · R_j ;  out = W_v (Σ a_j c_j).
 // w_kt is [n_heads * kv_lora, qk_nope], w_v is [n_heads * v_head, kv_lora].
-// w_g is optional (K3 output gate). Missing q_a/q_b falls back to a dense Q/O stand-in.
+// w_g is optional (K3 output gate). Missing absorbed KV (kva/kt/v/cache) falls back
+// to a dense Q/O stand-in.
 void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::QuantMat *w_qa,
               const float *qa_ln, const quant::QuantMat *w_qb, const quant::QuantMat *w_kva,
               const float *kva_ln, const quant::QuantMat *w_kt, const quant::QuantMat *w_v,

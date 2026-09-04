@@ -45,7 +45,7 @@ void kda_short_conv(float *x, const float *taps, float *window, int channels, in
 void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
               const quant::QuantMat *w_k, const quant::QuantMat *w_v, const quant::QuantMat *w_b,
               const quant::QuantMat *w_fa, const quant::QuantMat *w_fb, const float *dt_bias,
-              const float *a_log, const quant::QuantMat *w_g, const quant::QuantMat *w_o,
+              int dt_n, const float *a_log, const quant::QuantMat *w_g, const quant::QuantMat *w_o,
               const float *out_norm, float *S, float *y, float eps, const float *conv_q,
               const float *conv_k, const float *conv_v, float *win_q, float *win_k, float *win_v) {
     const int H = kda.heads;
@@ -94,9 +94,16 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     } else {
         std::fill(z.begin(), z.end(), 0.f);
     }
-    if (dt_bias) {
+    if (dt_bias && dt_n >= P) {
         for (int i = 0; i < P; ++i)
             z[i] += dt_bias[i];
+    } else if (dt_bias && dt_n >= H) {
+        for (int h = 0; h < H; ++h)
+            for (int i = 0; i < D; ++i)
+                z[h * D + i] += dt_bias[h];
+    } else if (dt_bias && dt_n > 0) {
+        for (int i = 0; i < P; ++i)
+            z[i] += dt_bias[i % dt_n];
     }
 
     if (w_b && !w_b->empty())
@@ -157,7 +164,7 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
                 acc += Sh[i * D + j] * qh[i];
             oh[j] = acc;
         }
-        quant::rmsnorm(oh, out_norm ? out_norm + h * D : nullptr, oh, D, eps);
+        quant::rmsnorm(oh, out_norm, oh, D, eps);
         if (!out_norm) {
             // rmsnorm with w=1
         }

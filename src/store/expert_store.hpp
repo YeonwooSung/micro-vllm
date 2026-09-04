@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mvllm {
@@ -75,7 +76,13 @@ public:
     void release(ExpertView &view);
     Status prefetch(const ExpertKey *keys, size_t count, std::string &err);
 
-    // Load keys[1..] without pinning so expert 0's matmul can overlap I/O.
+    // Load one expert on a helper thread so the caller can GEMM the current
+    // expert while pread runs. Pair with wait_prefetch().
+    void prefetch_one_async(ExpertKey key);
+    Status wait_prefetch(std::string &err);
+
+    // Legacy helper: load keys[1..] synchronously (no overlap). Prefer
+    // prefetch_one_async of keys[i+1] after lookup(keys[i]).
     Status prefetch_tail(const ExpertKey *keys, size_t count, std::string &err) {
         if (count <= 1)
             return Status::Ok;
@@ -134,6 +141,9 @@ private:
     bool open_ = false;
     bool use_direct_ = true;
     std::mutex mu_;
+    std::thread prefetch_th_;
+    Status prefetch_st_ = Status::Ok;
+    std::string prefetch_err_;
 };
 
 // LRU slots per layer: budget against 4 KiB-aligned blobs, never more than n_experts.

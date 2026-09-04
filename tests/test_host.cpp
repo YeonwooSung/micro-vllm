@@ -398,6 +398,22 @@ static void test_tokenizer() {
     std::string k3 = tk.apply_chat(Family::KimiK3, {{"user", "hi"}}, false);
     CHECK(k3.find("<|im_start|>user") != std::string::npos);
     CHECK(k3.find("<|im_start|>assistant") != std::string::npos);
+
+    // Official Kimi pretok: contraction stays on the word; leading punct joins.
+    vocab += ",\"" + json_escape(std::string("'ll")) + "\":5";
+    vocab += ",\"" + json_escape(std::string("\"H")) + "\":6";
+    vocab += ",\"" + json_escape(std::string("ll")) + "\":7";
+    write_file(dir + "/tokenizer.json",
+               std::string("{\"model\":{\"type\":\"BPE\",\"vocab\":{") + vocab +
+                   "},\"merges\":[]},\"pre_tokenizer\":{\"type\":\"Sequence\",\"pretokenizers\":"
+                   "[{\"type\":\"Split\",\"pattern\":{\"Regex\":\"\\\\p{Han}+\"}}]}}");
+    Tokenizer km;
+    CHECK(km.load(dir, err) == Status::Ok);
+    CHECK(km.kimi());
+    CHECK(km.encode("I'll", ids) == Status::Ok);
+    CHECK(ids.size() == 2 && ids[0] == static_cast<int>('I') && ids[1] == 5);
+    CHECK(km.encode("\"Hello", ids) == Status::Ok);
+    CHECK(!ids.empty() && ids[0] == 6);
 }
 
 static void test_k3_xtml() {
@@ -1146,6 +1162,13 @@ static void test_shard_probe() {
     CHECK(r.shards_ok);
     std::string text = format_shard_report(r);
     CHECK(text.find("prefix=language_model.") != std::string::npos);
+
+    std::string bad = tmpdir();
+    write_file(bad + "/config.json", R"({"model_type":"kimi_linear"})");
+    write_file(bad + "/model.safetensors", std::string(8, '\0'));
+    ShardReport rb;
+    std::string berr;
+    CHECK(probe_shards(bad, rt, rb, berr) != Status::Ok);
 }
 
 static void test_dsa() {
@@ -1273,6 +1296,22 @@ static void test_kda_short_conv() {
     kda_short_conv(b, all_one_taps, win2, P, K);
     // after 2 steps window is [0,0,1,1] · [1,1,1,1] = 2
     CHECK_NEAR(b[0], 2.f, 1e-5);
+
+    // Shared [head_dim] o_norm must not be indexed as [heads, head_dim].
+    KdaConfig kda;
+    kda.heads = 2;
+    kda.head_dim = 4;
+    std::vector<float> xin(8, 0.1f), S(2 * 4 * 4, 0.f), y(8, 0.f), on(4, 2.f);
+    kda_step(xin.data(), 8, kda, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0,
+             nullptr, nullptr, nullptr, on.data(), S.data(), y.data(), 1e-6f);
+    for (float v : y)
+        CHECK(std::isfinite(v));
+
+    // mHC of [x, 0] is not a clone of x.
+    float st[4] = {1.f, 2.f, 0.f, 0.f};
+    mhc_mix(st, 2, 2, nullptr, 20, 1e-6f);
+    CHECK(std::fabs(st[0] - 1.f) > 1e-4f);
+    CHECK(std::isfinite(st[0]) && std::isfinite(st[2]));
 }
 
 static void test_mla_absorb() {

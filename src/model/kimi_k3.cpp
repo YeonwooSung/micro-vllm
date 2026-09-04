@@ -183,8 +183,10 @@ public:
                 bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
                 if (use_kda) {
                     kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
-                             &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(), d_.alog[l].data(),
-                             &d_.wg[l], &d_.wo[l], d_.out_norm[l].data(), S[l].data(), y.data(),
+                             &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
+                             static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
+                             &d_.wo[l], d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
+                             S[l].data(), y.data(),
                              cfg_.rms_eps,
                              l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
                                  ? d_.conv_q[l].data()
@@ -284,8 +286,11 @@ public:
                     bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
                     if (use_kda) {
                         kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
-                                 &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(), d_.alog[l].data(),
-                                 &d_.wg[l], &d_.wo[l], d_.out_norm[l].data(), S[l].data(), y.data(),
+                                 &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
+                                 static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
+                                 &d_.wo[l],
+                                 d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
+                                 S[l].data(), y.data(),
                                  cfg_.rms_eps,
                                  l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
                                      ? d_.conv_q[l].data()
@@ -363,7 +368,7 @@ public:
             out.tokens.push_back(next);
             if (is_stop_token(next, cfg_, gp.eos))
                 break;
-            Status sst = step(next, false);
+            Status sst = step(next, true);
             if (sst != Status::Ok)
                 return sst;
         }
@@ -711,12 +716,6 @@ private:
         std::vector<ExpertKey> keys(static_cast<size_t>(nu));
         for (int i = 0; i < nu; ++i)
             keys[static_cast<size_t>(i)] = {layer, uniq[i]};
-        if (rt_.pipe && nu > 0) {
-            Status pst = store_.prefetch_tail(keys.data(), keys.size(), err);
-            if (pst != Status::Ok)
-                return pst;
-        }
-
         std::vector<float> acc(static_cast<size_t>(C) * I, 0.f);
         std::vector<float> xb(static_cast<size_t>(C) * I), yb(static_cast<size_t>(C) * I);
         std::vector<float> ww(static_cast<size_t>(C));
@@ -729,12 +728,16 @@ private:
             Status st = store_.lookup({layer, eid}, v, err);
             if (st != Status::Ok || !v.data) {
                 store_.release(v);
+                std::string perr;
+                store_.wait_prefetch(perr);
                 if (st == Status::Ok) {
                     err = "empty expert view";
                     return Status::NotFound;
                 }
                 return st;
             }
+            if (rt_.pipe && ui + 1 < nu)
+                store_.prefetch_one_async(keys[static_cast<size_t>(ui + 1)]);
             int n = 0;
             for (int c = 0; c < C; ++c) {
                 float wsum = 0.f;
@@ -762,6 +765,11 @@ private:
                 }
             }
             store_.release(v);
+            if (rt_.pipe) {
+                Status pst = store_.wait_prefetch(err);
+                if (pst != Status::Ok)
+                    return pst;
+            }
         }
         for (int c = 0; c < C; ++c) {
             float *ac = acc.data() + static_cast<size_t>(c) * I;
@@ -869,7 +877,7 @@ private:
             d_.wdt[l].assign(P, 0.f);
             d_.alog[l].assign(cfg_.kda.heads, 0.f);
             d_.wb[l] = qmat_xavier(P, H, 80 + l, bits);
-            ones(d_.out_norm[l], P);
+            ones(d_.out_norm[l], cfg_.kda.head_dim > 0 ? cfg_.kda.head_dim : 1);
             xavier(d_.router[l], cfg_.moe.n_experts, H, 90 + l);
             d_.router_bias[l].assign(cfg_.moe.n_experts, 0.f);
             if (cfg_.moe.latent > 0) {

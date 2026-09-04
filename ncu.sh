@@ -1,1 +1,1 @@
-sudo /usr/local/cuda-12.8/bin/ncu --target-processes all ./build/micro-vllm
+sudo /usr/local/cuda-12.8/bin/ncu --target-processes all ./build/micro-vllm-cuda

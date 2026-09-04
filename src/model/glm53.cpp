@@ -147,23 +147,23 @@ public:
                 tid = 0;
             std::memcpy(h, embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
             for (int m = 1; m < M; ++m)
-                std::memcpy(streams.data() + static_cast<size_t>(m) * H, h, H * sizeof(float));
+                std::memset(streams.data() + static_cast<size_t>(m) * H, 0, H * sizeof(float));
+        };
+
+        auto mhc_layer = [&](float *st, int l) {
+            if (M > 1 && !mhc_alpha_[l].empty())
+                mhc_mix(st, H, M, mhc_alpha_[l].data(), cfg_.mhc.iters, cfg_.mhc.eps);
         };
 
         auto attn_one = [&](float *hh, int at, int l) {
-            if (M > 1 && !mhc_alpha_[l].empty()) {
-                std::vector<float> st(static_cast<size_t>(M) * H);
-                for (int m = 0; m < M; ++m)
-                    std::memcpy(st.data() + static_cast<size_t>(m) * H, hh, H * sizeof(float));
-                mhc_mix(st.data(), H, M, mhc_alpha_[l].data(), cfg_.mhc.iters, cfg_.mhc.eps);
-                std::memcpy(hh, st.data(), H * sizeof(float));
-            }
             std::vector<float> n(H), y(H, 0.f);
             quant::rmsnorm(hh, in_n_[l].data(), n.data(), H, cfg_.rms_eps);
             bool full = (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
             if (!full && cfg_.kda.heads > 0) {
                 kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l],
-                         &wfb_[l], wdt_[l].data(), alog_[l].data(), &wg_[l], &wo_[l], on_[l].data(),
+                         &wfb_[l], wdt_[l].data(), static_cast<int>(wdt_[l].size()),
+                         alog_[l].data(), &wg_[l], &wo_[l],
+                         on_[l].empty() ? nullptr : on_[l].data(),
                          S[l].data(), y.data(), cfg_.rms_eps,
                          l < static_cast<int>(conv_q_.size()) && !conv_q_[l].empty()
                              ? conv_q_[l].data()
@@ -226,13 +226,6 @@ public:
             }
             for (int i = 0; i < H; ++i)
                 hh[i] += y[i];
-            if (M > 1 && !mhc_alpha_[l].empty()) {
-                std::vector<float> st(static_cast<size_t>(M) * H);
-                for (int m = 0; m < M; ++m)
-                    std::memcpy(st.data() + static_cast<size_t>(m) * H, hh, H * sizeof(float));
-                mhc_mix(st.data(), H, M, mhc_alpha_[l].data(), cfg_.mhc.iters, cfg_.mhc.eps);
-                std::memcpy(hh, st.data(), H * sizeof(float));
-            }
         };
 
         auto ffn_one = [&](float *hh, int l) -> Status {
@@ -248,10 +241,12 @@ public:
         auto step = [&](int token) -> Status {
             embed_tok(token);
             for (int l = 0; l < L; ++l) {
+                mhc_layer(streams.data(), l);
                 attn_one(h, pos, l);
                 Status st = ffn_one(h, l);
                 if (st != Status::Ok)
                     return st;
+                mhc_layer(streams.data(), l);
             }
             ++pos;
             return Status::Ok;
@@ -261,35 +256,47 @@ public:
         for (size_t i = 0; i < prompt.size();) {
             const int C = static_cast<int>(
                 std::min(static_cast<size_t>(chunk), prompt.size() - i));
-            std::vector<float> act(static_cast<size_t>(C) * H);
+            std::vector<float> act(static_cast<size_t>(C) * M * H, 0.f);
             for (int c = 0; c < C; ++c) {
                 int tid = prompt[i + static_cast<size_t>(c)];
                 if (tid < 0 || tid >= cfg_.vocab)
                     tid = 0;
-                std::memcpy(act.data() + static_cast<size_t>(c) * H,
+                std::memcpy(act.data() + static_cast<size_t>(c) * M * H,
                             embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
             }
             for (int l = 0; l < L; ++l) {
-                for (int c = 0; c < C; ++c)
-                    attn_one(act.data() + static_cast<size_t>(c) * H, pos + c, l);
+                for (int c = 0; c < C; ++c) {
+                    float *st = act.data() + static_cast<size_t>(c) * M * H;
+                    mhc_layer(st, l);
+                    attn_one(st, pos + c, l);
+                }
                 if (l < cfg_.first_dense) {
                     for (int c = 0; c < C; ++c) {
+                        float *hh = act.data() + static_cast<size_t>(c) * M * H;
                         std::vector<float> n(H);
-                        quant::rmsnorm(act.data() + static_cast<size_t>(c) * H, out_n_[l].data(),
-                                       n.data(), H, cfg_.rms_eps);
-                        dense_mlp(l, n.data(), act.data() + static_cast<size_t>(c) * H);
+                        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                        dense_mlp(l, n.data(), hh);
                     }
                 } else {
-                    std::vector<float> norms(static_cast<size_t>(C) * H);
-                    for (int c = 0; c < C; ++c)
-                        quant::rmsnorm(act.data() + static_cast<size_t>(c) * H, out_n_[l].data(),
+                    std::vector<float> norms(static_cast<size_t>(C) * H), s0(static_cast<size_t>(C) * H);
+                    for (int c = 0; c < C; ++c) {
+                        float *hh = act.data() + static_cast<size_t>(c) * M * H;
+                        std::memcpy(s0.data() + static_cast<size_t>(c) * H, hh, H * sizeof(float));
+                        quant::rmsnorm(hh, out_n_[l].data(),
                                        norms.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
-                    Status st = moe_layer_n(l, norms.data(), act.data(), C, err);
+                    }
+                    Status st = moe_layer_n(l, norms.data(), s0.data(), C, err);
                     if (st != Status::Ok)
                         return st;
+                    for (int c = 0; c < C; ++c)
+                        std::memcpy(act.data() + static_cast<size_t>(c) * M * H,
+                                    s0.data() + static_cast<size_t>(c) * H, H * sizeof(float));
                 }
+                for (int c = 0; c < C; ++c)
+                    mhc_layer(act.data() + static_cast<size_t>(c) * M * H, l);
             }
-            std::memcpy(h, act.data() + static_cast<size_t>(C - 1) * H, H * sizeof(float));
+            std::memcpy(streams.data(), act.data() + static_cast<size_t>(C - 1) * M * H,
+                        static_cast<size_t>(M) * H * sizeof(float));
             pos += C;
             i += static_cast<size_t>(C);
         }
@@ -573,6 +580,18 @@ private:
                         conv_k_[i], 0, err);
             overlay_f32(files, P + "layers." + std::to_string(i) + ".self_attn.v_conv1d.weight",
                         conv_v_[i], 0, err);
+            {
+                const int Mn = cfg_.mhc.mult > 0 ? cfg_.mhc.mult : 1;
+                const int expect = Mn * Mn;
+                const std::string ly = P + "layers." + std::to_string(i) + ".";
+                const char *hc_names[] = {"mhc.weight", "mhc.alpha", "hyper_connection.weight",
+                                          "hc.alpha", "input_mhc.weight", nullptr};
+                for (int n = 0; hc_names[n]; ++n) {
+                    if (overlay_f32(files, ly + hc_names[n], mhc_alpha_[i], expect, err) ==
+                        Status::Ok)
+                        break;
+                }
+            }
             if (i < cfg_.first_dense) {
                 overlay_mat(files, P + "layers." + std::to_string(i) + ".mlp.gate_proj.weight",
                             mlp_gate_[i], bits, err);
@@ -720,9 +739,6 @@ private:
         std::vector<ExpertKey> keys(static_cast<size_t>(nu));
         for (int i = 0; i < nu; ++i)
             keys[static_cast<size_t>(i)] = {layer, uniq[i]};
-        if (rt_.pipe && nu > 0)
-            store_.prefetch_tail(keys.data(), keys.size(), err);
-
         std::vector<float> acc(static_cast<size_t>(C) * H, 0.f);
         std::vector<float> xb(static_cast<size_t>(C) * H), yb(static_cast<size_t>(C) * H);
         std::vector<float> ww(static_cast<size_t>(C));
@@ -731,8 +747,13 @@ private:
             const int eid = uniq[ui];
             ExpertView v{};
             Status st = store_.lookup({layer, eid}, v, err);
-            if (st != Status::Ok)
+            if (st != Status::Ok) {
+                std::string perr;
+                store_.wait_prefetch(perr);
                 return st;
+            }
+            if (rt_.pipe && ui + 1 < nu)
+                store_.prefetch_one_async(keys[static_cast<size_t>(ui + 1)]);
             int n = 0;
             for (int c = 0; c < C; ++c) {
                 float wsum = 0.f;
@@ -758,6 +779,11 @@ private:
                 }
             }
             store_.release(v);
+            if (rt_.pipe) {
+                Status pst = store_.wait_prefetch(err);
+                if (pst != Status::Ok)
+                    return pst;
+            }
         }
         for (int c = 0; c < C; ++c) {
             const float *x = xs + static_cast<size_t>(c) * H;
@@ -865,7 +891,7 @@ private:
             wdt_[l].assign(P, 0.f);
             alog_[l].assign(cfg_.kda.heads, 0.f);
             wb_[l] = qmat_xavier(P, H, 270 + l, bits);
-            ones(on_[l], P);
+            ones(on_[l], cfg_.kda.head_dim > 0 ? cfg_.kda.head_dim : 1);
             xavier(router_[l], std::max(cfg_.moe.n_experts, 1), H, 280 + l);
             router_bias_[l].assign(std::max(cfg_.moe.n_experts, 1), 0.f);
             mlp_gate_[l] = qmat_xavier(cfg_.dense_intermediate, H, 290 + l, bits);
