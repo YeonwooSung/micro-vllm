@@ -123,7 +123,9 @@ void attnres_mix(const std::vector<std::vector<float>> &snapshots, const float *
 
 void mhc_mix(float *streams, int hidden, int mult, const float *alpha, int iters, float eps);
 
-int moe_topk(const float *scores, int n, int k, int *idx, float *w);
+// Top-k on `choice`. Mix weights come from `mix` (official: unbiased σ) or
+// from `choice` when mix is null. Selected weights are clipped at 0 and L1-normalized.
+int moe_topk(const float *choice, int n, int k, int *idx, float *w, const float *mix = nullptr);
 
 // Unique expert ids from C tokens × topk, sorted. Returns count.
 int moe_union_ids(const int *idx, int n_tok, int topk, int *out, int out_cap);

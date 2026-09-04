@@ -57,7 +57,7 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     const int qn = orows(w_q, P);
     const int kn = orows(w_k, P);
     const int vn = orows(w_v, P);
-    const int bn = orows(w_b, P);
+    const int bn = (w_b && !w_b->empty()) ? w_b->O : H;
     const int gn = orows(w_g, P);
     const int zn = orows(w_fb, P);
     const int on = (w_o && !w_o->empty() && w_o->I > P) ? w_o->I : P;
@@ -122,7 +122,6 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
         const float *kh = k.data() + h * D;
         const float *vh = v.data() + h * D;
         const float *zh = z.data() + h * D;
-        const float *bh = b.data() + h * D;
         float *oh = o.data() + h * D;
 
         float alog = 0.f;
@@ -137,12 +136,18 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
             for (int j = 0; j < D; ++j)
                 Sh[i * D + j] *= alpha;
         }
-        // S <- (I - beta k k^T) S + beta k v^T
-        // beta is per-channel in the reference; we use per-head mean of σ(b).
+        // Official b_proj is [heads, hidden] → β_h = σ(b[h]). Packed [P] keeps a mean.
         float beta = 0.f;
-        for (int i = 0; i < D; ++i)
-            beta += quant::sigmoid(bh[i]);
-        beta /= static_cast<float>(D);
+        if (bn >= P && D > 0) {
+            const float *bh = b.data() + h * D;
+            for (int i = 0; i < D; ++i)
+                beta += quant::sigmoid(bh[i]);
+            beta /= static_cast<float>(D);
+        } else if (h < bn) {
+            beta = quant::sigmoid(b[h]);
+        } else {
+            beta = 0.5f;
+        }
 
         std::vector<float> ktS(D, 0.f);
         for (int j = 0; j < D; ++j) {
@@ -254,7 +259,7 @@ void mhc_mix(float *streams, int hidden, int mult, const float *alpha, int iters
     std::memcpy(streams, out.data(), out.size() * sizeof(float));
 }
 
-int moe_topk(const float *scores, int n, int k, int *idx, float *w) {
+int moe_topk(const float *choice, int n, int k, int *idx, float *w, const float *mix) {
     if (k > n)
         k = n;
     std::vector<int> order(n);
@@ -262,14 +267,14 @@ int moe_topk(const float *scores, int n, int k, int *idx, float *w) {
         order[i] = i;
     std::partial_sort(order.begin(), order.begin() + k, order.end(),
                       [&](int a, int b) {
-                          if (scores[a] == scores[b])
+                          if (choice[a] == choice[b])
                               return a < b;
-                          return scores[a] > scores[b];
+                          return choice[a] > choice[b];
                       });
     float sum = 0.f;
     for (int i = 0; i < k; ++i) {
         idx[i] = order[i];
-        w[i] = scores[order[i]];
+        w[i] = mix ? mix[order[i]] : choice[order[i]];
         if (w[i] < 0.f)
             w[i] = 0.f;
         sum += w[i];

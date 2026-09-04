@@ -718,15 +718,16 @@ private:
         std::vector<float> zs(static_cast<size_t>(C) * I, 0.f);
         for (int c = 0; c < C; ++c) {
             const float *x = xs + static_cast<size_t>(c) * H;
-            std::vector<float> scores(cfg_.moe.n_experts);
+            std::vector<float> scores(cfg_.moe.n_experts), choice(cfg_.moe.n_experts);
             quant::matmul_f32(scores.data(), x, d_.router[layer].data(), 1, H, cfg_.moe.n_experts);
             for (int i = 0; i < cfg_.moe.n_experts; ++i) {
+                scores[i] = quant::sigmoid(scores[i]);
                 float b = i < static_cast<int>(d_.router_bias[layer].size()) ? d_.router_bias[layer][i]
                                                                             : 0.f;
-                scores[i] = quant::sigmoid(scores[i]) + b;
+                choice[i] = scores[i] + b;
             }
-            moe_topk(scores.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
-                     wt.data() + static_cast<size_t>(c) * K);
+            moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
+                     wt.data() + static_cast<size_t>(c) * K, scores.data());
             if (cfg_.moe.latent > 0)
                 d_.lat_down[layer].gemm(zs.data() + static_cast<size_t>(c) * I, x, 1);
             else
@@ -898,7 +899,7 @@ private:
             d_.wfb[l] = qmat_xavier(P, cfg_.kda.head_dim, 70 + l, bits);
             d_.wdt[l].assign(P, 0.f);
             d_.alog[l].assign(cfg_.kda.heads, 0.f);
-            d_.wb[l] = qmat_xavier(P, H, 80 + l, bits);
+            d_.wb[l] = qmat_xavier(cfg_.kda.heads > 0 ? cfg_.kda.heads : 1, H, 80 + l, bits);
             ones(d_.out_norm[l], cfg_.kda.head_dim > 0 ? cfg_.kda.head_dim : 1);
             xavier(d_.router[l], cfg_.moe.n_experts, H, 90 + l);
             d_.router_bias[l].assign(cfg_.moe.n_experts, 0.f);

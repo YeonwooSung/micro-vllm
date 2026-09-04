@@ -1230,6 +1230,16 @@ static void test_dsa() {
 
 static void test_moe_union() {
     using namespace mvllm;
+    float sig[4] = {0.1f, 0.4f, 0.3f, 0.2f};
+    float choice[4] = {0.1f, 0.4f, 10.3f, 0.2f}; // expert 2 wins selection via bias
+    int top[2];
+    float wt[2];
+    CHECK(moe_topk(choice, 4, 2, top, wt, sig) == 2);
+    CHECK(top[0] == 2);
+    CHECK_NEAR(wt[0], 0.3f / (0.3f + 0.4f), 1e-5); // mix uses unbiased σ, not 10.3
+    CHECK(top[1] == 1);
+    CHECK_NEAR(wt[1], 0.4f / (0.3f + 0.4f), 1e-5);
+
     int idx[] = {3, 1, 3, 2, 1, -1};
     int out[8];
     int n = moe_union_ids(idx, 3, 2, out, 8);

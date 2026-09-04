@@ -723,16 +723,17 @@ private:
         std::vector<int> idx(static_cast<size_t>(C) * std::max(K, 1), -1);
         std::vector<float> wt(static_cast<size_t>(C) * std::max(K, 1), 0.f);
         for (int c = 0; c < C; ++c) {
-            std::vector<float> scores(cfg_.moe.n_experts);
+            std::vector<float> scores(cfg_.moe.n_experts), choice(cfg_.moe.n_experts);
             quant::matmul_f32(scores.data(), xs + static_cast<size_t>(c) * H, router_[layer].data(),
                               1, H, cfg_.moe.n_experts);
             for (int i = 0; i < cfg_.moe.n_experts; ++i) {
+                scores[i] = quant::sigmoid(scores[i]);
                 float b = i < static_cast<int>(router_bias_[layer].size()) ? router_bias_[layer][i]
                                                                           : 0.f;
-                scores[i] = quant::sigmoid(scores[i]) + b;
+                choice[i] = scores[i] + b;
             }
-            moe_topk(scores.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
-                     wt.data() + static_cast<size_t>(c) * K);
+            moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
+                     wt.data() + static_cast<size_t>(c) * K, scores.data());
         }
         std::vector<int> uniq(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1)));
         int nu = moe_union_ids(idx.data(), C, K, uniq.data(), static_cast<int>(uniq.size()));
@@ -891,7 +892,7 @@ private:
             wfb_[l] = qmat_xavier(P, cfg_.kda.head_dim, 260 + l, bits);
             wdt_[l].assign(P, 0.f);
             alog_[l].assign(cfg_.kda.heads, 0.f);
-            wb_[l] = qmat_xavier(P, H, 270 + l, bits);
+            wb_[l] = qmat_xavier(cfg_.kda.heads > 0 ? cfg_.kda.heads : 1, H, 270 + l, bits);
             ones(on_[l], cfg_.kda.head_dim > 0 ? cfg_.kda.head_dim : 1);
             xavier(router_[l], std::max(cfg_.moe.n_experts, 1), H, 280 + l);
             router_bias_[l].assign(std::max(cfg_.moe.n_experts, 1), 0.f);
