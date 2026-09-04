@@ -12,7 +12,7 @@ void usage() {
     std::cerr
         << "micro-vllm — consumer-hardware inference server\n"
         << "  micro-vllm info     --model DIR\n"
-        << "  micro-vllm generate --model DIR --prompt TEXT [--n N]\n"
+        << "  micro-vllm generate --model DIR --prompt TEXT [--n N] [--chat] [--think|--no-think]\n"
         << "  micro-vllm serve    --model DIR [--host H] [--port P]\n"
         << "  micro-vllm video    --model DIR --prompt TEXT [-o FILE]\n"
         << "\n"
@@ -88,6 +88,13 @@ int main(int argc, char **argv) {
         mvllm::GenParams gp;
         gp.max_new_tokens = n;
         gp.eos = engine.config().eos;
+        gp.apply_template = has(argc, argv, "--chat");
+        gp.think = has(argc, argv, "--think");
+        if (has(argc, argv, "--no-think"))
+            gp.think = false;
+        else if (gp.apply_template && engine.family() == mvllm::Family::Glm53 &&
+                 !has(argc, argv, "--think"))
+            gp.think = true;
         mvllm::GenResult out;
         st = engine.generate(prompt, gp, out, err);
         if (st != mvllm::Status::Ok) {

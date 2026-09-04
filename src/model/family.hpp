@@ -19,6 +19,7 @@ struct GenParams {
     int eos = -1;
     bool apply_template = true;
     bool think = false;
+    std::string reasoning_effort;
 };
 
 struct GenResult {

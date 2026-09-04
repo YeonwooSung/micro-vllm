@@ -46,6 +46,7 @@ std::string openai_chat_response(const std::string &id, const std::string &model
 std::string openai_models_response(const std::string &id);
 bool extract_json_string(const std::string &body, const char *key, std::string &out);
 bool extract_json_int(const std::string &body, const char *key, int &out);
+bool extract_json_bool(const std::string &body, const char *key, bool &out);
 bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &out);
 
 } // namespace mvllm

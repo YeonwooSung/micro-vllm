@@ -89,7 +89,7 @@ public:
                 }
             }
             out.tokens.push_back(next);
-            if ((gp.eos >= 0 && next == gp.eos) || (cfg_.eos && next == cfg_.eos))
+            if (is_stop_token(next, cfg_, gp.eos))
                 break;
             step(next);
         }

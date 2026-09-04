@@ -137,7 +137,10 @@ Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise
 Kimi pretok sniffs `\\p{Han}`. GLM chat is `[gMASK]<sop><|user|>…<|assistant|><think></think>`.
 K3 chat is segmented XTML (`<|open|>` / `<|sep|>` / `<|close|>` / `<|end_of_msg|>`)
 when those specials exist; otherwise `<|im_start|>role`. HTTP
-`/v1/chat/completions` applies the family template.
+`/v1/chat/completions` applies the family template. GLM chat defaults to
+think-on (`<|assistant|><think>` + Reasoning Effort); `--no-think` /
+`enable_thinking=false` closes the block. `generate --prompt` is raw.
+`eos_token_id` arrays (config + `generation_config.json`) are honored.
 
 Prefill is layer-major: a chunk of tokens walks each layer, then union-MoE loads
 each routed expert once for the chunk (`prefill=layer`). Decode stays C=1.

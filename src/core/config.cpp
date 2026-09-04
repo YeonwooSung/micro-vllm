@@ -312,7 +312,46 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
     if (text.contains("rope_parameters") && text["rope_parameters"].is_object())
         out.rope_theta = jfloat(text["rope_parameters"], "rope_theta", out.rope_theta);
     out.bos = jnum(text, "bos_token_id", 0);
-    out.eos = jnum(text, "eos_token_id", 0);
+
+    auto ingest_eos = [&](const json &j) {
+        if (!j.contains("eos_token_id") || j["eos_token_id"].is_null())
+            return;
+        const json &e = j["eos_token_id"];
+        auto push = [&](int id) {
+            if (id < 0)
+                return;
+            for (int have : out.eos_ids)
+                if (have == id)
+                    return;
+            out.eos_ids.push_back(id);
+        };
+        if (e.is_number_integer() || e.is_number()) {
+            int id = e.is_number_integer() ? e.get<int>() : static_cast<int>(e.get<double>());
+            push(id);
+        } else if (e.is_array()) {
+            for (const auto &el : e) {
+                if (el.is_number_integer())
+                    push(el.get<int>());
+                else if (el.is_number())
+                    push(static_cast<int>(el.get<double>()));
+            }
+        }
+        if (!out.eos_ids.empty())
+            out.eos = out.eos_ids[0];
+    };
+    ingest_eos(text);
+    ingest_eos(root);
+    {
+        json gen;
+        std::string graw = read_file(model_dir + "/generation_config.json");
+        if (!graw.empty()) {
+            try {
+                gen = json::parse(graw);
+                ingest_eos(gen);
+            } catch (...) {
+            }
+        }
+    }
 
     out.mla.n_heads = jnum(text, "num_attention_heads", 0);
     out.mla.q_lora = jnum(text, "q_lora_rank", 0);

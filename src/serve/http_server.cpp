@@ -449,6 +449,21 @@ Status HttpServer::serve_forever(std::string &err) {
                     max_tokens = 0;
                 GenParams gp;
                 gp.max_new_tokens = max_tokens;
+                extract_json_string(body, "reasoning_effort", gp.reasoning_effort);
+                bool enable_thinking = false;
+                if (path == "/v1/chat/completions" && engine_->family() == Family::Glm53)
+                    enable_thinking = true;
+                bool parsed_think = false;
+                if (extract_json_bool(body, "enable_thinking", enable_thinking))
+                    parsed_think = true;
+                if (gp.reasoning_effort == "none")
+                    enable_thinking = false;
+                else if (!parsed_think && !gp.reasoning_effort.empty() &&
+                         gp.reasoning_effort != "none")
+                    enable_thinking = true;
+                gp.think = enable_thinking;
+                if (path == "/v1/completions")
+                    gp.apply_template = false;
                 GenResult out;
                 std::string gerr;
                 Status st = Status::Ok;
@@ -537,6 +552,28 @@ std::string openai_models_response(const std::string &id) {
 
 bool extract_json_string(const std::string &body, const char *key, std::string &out) {
     return extract_json_string_from(body, key, 0, out, nullptr);
+}
+
+bool extract_json_bool(const std::string &body, const char *key, bool &out) {
+    if (!key)
+        return false;
+    std::string pat = std::string("\"") + key + "\"";
+    size_t pos = body.find(pat);
+    if (pos == std::string::npos)
+        return false;
+    size_t i = skip_ws(body, pos + pat.size());
+    if (i >= body.size() || body[i] != ':')
+        return false;
+    i = skip_ws(body, i + 1);
+    if (body.compare(i, 4, "true") == 0) {
+        out = true;
+        return true;
+    }
+    if (body.compare(i, 5, "false") == 0) {
+        out = false;
+        return true;
+    }
+    return false;
 }
 
 bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &out) {

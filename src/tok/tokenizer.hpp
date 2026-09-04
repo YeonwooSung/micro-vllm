@@ -21,10 +21,11 @@ public:
     Status encode(const std::string &text, std::vector<int> &ids) const;
     Status decode(const std::vector<int> &ids, std::string &text) const;
     // Prompt string for inspection. GLM: [gMASK]<sop>…; K3 XTML or <|im_start|> fallback.
-    std::string apply_chat(Family family, const std::vector<ChatMessage> &msgs, bool think) const;
+    std::string apply_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
+                          const std::string &effort = {}) const;
     // K3 XTML encodes tag/attr pieces as separate tok_encode calls (rank-BPE contract).
     Status encode_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
-                       std::vector<int> &ids) const;
+                       std::vector<int> &ids, const std::string &effort = {}) const;
     int id_of(const std::string &content) const;
     bool has_xtml() const;
     int vocab_size() const { return vocab_size_; }

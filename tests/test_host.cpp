@@ -311,6 +311,9 @@ static void test_http_helpers() {
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"},{\"role\":\"assistant\",\"content\":\"ok\"}]}",
         msgs));
     CHECK(msgs.size() == 2 && msgs[0].role == "user" && msgs[0].content == "hello");
+    bool th = false;
+    CHECK(extract_json_bool("{\"enable_thinking\":true}", "enable_thinking", th) && th);
+    CHECK(extract_json_bool("{\"enable_thinking\":false}", "enable_thinking", th) && !th);
 }
 
 static std::string gpt2_byte_token(int b) {
@@ -373,10 +376,15 @@ static void test_tokenizer() {
     CHECK(glm.find("[gMASK]<sop>") == 0);
     CHECK(glm.find("<|user|>hi") != std::string::npos);
     CHECK(glm.find("<|assistant|><think></think>") != std::string::npos);
+    CHECK(glm.find("Reasoning Effort") == std::string::npos);
     std::string glmt = tk.apply_chat(Family::Glm53, {{"user", "hi"}}, true);
+    CHECK(glmt.find("<|system|>Reasoning Effort: Max") != std::string::npos);
     CHECK(glmt.find("<|assistant|><think>") != std::string::npos);
-    CHECK(glmt.find("<think></think>") == std::string::npos ||
-          glmt.rfind("<|assistant|><think>") > glmt.find("<|user|>"));
+    CHECK(glmt.find("<think></think>") == std::string::npos);
+    std::string glml = tk.apply_chat(Family::Glm53, {{"user", "hi"}}, true, "low");
+    CHECK(glml.find("Reasoning Effort: Low") != std::string::npos);
+    CHECK(glml.find("[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>hi<|assistant|><think>") ==
+          0);
     std::string k3 = tk.apply_chat(Family::KimiK3, {{"user", "hi"}}, false);
     CHECK(k3.find("<|im_start|>user") != std::string::npos);
     CHECK(k3.find("<|im_start|>assistant") != std::string::npos);
@@ -459,6 +467,29 @@ static void test_k3_xtml() {
     tk.decode(hist, hs);
     CHECK(hs.find("hmm") != std::string::npos);
     CHECK(hs.find("ok") != std::string::npos);
+}
+
+static void test_glm_eos_ids() {
+    using namespace mvllm;
+    std::string dir = tmpdir();
+    write_file(dir + "/config.json", R"({
+      "model_type": "glm",
+      "architectures": ["Glm5ForConditionalGeneration"],
+      "hidden_size": 32,
+      "num_hidden_layers": 2,
+      "vocab_size": 40,
+      "eos_token_id": [7, 8, 9]
+    })");
+    write_file(dir + "/generation_config.json", R"({"eos_token_id":[7,8,9,11]})");
+    ModelConfig cfg;
+    std::string err;
+    CHECK(load_model_config(dir, cfg, err) == Status::Ok);
+    CHECK(cfg.eos == 7);
+    CHECK(cfg.eos_ids.size() == 4);
+    CHECK(cfg.eos_ids[3] == 11);
+    CHECK(is_stop_token(11, cfg, -1));
+    CHECK(is_stop_token(4, cfg, 4));
+    CHECK(!is_stop_token(3, cfg, -1));
 }
 
 static void test_config_and_families() {
@@ -1412,6 +1443,7 @@ int main() {
     test_http_helpers();
     test_tokenizer();
     test_k3_xtml();
+    test_glm_eos_ids();
     test_config_and_families();
     test_offload_generate();
     test_glm53_container();

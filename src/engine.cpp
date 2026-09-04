@@ -65,7 +65,7 @@ Status Engine::generate(const std::string &prompt, const GenParams &gp, GenResul
 Status Engine::generate_chat(const std::vector<ChatMessage> &msgs, const GenParams &gp,
                              GenResult &out, std::string &err) {
     std::vector<int> ids;
-    Status st = tok_.encode_chat(family_, msgs, gp.think, ids);
+    Status st = tok_.encode_chat(family_, msgs, gp.think, ids, gp.reasoning_effort);
     if (st != Status::Ok) {
         err = "tokenize failed";
         return st;

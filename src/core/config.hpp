@@ -100,6 +100,7 @@ struct ModelConfig {
     float rope_theta = 10000.f;
     int bos = 0;
     int eos = 0;
+    std::vector<int> eos_ids;
     std::vector<uint8_t> is_kda;  // 1 = KDA layer, 0 = full attn
     std::vector<uint8_t> is_full; // GLM53: 1 = MLA/DSA
     KdaConfig kda;
@@ -136,6 +137,17 @@ struct RuntimeConfig {
     std::string host = "127.0.0.1";
     std::string model_dir;
 };
+
+inline bool is_stop_token(int id, const ModelConfig &cfg, int extra_eos = -1) {
+    if (extra_eos >= 0 && id == extra_eos)
+        return true;
+    if (cfg.eos && id == cfg.eos)
+        return true;
+    for (int e : cfg.eos_ids)
+        if (e == id)
+            return true;
+    return false;
+}
 
 Status load_model_config(const std::string &model_dir, ModelConfig &out, std::string &err);
 Family sniff_family(const std::string &model_dir, std::string *model_type = nullptr);

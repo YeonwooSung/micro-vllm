@@ -596,10 +596,10 @@ void xtml_append_encode(const Tokenizer &tk, const std::string &s, std::vector<i
 } // namespace
 
 Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
-                              std::vector<int> &ids) const {
+                              std::vector<int> &ids, const std::string &effort) const {
     ids.clear();
     if (family != Family::KimiK3 || !has_xtml())
-        return encode(apply_chat(family, msgs, think), ids);
+        return encode(apply_chat(family, msgs, think, effort), ids);
 
     const int op = id_of("<|open|>");
     const int cl = id_of("<|close|>");
@@ -649,11 +649,17 @@ Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msg
 }
 
 std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> &msgs,
-                                  bool think) const {
+                                  bool think, const std::string &effort) const {
     if (family == Family::Glm53) {
         std::string p = "[gMASK]<sop>";
-        if (think)
-            p += "<|system|>Reasoning Effort: Max";
+        if (think) {
+            std::string label = "Max";
+            if (effort == "low" || effort == "minimal")
+                label = "Low";
+            else if (effort == "high" || effort == "medium")
+                label = "High";
+            p += "<|system|>Reasoning Effort: " + label;
+        }
         for (const auto &m : msgs) {
             if (m.role == "system")
                 p += "<|system|>" + m.content;
