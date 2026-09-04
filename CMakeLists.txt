@@ -2,7 +2,13 @@ cmake_minimum_required(VERSION 3.24)
 
 option(USE_HIP "Build with HIP for AMD GPUs" OFF)
 option(MVLLM_CUDA "Build the legacy CUDA Llama demo (micro-vllm-cuda)" OFF)
-option(MVLLM_HOST_ONLY "Build only the host engine and tests (no CUDA/HIP)" ON)
+option(MVLLM_HOST_ONLY "Build only the host engine and tests (no CUDA/HIP Llama demo)" ON)
+if(APPLE)
+    option(MVLLM_METAL "Metal expert GEMM and H3 DiT in the host engine" ON)
+else()
+    option(MVLLM_METAL "Metal expert GEMM and H3 DiT in the host engine" OFF)
+endif()
+option(MVLLM_GPU_CUDA "CUDA expert GEMM and H3 DiT in the host engine (not the Llama demo)" OFF)
 
 if(NOT USE_HIP AND MVLLM_CUDA AND NOT MVLLM_HOST_ONLY)
     if(EXISTS "/opt/cuda/bin/nvcc")
@@ -48,12 +54,41 @@ set(MVLLM_HOST_SOURCES
     src/model/llama.cpp
     src/serve/http_server.cpp
     src/engine.cpp
+    src/gpu/backend.cpp
 )
+
+if(APPLE AND MVLLM_METAL)
+    list(APPEND MVLLM_HOST_SOURCES src/gpu/metal.mm)
+endif()
+
+if(MVLLM_GPU_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        list(APPEND MVLLM_HOST_SOURCES src/gpu/cuda_gemm.cu)
+    else()
+        message(WARNING "MVLLM_GPU_CUDA=ON but no CUDA compiler was found")
+        set(MVLLM_GPU_CUDA OFF)
+    endif()
+endif()
 
 add_library(mvllm_host STATIC ${MVLLM_HOST_SOURCES})
 target_include_directories(mvllm_host PUBLIC src include)
 if(UNIX)
     target_link_libraries(mvllm_host PUBLIC pthread)
+endif()
+if(APPLE AND MVLLM_METAL)
+    set_source_files_properties(src/gpu/metal.mm PROPERTIES
+        COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+    target_compile_definitions(mvllm_host PUBLIC MVLLM_WITH_METAL=1)
+    target_link_libraries(mvllm_host PUBLIC "-framework Metal" "-framework Foundation")
+endif()
+if(MVLLM_GPU_CUDA)
+    set_target_properties(mvllm_host PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    target_compile_definitions(mvllm_host PUBLIC MVLLM_WITH_CUDA_GEMM=1)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(mvllm_host PUBLIC CUDA::cudart)
 endif()
 
 add_executable(micro-vllm src/main.cpp)

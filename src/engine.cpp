@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "gpu/backend.hpp"
 
 #include <sstream>
 
@@ -8,6 +9,7 @@ Status Engine::load(const std::string &model_dir, const RuntimeConfig &rt, std::
     rt_ = rt;
     rt_.model_dir = model_dir;
     model_dir_ = model_dir;
+    gpu::select(rt_.device);
     Status st = load_model_config(model_dir, cfg_, err);
     if (st != Status::Ok) {
         Family sniffed = sniff_family(model_dir);
@@ -129,7 +131,8 @@ std::string Engine::info() const {
     if (impl_)
         os << "  " << impl_->describe() << "\n";
     os << "  expert_gb=" << rt_.expert_gb << " bits=" << rt_.dense_bits
-       << " device=" << static_cast<int>(rt_.device) << "\n";
+       << " device=" << device_name(rt_.device) << " gpu=" << gpu::name()
+       << " compiled=" << gpu::compiled() << "\n";
     return os.str();
 }
 

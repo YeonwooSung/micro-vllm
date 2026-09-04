@@ -1,8 +1,10 @@
 #include "core/config.hpp"
 #include "engine.hpp"
+#include "gpu/backend.hpp"
 #include "io/file_io.hpp"
 #include "io/safetensors.hpp"
 #include "io/shard_probe.hpp"
+#include "model/family.hpp"
 #include "model/h3_vae.hpp"
 #include "quant/quant.hpp"
 #include "quant/weight.hpp"
@@ -1522,6 +1524,207 @@ static void test_h3_vae() {
     CHECK(magic == "P6");
 }
 
+static uint16_t f32_to_bf16(float f) {
+    uint32_t u = 0;
+    std::memcpy(&u, &f, sizeof(float));
+    return static_cast<uint16_t>(u >> 16);
+}
+
+static void max_abs_check(const float *a, const float *b, int n, float eps) {
+    for (int i = 0; i < n; ++i) {
+        CHECK(std::isfinite(a[i]) && std::isfinite(b[i]));
+        CHECK(std::fabs(a[i] - b[i]) < eps);
+    }
+}
+
+static void test_gpu_backend() {
+    using namespace mvllm;
+    using namespace mvllm::quant;
+
+    CHECK(std::strstr(gpu::compiled(), "cpu") != nullptr);
+    CHECK(parse_device("metal") == Device::Metal);
+    CHECK(parse_device("cuda") == Device::Cuda);
+    CHECK(parse_device("cpu") == Device::Cpu);
+    CHECK(std::strcmp(device_name(Device::Metal), "metal") == 0);
+
+    gpu::select(Device::Cpu);
+    CHECK(gpu::device() == Device::Cpu);
+    CHECK(std::strcmp(gpu::name(), "cpu") == 0);
+    CHECK(!gpu::gpu_ready());
+
+    const int O = 4, I = 64, S = 2;
+    std::vector<float> W(static_cast<size_t>(O) * I), X(static_cast<size_t>(S) * I), Yc(static_cast<size_t>(S) * O),
+        Yg(static_cast<size_t>(S) * O);
+    for (int i = 0; i < O * I; ++i)
+        W[static_cast<size_t>(i)] = ((i * 17) % 11 - 5) * 0.1f;
+    for (int i = 0; i < S * I; ++i)
+        X[static_cast<size_t>(i)] = ((i * 3) % 7 - 3) * 0.2f;
+    matmul_f32(Yc.data(), X.data(), W.data(), S, I, O);
+    gpu::gemm_f32(Yg.data(), X.data(), W.data(), S, I, O);
+    max_abs_check(Yc.data(), Yg.data(), S * O, 1e-5f);
+
+    std::vector<uint8_t> p4(static_cast<size_t>(O) * (I / 2));
+    std::vector<float> s4(static_cast<size_t>(O) * (I / 64));
+    quantize_int4_g64(W.data(), O, I, p4.data(), s4.data());
+    matmul_int4_g64(Yc.data(), X.data(), p4.data(), s4.data(), S, I, O);
+    gpu::gemm_int4_g64(Yg.data(), X.data(), p4.data(), s4.data(), S, I, O);
+    max_abs_check(Yc.data(), Yg.data(), S * O, 1e-5f);
+
+    std::vector<uint8_t> pm(static_cast<size_t>(O) * (I / 2)), sm(static_cast<size_t>(O) * (I / 32));
+    pack_mxfp4(W.data(), O, I, pm.data(), sm.data());
+    matmul_mxfp4(Yc.data(), X.data(), pm.data(), sm.data(), S, I, O);
+    gpu::gemm_mxfp4(Yg.data(), X.data(), pm.data(), sm.data(), S, I, O, false);
+    max_abs_check(Yc.data(), Yg.data(), S * O, 1e-5f);
+
+    const int kI = 32, kO = 32;
+    std::vector<float> W1(static_cast<size_t>(kO) * kI), W2(static_cast<size_t>(kI) * kO),
+        W3(static_cast<size_t>(kO) * kI), Z(kI);
+    for (int i = 0; i < kO * kI; ++i) {
+        W1[static_cast<size_t>(i)] = ((i * 13) % 11 - 5) * 0.08f;
+        W3[static_cast<size_t>(i)] = ((i * 19) % 9 - 4) * 0.07f;
+    }
+    for (int i = 0; i < kI * kO; ++i)
+        W2[static_cast<size_t>(i)] = ((i * 11) % 7 - 3) * 0.06f;
+    for (int i = 0; i < kI; ++i)
+        Z[static_cast<size_t>(i)] = ((i * 5) % 9 - 4) * 0.2f;
+    const int64_t w1p = static_cast<int64_t>(kO) * (kI / 2);
+    const int64_t w1s = static_cast<int64_t>(kO) * (kI / 32);
+    const int64_t w2p = static_cast<int64_t>(kI) * (kO / 2);
+    const int64_t w2s = static_cast<int64_t>(kI) * (kO / 32);
+    std::vector<uint8_t> kblob(static_cast<size_t>(2 * (w1p + w1s) + w2p + w2s));
+    pack_mxfp4(W1.data(), kO, kI, kblob.data(), kblob.data() + w1p);
+    pack_mxfp4(W2.data(), kI, kO, kblob.data() + w1p + w1s, kblob.data() + w1p + w1s + w2p);
+    pack_mxfp4(W3.data(), kO, kI, kblob.data() + w1p + w1s + w2p + w2s,
+               kblob.data() + w1p + w1s + w2p + w2s + w1p);
+    std::vector<float> yk(kI);
+    gpu::k3_expert(yk.data(), Z.data(), 1, kblob.data(), kI, kO, 4.f, 25.f, false);
+    for (float v : yk)
+        CHECK(std::isfinite(v));
+
+    const int gH = 64, gO = 64;
+    std::vector<float> G(static_cast<size_t>(gO) * gH), U(static_cast<size_t>(gO) * gH),
+        D(static_cast<size_t>(gH) * gO), Xg(gH);
+    for (int i = 0; i < gO * gH; ++i) {
+        G[static_cast<size_t>(i)] = ((i * 7) % 11 - 5) * 0.05f;
+        U[static_cast<size_t>(i)] = ((i * 5) % 9 - 4) * 0.05f;
+    }
+    for (int i = 0; i < gH * gO; ++i)
+        D[static_cast<size_t>(i)] = ((i * 3) % 7 - 3) * 0.04f;
+    for (int i = 0; i < gH; ++i)
+        Xg[static_cast<size_t>(i)] = ((i * 2) % 5 - 2) * 0.1f;
+    const int64_t pack = static_cast<int64_t>(gO) * gH / 2;
+    const int64_t sc = static_cast<int64_t>(gO) * gH / 64 * 4;
+    std::vector<uint8_t> gblob(static_cast<size_t>(3 * (pack + sc)));
+    quantize_int4_g64(G.data(), gO, gH, gblob.data(), reinterpret_cast<float *>(gblob.data() + pack));
+    quantize_int4_g64(U.data(), gO, gH, gblob.data() + pack + sc,
+                      reinterpret_cast<float *>(gblob.data() + pack + sc + pack));
+    quantize_int4_g64(D.data(), gH, gO, gblob.data() + 2 * (pack + sc),
+                      reinterpret_cast<float *>(gblob.data() + 2 * (pack + sc) + pack));
+    std::vector<float> yg(gH);
+    gpu::glm_expert(yg.data(), Xg.data(), 1, gblob.data(), gH, gO, 7.f);
+    for (float v : yg)
+        CHECK(std::isfinite(v));
+
+    const int H = 8, Inn = 4, Ffn = 8, T = 3, hd = 2;
+    const int64_t qkv_n = static_cast<int64_t>(3) * Inn * H;
+    const int64_t out_n = static_cast<int64_t>(H) * Inn;
+    const int64_t fc1_n = static_cast<int64_t>(2) * Ffn * H;
+    const int64_t fc2_n = static_cast<int64_t>(H) * Ffn;
+    std::vector<uint8_t> dblob(static_cast<size_t>(2 * (qkv_n + out_n + fc1_n + fc2_n)));
+    uint16_t *bf = reinterpret_cast<uint16_t *>(dblob.data());
+    for (int64_t i = 0; i < qkv_n + out_n + fc1_n + fc2_n; ++i)
+        bf[i] = f32_to_bf16(((i * 17) % 11 - 5) * 0.05f);
+    std::vector<float> xc(static_cast<size_t>(T) * H), xg(static_cast<size_t>(T) * H);
+    for (int i = 0; i < T * H; ++i)
+        xc[static_cast<size_t>(i)] = xg[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+    h3_dit_block_cpu(dblob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                     xc.data(), T, 1e-6f);
+    gpu::dit_block(dblob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                   xg.data(), T, 1e-6f);
+    max_abs_check(xc.data(), xg.data(), T * H, 1e-5f);
+
+    gpu::select(Device::Metal);
+#if defined(MVLLM_WITH_METAL)
+    CHECK(std::strstr(gpu::compiled(), "metal") != nullptr);
+#endif
+    if (gpu::gpu_ready()) {
+        std::vector<float> Ym(static_cast<size_t>(S) * O);
+        matmul_f32(Yc.data(), X.data(), W.data(), S, I, O);
+        gpu::gemm_f32(Ym.data(), X.data(), W.data(), S, I, O);
+        max_abs_check(Yc.data(), Ym.data(), S * O, 2e-4f);
+
+        gpu::gemm_int4_g64(Ym.data(), X.data(), p4.data(), s4.data(), S, I, O);
+        matmul_int4_g64(Yc.data(), X.data(), p4.data(), s4.data(), S, I, O);
+        max_abs_check(Yc.data(), Ym.data(), S * O, 2e-4f);
+
+        gpu::gemm_mxfp4(Ym.data(), X.data(), pm.data(), sm.data(), S, I, O, false);
+        matmul_mxfp4(Yc.data(), X.data(), pm.data(), sm.data(), S, I, O);
+        max_abs_check(Yc.data(), Ym.data(), S * O, 2e-4f);
+
+        std::vector<float> yk_g(kI);
+        gpu::select(Device::Cpu);
+        gpu::k3_expert(yk.data(), Z.data(), 1, kblob.data(), kI, kO, 4.f, 25.f, false);
+        gpu::select(Device::Metal);
+        gpu::k3_expert(yk_g.data(), Z.data(), 1, kblob.data(), kI, kO, 4.f, 25.f, false);
+        max_abs_check(yk.data(), yk_g.data(), kI, 2e-3f);
+
+        std::vector<float> yg_g(gH);
+        gpu::select(Device::Cpu);
+        gpu::glm_expert(yg.data(), Xg.data(), 1, gblob.data(), gH, gO, 7.f);
+        gpu::select(Device::Metal);
+        gpu::glm_expert(yg_g.data(), Xg.data(), 1, gblob.data(), gH, gO, 7.f);
+        max_abs_check(yg.data(), yg_g.data(), gH, 2e-3f);
+
+        std::vector<float> xd(static_cast<size_t>(T) * H);
+        for (int i = 0; i < T * H; ++i)
+            xd[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+        gpu::dit_block(dblob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                       xd.data(), T, 1e-6f);
+        max_abs_check(xc.data(), xd.data(), T * H, 2e-3f);
+
+        std::string dir = tmpdir();
+        write_file(dir + "/config.json",
+                   R"({"model_type":"minimax_h3","architectures":["MiniMaxH3"]})");
+        using Tup = std::tuple<std::string, std::string, std::vector<int64_t>, std::vector<uint8_t>>;
+        std::vector<Tup> ts;
+        auto bf16z = [&](size_t n) { return std::vector<uint8_t>(n * 2, 0); };
+        for (int b = 0; b < 2; ++b) {
+            std::string p = "blocks." + std::to_string(b) + ".";
+            ts.push_back({p + "attn.qkv_proj.weight", "BF16", {Inn * 3, H},
+                          bf16z(static_cast<size_t>(Inn * 3 * H))});
+            ts.push_back({p + "attn.out_proj.weight", "BF16", {H, Inn},
+                          bf16z(static_cast<size_t>(H * Inn))});
+            ts.push_back({p + "mlp.fc1.weight", "BF16", {Ffn * 2, H},
+                          bf16z(static_cast<size_t>(Ffn * 2 * H))});
+            ts.push_back({p + "mlp.fc2.weight", "BF16", {H, Ffn},
+                          bf16z(static_cast<size_t>(H * Ffn))});
+        }
+        write_safetensors_file(dir + "/model.safetensors", ts);
+        Engine eh;
+        RuntimeConfig rt;
+        rt.device = Device::Metal;
+        std::string err;
+        CHECK(eh.load(dir, rt, err) == Status::Ok);
+        CHECK(eh.info().find("gpu=metal") != std::string::npos);
+        H3GenParams hp;
+        hp.steps = 1;
+        hp.dit_layers = 2;
+        hp.width = 32;
+        hp.height = 32;
+        hp.frames = 5;
+        hp.output_path = dir + "/out.txt";
+        H3GenResult hr;
+        CHECK(eh.generate_video(hp, hr, err) == Status::Ok);
+        CHECK(hr.note.find("Metal DiT") != std::string::npos);
+    } else {
+        gpu::select(Device::Metal);
+        CHECK(gpu::device() == Device::Cpu);
+    }
+
+    gpu::select(Device::Cpu);
+    CHECK(gpu::device() == Device::Cpu);
+}
+
 int main() {
     test_quant();
     test_quant_mat();
@@ -1547,6 +1750,7 @@ int main() {
     test_mla_absorb();
     test_mla_generate();
     test_h3_vae();
+    test_gpu_backend();
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
 }

@@ -1,4 +1,5 @@
 #include "family.hpp"
+#include "../gpu/backend.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -716,12 +717,11 @@ private:
                 return pst;
         }
 
-        std::vector<float> acc(static_cast<size_t>(C) * I, 0.f), gate(O), up(O), hz(I);
-        const auto geom = make_k3_geom(I, O);
-        const int64_t w13p = geom.w1p;
-        const int64_t w13s = geom.w1s;
-        const int64_t w2p = geom.w2p;
-        const int64_t w2s = geom.w2s;
+        std::vector<float> acc(static_cast<size_t>(C) * I, 0.f);
+        std::vector<float> xb(static_cast<size_t>(C) * I), yb(static_cast<size_t>(C) * I);
+        std::vector<float> ww(static_cast<size_t>(C));
+        std::vector<int> cmap(static_cast<size_t>(C));
+        const bool idot = rt_.idot && gpu::device() == Device::Cpu;
 
         for (int ui = 0; ui < nu; ++ui) {
             const int eid = uniq[ui];
@@ -735,13 +735,7 @@ private:
                 }
                 return st;
             }
-            const uint8_t *blob = v.data;
-            const uint8_t *w1p = blob;
-            const uint8_t *w1s = w1p + w13p;
-            const uint8_t *w2p_ = w1s + w13s;
-            const uint8_t *w2s_ = w2p_ + w2p;
-            const uint8_t *w3p = w2s_ + w2s;
-            const uint8_t *w3s = w3p + w13p;
+            int n = 0;
             for (int c = 0; c < C; ++c) {
                 float wsum = 0.f;
                 for (int t = 0; t < K; ++t)
@@ -749,23 +743,23 @@ private:
                         wsum += wt[static_cast<size_t>(c) * K + t];
                 if (wsum == 0.f)
                     continue;
-                const float *z = zs.data() + static_cast<size_t>(c) * I;
-                if (rt_.idot) {
-                    quant::matmul_mxfp4_i8(gate.data(), z, w1p, w1s, 1, I, O);
-                    quant::matmul_mxfp4_i8(up.data(), z, w3p, w3s, 1, I, O);
-                } else {
-                    quant::matmul_mxfp4(gate.data(), z, w1p, w1s, 1, I, O);
-                    quant::matmul_mxfp4(up.data(), z, w3p, w3s, 1, I, O);
+                std::memcpy(xb.data() + static_cast<size_t>(n) * I,
+                            zs.data() + static_cast<size_t>(c) * I,
+                            static_cast<size_t>(I) * sizeof(float));
+                ww[static_cast<size_t>(n)] = wsum;
+                cmap[static_cast<size_t>(n)] = c;
+                ++n;
+            }
+            if (n > 0) {
+                gpu::k3_expert(yb.data(), xb.data(), n, v.data, I, O, cfg_.moe.situ_b1,
+                               cfg_.moe.situ_b2, idot);
+                for (int i = 0; i < n; ++i) {
+                    float *ac = acc.data() + static_cast<size_t>(cmap[static_cast<size_t>(i)]) * I;
+                    const float *hz = yb.data() + static_cast<size_t>(i) * I;
+                    const float wsum = ww[static_cast<size_t>(i)];
+                    for (int d = 0; d < I; ++d)
+                        ac[d] += wsum * hz[d];
                 }
-                for (int i = 0; i < O; ++i)
-                    gate[i] = quant::situ_glu(gate[i], up[i], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
-                if (rt_.idot)
-                    quant::matmul_mxfp4_i8(hz.data(), gate.data(), w2p_, w2s_, 1, O, I);
-                else
-                    quant::matmul_mxfp4(hz.data(), gate.data(), w2p_, w2s_, 1, O, I);
-                float *ac = acc.data() + static_cast<size_t>(c) * I;
-                for (int i = 0; i < I; ++i)
-                    ac[i] += wsum * hz[i];
             }
             store_.release(v);
         }

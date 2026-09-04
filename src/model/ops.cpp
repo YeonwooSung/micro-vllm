@@ -51,7 +51,18 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     const int H = kda.heads;
     const int D = kda.head_dim;
     const int P = H * D;
-    std::vector<float> q(P), k(P), v(P), b(P), z(P), g(P), o(P), mix(P);
+    auto orows = [](const quant::QuantMat *w, int fb) {
+        return (w && !w->empty() && w->O > fb) ? w->O : fb;
+    };
+    const int qn = orows(w_q, P);
+    const int kn = orows(w_k, P);
+    const int vn = orows(w_v, P);
+    const int bn = orows(w_b, P);
+    const int gn = orows(w_g, P);
+    const int zn = orows(w_fb, P);
+    const int on = (w_o && !w_o->empty() && w_o->I > P) ? w_o->I : P;
+    std::vector<float> q(qn, 0.f), k(kn, 0.f), v(vn, 0.f), b(bn, 0.f), z(zn, 0.f), g(gn, 0.f),
+        o(on, 0.f), mix(P);
 
     if (w_q)
         w_q->gemm(q.data(), x, 1);
@@ -76,7 +87,7 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     }
 
     // z = W_fb(W_fa x) + dt_bias   (low-rank dt)
-    std::vector<float> fa(D > 0 ? D : 1, 0.f);
+    std::vector<float> fa(orows(w_fa, D > 0 ? D : 1), 0.f);
     if (w_fa && w_fb && !w_fa->empty() && !w_fb->empty()) {
         w_fa->gemm(fa.data(), x, 1);
         w_fb->gemm(z.data(), fa.data(), 1);

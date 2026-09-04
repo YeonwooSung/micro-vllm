@@ -489,17 +489,8 @@ RuntimeConfig runtime_from_env() {
     auto get = [](const char *k) -> const char * {
         return std::getenv(k);
     };
-    if (const char *v = get("MVLLM_DEVICE")) {
-        std::string s(v);
-        if (s == "cuda")
-            rt.device = Device::Cuda;
-        else if (s == "hip")
-            rt.device = Device::Hip;
-        else if (s == "metal")
-            rt.device = Device::Metal;
-        else
-            rt.device = Device::Cpu;
-    }
+    if (const char *v = get("MVLLM_DEVICE"))
+        rt.device = parse_device(v);
     if (const char *v = get("MVLLM_BITS"))
         rt.dense_bits = std::atoi(v);
     if (const char *v = get("MVLLM_HEAD_BITS"))

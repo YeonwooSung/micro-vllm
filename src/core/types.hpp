@@ -41,6 +41,29 @@ enum class Family : int {
     H3 = 4,
 };
 
+inline const char *device_name(Device d) {
+    switch (d) {
+    case Device::Cuda:
+        return "cuda";
+    case Device::Hip:
+        return "hip";
+    case Device::Metal:
+        return "metal";
+    default:
+        return "cpu";
+    }
+}
+
+inline Device parse_device(const std::string &s) {
+    if (s == "cuda")
+        return Device::Cuda;
+    if (s == "hip")
+        return Device::Hip;
+    if (s == "metal")
+        return Device::Metal;
+    return Device::Cpu;
+}
+
 inline const char *family_name(Family f) {
     switch (f) {
     case Family::Llama:

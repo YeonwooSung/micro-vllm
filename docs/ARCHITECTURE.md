@@ -3,7 +3,10 @@
 Consumer-hardware inference server. The original CUDA Llama 3.2 1B engine
 stays as `micro-vllm-cuda`. The new `micro-vllm` binary is a family-aware
 host engine: disk/RAM/VRAM weight placement, CPU kernels, optional CUDA/HIP,
-and an OpenAI-compatible HTTP server.
+and an OpenAI-compatible HTTP server. Expert GEMM (K3 MXFP4, GLM int4-g64)
+and the H3 DiT residual run on Metal or CUDA when `--device metal|cuda` /
+`MVLLM_DEVICE` is set; otherwise the CPU kernels. The Llama CUDA demo stays
+in `src/kernels.cu` and is not used by this path.
 
 ## What the three source projects taught us
 
@@ -129,10 +132,19 @@ quantizes o/g. Missing MLA tensors keep the dense Q/O stand-in.
 prefix, expert counts, slot bytes, and LRU slots that fit in `expert_gb`.
 It does not allocate the expert cache.
 
+Metal / CUDA expert GEMM and H3 DiT (host engine, not `kernels.cu`):
+
+- `src/gpu/` dispatches `gemm_f32` / `gemm_int4_g64` / `gemm_mxfp4` and one
+  DiT residual (BF16→F32, RMSNorm, QKV attention, SwiGLU).
+- Apple builds compile `metal.mm` (`MVLLM_METAL`, default ON). CUDA expert
+  kernels live in `cuda_gemm.cu` (`MVLLM_GPU_CUDA`, default OFF).
+- `Engine::load` calls `gpu::select(rt.device)` and falls back to CPU if the
+  GPU is missing. Default device stays CPU so host tests stay deterministic.
+- K3/GLM union-MoE batches tokens that share an expert into one GEMM.
+
 Not absorbed yet:
 
 - Walking a live 1.5 TB / 195 GB dump on this machine (smoke is the dry path)
-- Metal / CUDA expert GEMM and H3 DiT compute
 - Official 36-block 2048-d VAE without a fixture (synth mix is the host path)
 - Audio VAE
 - K3 K3CHAT1 gateway wire / tool-call XTML (prompt chat uses segmented XTML)

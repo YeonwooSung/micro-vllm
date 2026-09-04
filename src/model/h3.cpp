@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "h3_vae.hpp"
+#include "../gpu/backend.hpp"
 #include "../io/safetensors.hpp"
 
 #include <algorithm>
@@ -129,8 +130,8 @@ public:
                 if (data && bytes > 0)
                     streamed++;
                 if (from_checkpoint_ && data && bytes == expect) {
-                    h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
-                                     latent.data(), tokens, 1e-6f);
+                    gpu::dit_block(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
+                                   latent.data(), tokens, 1e-6f);
                     ++computed;
                 }
                 blocks_.release(b);
@@ -160,6 +161,11 @@ public:
         out.height = vg.height;
         out.vae_used = true;
         out.output_path = hp.output_path.empty() ? (model_dir_ + "/h3_dryrun.txt") : hp.output_path;
+        const char *dit_tag = "CPU";
+        if (std::strcmp(gpu::name(), "metal") == 0)
+            dit_tag = "Metal";
+        else if (std::strcmp(gpu::name(), "cuda") == 0)
+            dit_tag = "CUDA";
         const bool ppm = ends_with(out.output_path, ".ppm");
         const bool raw = ends_with(out.output_path, ".rgb");
         if (ppm) {
@@ -195,14 +201,16 @@ public:
                   << " slots=" << blocks_.n_slots() << "\n"
                   << "latent_l2=" << checksum << "\n"
                   << "vae=" << (vae_.from_checkpoint ? "real" : "synth") << "\n"
-                  << "note: " << (computed ? "CPU DiT residual on streamed BF16" : "stream only")
+                  << "note: " << (computed ? std::string(dit_tag) + " DiT residual on streamed BF16"
+                                          : std::string("stream only"))
                   << "\n";
             }
             std::string ppath = out.output_path + ".ppm";
             h3_write_ppm(ppath, rgb.data(), vg.frames, vg.height, vg.width, err);
             err.clear();
         }
-        out.note = computed ? "checkpoint: CPU DiT residual on streamed BF16 matrices"
+        out.note = computed ? std::string("checkpoint: ") + dit_tag +
+                                  " DiT residual on streamed BF16 matrices"
                             : "dry-run: DiT blocks streamed from SSD (2-slot)";
         out.note += vae_.from_checkpoint ? " vae=real" : " vae=synth";
         err.clear();

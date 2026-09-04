@@ -1,4 +1,5 @@
 #include "family.hpp"
+#include "../gpu/backend.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -722,24 +723,17 @@ private:
         if (rt_.pipe && nu > 0)
             store_.prefetch_tail(keys.data(), keys.size(), err);
 
-        const auto geom = make_expert_geom(H, O);
-        const int64_t pack_go = geom.pack_go;
-        const int64_t sc_go = geom.sc_go;
-        const int64_t pack_d = geom.pack_d;
-        std::vector<float> acc(static_cast<size_t>(C) * H, 0.f), g(O), u(O), d(H);
+        std::vector<float> acc(static_cast<size_t>(C) * H, 0.f);
+        std::vector<float> xb(static_cast<size_t>(C) * H), yb(static_cast<size_t>(C) * H);
+        std::vector<float> ww(static_cast<size_t>(C));
+        std::vector<int> cmap(static_cast<size_t>(C));
         for (int ui = 0; ui < nu; ++ui) {
             const int eid = uniq[ui];
             ExpertView v{};
             Status st = store_.lookup({layer, eid}, v, err);
             if (st != Status::Ok)
                 return st;
-            const uint8_t *blob = v.data;
-            const uint8_t *gp = blob;
-            const float *gs = reinterpret_cast<const float *>(gp + pack_go);
-            const uint8_t *up = gp + pack_go + sc_go;
-            const float *us = reinterpret_cast<const float *>(up + pack_go);
-            const uint8_t *dp = up + pack_go + sc_go;
-            const float *ds = reinterpret_cast<const float *>(dp + pack_d);
+            int n = 0;
             for (int c = 0; c < C; ++c) {
                 float wsum = 0.f;
                 for (int t = 0; t < K; ++t)
@@ -747,15 +741,21 @@ private:
                         wsum += wt[static_cast<size_t>(c) * K + t];
                 if (wsum == 0.f)
                     continue;
-                const float *x = xs + static_cast<size_t>(c) * H;
-                quant::matmul_int4_g64(g.data(), x, gp, gs, 1, H, O);
-                quant::matmul_int4_g64(u.data(), x, up, us, 1, H, O);
-                for (int i = 0; i < O; ++i)
-                    g[i] = quant::clamped_swiglu(g[i], u[i], cfg_.moe.swiglu_limit);
-                quant::matmul_int4_g64(d.data(), g.data(), dp, ds, 1, O, H);
-                float *ac = acc.data() + static_cast<size_t>(c) * H;
-                for (int i = 0; i < H; ++i)
-                    ac[i] += wsum * d[i];
+                std::memcpy(xb.data() + static_cast<size_t>(n) * H, xs + static_cast<size_t>(c) * H,
+                            static_cast<size_t>(H) * sizeof(float));
+                ww[static_cast<size_t>(n)] = wsum;
+                cmap[static_cast<size_t>(n)] = c;
+                ++n;
+            }
+            if (n > 0) {
+                gpu::glm_expert(yb.data(), xb.data(), n, v.data, H, O, cfg_.moe.swiglu_limit);
+                for (int i = 0; i < n; ++i) {
+                    float *ac = acc.data() + static_cast<size_t>(cmap[static_cast<size_t>(i)]) * H;
+                    const float *d = yb.data() + static_cast<size_t>(i) * H;
+                    const float wsum = ww[static_cast<size_t>(i)];
+                    for (int j = 0; j < H; ++j)
+                        ac[j] += wsum * d[j];
+                }
             }
             store_.release(v);
         }

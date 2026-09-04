@@ -19,6 +19,8 @@ void usage() {
         << "  micro-vllm video    --model DIR --prompt TEXT [-o FILE]\n"
         << "\n"
         << "Families: llama | kimi_k3 | glm53 | h3\n"
+        << "  --device cpu|metal|cuda   expert GEMM / H3 DiT backend (default cpu)\n"
+        << "\n"
         << "Env: MVLLM_EXPERT_GB MVLLM_BITS MVLLM_HEAD_BITS MVLLM_MLA_BITS MVLLM_DEVICE MVLLM_PORT\n"
         << "     K3_EXPERT_GB GLM53_EXPERT_GB K3_BITS GLM53_BITS K3_MLA_BITS\n";
 }
@@ -63,6 +65,8 @@ int main(int argc, char **argv) {
         rt.host = h;
     if (const std::string g = arg(argc, argv, "--expert-gb"); !g.empty())
         rt.expert_gb = std::stod(g);
+    if (const std::string d = arg(argc, argv, "--device"); !d.empty())
+        rt.device = mvllm::parse_device(d);
 
     if (cmd == "smoke") {
         mvllm::ShardReport rep;
