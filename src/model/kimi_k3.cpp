@@ -335,9 +335,17 @@ public:
                         d_.mlp_down[l].gemm(down.data(), g.data(), 1);
                         for (int j = 0; j < H; ++j)
                             hh[j] += down[j];
+                        if (attnres) {
+                            for (int j = 0; j < H; ++j)
+                                prefixes[static_cast<size_t>(c)][j] += down[j];
+                        }
                     }
                 } else {
                     std::vector<float> norms(static_cast<size_t>(C) * H);
+                    std::vector<float> before;
+                    if (attnres) {
+                        before.assign(act.begin(), act.end());
+                    }
                     for (int c = 0; c < C; ++c)
                         quant::rmsnorm(act.data() + static_cast<size_t>(c) * H,
                                        d_.attn_out_n[l].data(),
@@ -345,7 +353,20 @@ public:
                     Status mst = moe_layer_n(l, norms.data(), act.data(), C, err);
                     if (mst != Status::Ok)
                         return mst;
+                    if (attnres) {
+                        for (int c = 0; c < C; ++c)
+                            for (int j = 0; j < H; ++j)
+                                prefixes[static_cast<size_t>(c)][j] +=
+                                    act[static_cast<size_t>(c) * H + j] -
+                                    before[static_cast<size_t>(c) * H + j];
+                    }
                 }
+            }
+            if (cfg_.attn_res.block_size > 0) {
+                for (int c = 0; c < C; ++c)
+                    attnres_mix(psnaps[static_cast<size_t>(c)], prefixes[static_cast<size_t>(c)].data(),
+                                nullptr, nullptr, act.data() + static_cast<size_t>(c) * H, H,
+                                cfg_.rms_eps);
             }
             std::memcpy(h.data(), act.data() + static_cast<size_t>(C - 1) * H, H * sizeof(float));
             pos += C;
@@ -784,6 +805,10 @@ private:
                 d_.lat_up[layer].gemm(uph.data(), ac, 1);
             else
                 std::memcpy(uph.data(), ac, H * sizeof(float));
+            float *h = hs + static_cast<size_t>(c) * H;
+            // Official: h += routed * scale + shared (do not scale the shared expert).
+            for (int i = 0; i < H; ++i)
+                h[i] += uph[i] * cfg_.moe.routed_scale;
             if (cfg_.moe.n_shared > 0 && !d_.shared_gate[layer].empty()) {
                 int inter = cfg_.dense_intermediate > 0 ? cfg_.dense_intermediate : O * 2;
                 std::vector<float> sg(inter), su(inter), sd(H);
@@ -793,11 +818,8 @@ private:
                     sg[i] = quant::situ_glu(sg[i], su[i], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
                 d_.shared_down[layer].gemm(sd.data(), sg.data(), 1);
                 for (int i = 0; i < H; ++i)
-                    uph[i] += sd[i];
+                    h[i] += sd[i];
             }
-            float *h = hs + static_cast<size_t>(c) * H;
-            for (int i = 0; i < H; ++i)
-                h[i] += uph[i] * cfg_.moe.routed_scale;
         }
         return Status::Ok;
     }

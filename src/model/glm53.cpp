@@ -788,6 +788,10 @@ private:
         for (int c = 0; c < C; ++c) {
             const float *x = xs + static_cast<size_t>(c) * H;
             float *ac = acc.data() + static_cast<size_t>(c) * H;
+            float *h = hs + static_cast<size_t>(c) * H;
+            // Official: h += routed * scale + shared (do not scale the shared expert).
+            for (int i = 0; i < H; ++i)
+                h[i] += ac[i] * cfg_.moe.routed_scale;
             if (!shared_gate_[layer].empty()) {
                 std::vector<float> sg(O), su(O), sd(H);
                 shared_gate_[layer].gemm(sg.data(), x, 1);
@@ -796,11 +800,8 @@ private:
                     sg[i] = quant::clamped_swiglu(sg[i], su[i], cfg_.moe.swiglu_limit);
                 shared_down_[layer].gemm(sd.data(), sg.data(), 1);
                 for (int i = 0; i < H; ++i)
-                    ac[i] += sd[i];
+                    h[i] += sd[i];
             }
-            float *h = hs + static_cast<size_t>(c) * H;
-            for (int i = 0; i < H; ++i)
-                h[i] += ac[i] * cfg_.moe.routed_scale;
         }
         return Status::Ok;
     }
