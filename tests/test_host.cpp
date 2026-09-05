@@ -1,6 +1,7 @@
 #include "core/config.hpp"
 #include "engine.hpp"
 #include "gpu/backend.hpp"
+#include "io/dump_env.hpp"
 #include "io/file_io.hpp"
 #include "io/safetensors.hpp"
 #include "io/shard_probe.hpp"
@@ -75,6 +76,7 @@
 #include <limits>
 #include <string>
 #include <tuple>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -950,6 +952,145 @@ static void test_config_and_families() {
     CHECK(hr.audio_used);
     CHECK(hr.note.find("audio=") != std::string::npos);
     CHECK(hr.note.find("pack=text+audio+video") != std::string::npos);
+
+    // DSV4 tiny (official-shaped config, synthetic weights)
+    std::string ddir = tmpdir();
+    write_file(ddir + "/config.json", R"({
+      "model_type": "deepseek_v4",
+      "architectures": ["DeepseekV4ForCausalLM"],
+      "hidden_size": 32,
+      "num_hidden_layers": 2,
+      "vocab_size": 40,
+      "num_attention_heads": 2,
+      "head_dim": 16,
+      "q_lora_rank": 16,
+      "qk_rope_head_dim": 8,
+      "o_groups": 1,
+      "o_lora_rank": 16,
+      "sliding_window": 8,
+      "index_n_heads": 2,
+      "index_head_dim": 16,
+      "index_topk": 2,
+      "n_routed_experts": 4,
+      "num_experts_per_tok": 2,
+      "n_shared_experts": 1,
+      "moe_intermediate_size": 16,
+      "hc_mult": 2,
+      "hc_sinkhorn_iters": 3,
+      "rms_norm_eps": 1e-6,
+      "routed_scaling_factor": 1.5,
+      "swiglu_limit": 10.0,
+      "bos_token_id": 0,
+      "eos_token_id": 1
+    })");
+    CHECK(sniff_family(ddir) == Family::Dsv4);
+    Engine ed;
+    CHECK(ed.load(ddir, rt, err) == Status::Ok);
+    CHECK(ed.generate("ok", gp, gr, err) == Status::Ok);
+    CHECK(gr.completion_tokens > 0);
+}
+
+static void test_dsv4_tiny() {
+    using namespace mvllm;
+    std::string err;
+    CHECK(std::string(family_name(Family::Dsv4)) == "dsv4");
+    CHECK(sniff_family("/tmp/does-not-exist-dsv4-flash") == Family::Dsv4);
+    CHECK(sniff_family("/tmp/does-not-exist-deepseek-v4") == Family::Dsv4);
+    CHECK(sniff_family("/tmp/does-not-exist-deepseek_v4") == Family::Dsv4);
+
+    std::string llama_dir = tmpdir();
+    write_file(llama_dir + "/config.json",
+               R"({"model_type":"llama","architectures":["LlamaForCausalLM"]})");
+    CHECK(sniff_family(llama_dir) == Family::Llama);
+
+    std::string glm_dir = tmpdir();
+    write_file(glm_dir + "/config.json",
+               R"({"model_type":"glm","architectures":["Glm5ForConditionalGeneration"]})");
+    CHECK(sniff_family(glm_dir) == Family::Glm53);
+
+    std::string kimi_dir = tmpdir();
+    write_file(kimi_dir + "/config.json",
+               R"({"model_type":"kimi_linear","architectures":["KimiLinearForCausalLM"]})");
+    CHECK(sniff_family(kimi_dir) == Family::KimiK3);
+
+    std::string full = tmpdir();
+    write_file(full + "/config.json", R"({
+      "model_type": "deepseek_v4",
+      "architectures": ["DeepSeekV4ForCausalLM"],
+      "hidden_size": 4096
+    })");
+    CHECK(sniff_family(full) == Family::Dsv4);
+    ModelConfig fcfg;
+    CHECK(load_model_config(full, fcfg, err) == Status::Ok);
+    CHECK(fcfg.family == Family::Dsv4);
+    CHECK(fcfg.hidden == 4096);
+    CHECK(fcfg.n_layers == 43);
+    CHECK(fcfg.moe.n_experts == 256);
+    CHECK(fcfg.moe.topk == 6);
+    CHECK(fcfg.moe.n_shared == 1);
+    CHECK(fcfg.mla.q_lora == 1024);
+    CHECK(fcfg.o_lora == 1024);
+    CHECK(fcfg.sliding_window == 128);
+    CHECK(fcfg.dsa.topk == 512);
+
+    std::string tiny = tmpdir();
+    write_file(tiny + "/config.json", R"({
+      "architectures": ["DeepseekV4ForCausalLM"],
+      "model_type": "deepseek_v4",
+      "hidden_size": 32,
+      "num_hidden_layers": 2,
+      "vocab_size": 32,
+      "num_attention_heads": 2,
+      "head_dim": 16,
+      "q_lora_rank": 16,
+      "qk_rope_head_dim": 8,
+      "o_groups": 1,
+      "o_lora_rank": 16,
+      "sliding_window": 8,
+      "index_n_heads": 2,
+      "index_head_dim": 16,
+      "index_topk": 2,
+      "n_routed_experts": 4,
+      "num_experts_per_tok": 2,
+      "n_shared_experts": 1,
+      "moe_intermediate_size": 16,
+      "hc_mult": 2,
+      "bos_token_id": 0,
+      "eos_token_id": 1
+    })");
+    ModelConfig tcfg;
+    CHECK(load_model_config(tiny, tcfg, err) == Status::Ok);
+    CHECK(tcfg.family == Family::Dsv4);
+    CHECK(tcfg.hidden == 32);
+    CHECK(tcfg.n_layers == 2);
+    CHECK(tcfg.moe.n_experts == 4);
+    CHECK(tcfg.moe.topk == 2);
+    CHECK(tcfg.head_dim == 16);
+    CHECK(tcfg.o_lora == 16);
+    CHECK(tcfg.sliding_window == 8);
+
+    Engine e;
+    RuntimeConfig rt;
+    rt.expert_gb = 0.01;
+    CHECK(e.load(tiny, rt, err) == Status::Ok);
+    std::string info = e.info();
+    CHECK(info.find("dsv4") != std::string::npos);
+    CHECK(info.find("checkpoint=synthetic") != std::string::npos);
+    GenParams gp;
+    gp.max_new_tokens = 4;
+    gp.eos = 1;
+    GenResult gr;
+    CHECK(e.generate("hi", gp, gr, err) == Status::Ok);
+    CHECK(gr.completion_tokens > 0);
+    CHECK(gr.completion_tokens <= 4);
+    CHECK(gr.prompt_tokens > 0);
+
+    Tokenizer tk;
+    std::string chat = tk.apply_chat(Family::Dsv4, {{"user", "hi"}}, false);
+    CHECK(chat.find("<｜User｜>") != std::string::npos);
+    CHECK(chat.find("<｜Assistant｜>") != std::string::npos);
+    std::string think = tk.apply_chat(Family::Dsv4, {{"user", "hi"}}, true);
+    CHECK(think.find("<think>") != std::string::npos);
 }
 
 static void test_idot() {
@@ -1644,6 +1785,75 @@ static void test_shard_probe() {
     ShardReport rb;
     std::string berr;
     CHECK(probe_shards(bad, rt, rb, berr) != Status::Ok);
+}
+
+static bool dump_env_readable_dir(const char *p) {
+    if (!p || !p[0])
+        return false;
+    struct stat st {};
+    if (::stat(p, &st) != 0 || !S_ISDIR(st.st_mode))
+        return false;
+    return ::access(p, R_OK) == 0;
+}
+
+static void test_live_dump_env() {
+    using namespace mvllm;
+    CHECK(dump_env_for(Family::KimiK3) == dump_env_k3());
+    CHECK(dump_env_for(Family::Glm53) == dump_env_glm53());
+    CHECK(dump_env_for(Family::H3) == dump_env_h3());
+    CHECK(dump_env_for(Family::Dsv4) == dump_env_dsv4());
+    CHECK(dump_env_for(Family::Llama) == nullptr);
+    CHECK(dump_env_for(Family::Unknown) == nullptr);
+    const char *dsv4 = dump_env_dsv4();
+    CHECK(dsv4 == nullptr || dsv4[0] != '\0');
+
+    RuntimeConfig rt;
+    rt.expert_gb = 8;
+
+    if (const char *k3 = dump_env_k3(); dump_env_readable_dir(k3)) {
+        const bool live_dump_k3_sniff = sniff_family(k3) == Family::KimiK3;
+        CHECK(live_dump_k3_sniff);
+        ShardReport live_k3_rep;
+        std::string live_k3_err;
+        const bool live_dump_k3_probe =
+            probe_shards(k3, rt, live_k3_rep, live_k3_err) == Status::Ok;
+        CHECK(live_dump_k3_probe);
+        const bool live_dump_k3_family = live_k3_rep.family == Family::KimiK3;
+        CHECK(live_dump_k3_family);
+    }
+    if (const char *glm = dump_env_glm53(); dump_env_readable_dir(glm)) {
+        const bool live_dump_glm53_sniff = sniff_family(glm) == Family::Glm53;
+        CHECK(live_dump_glm53_sniff);
+        ShardReport live_glm53_rep;
+        std::string live_glm53_err;
+        const bool live_dump_glm53_probe =
+            probe_shards(glm, rt, live_glm53_rep, live_glm53_err) == Status::Ok;
+        CHECK(live_dump_glm53_probe);
+        const bool live_dump_glm53_family = live_glm53_rep.family == Family::Glm53;
+        CHECK(live_dump_glm53_family);
+    }
+    if (const char *h3 = dump_env_h3(); dump_env_readable_dir(h3)) {
+        const bool live_dump_h3_sniff = sniff_family(h3) == Family::H3;
+        CHECK(live_dump_h3_sniff);
+        ShardReport live_h3_rep;
+        std::string live_h3_err;
+        const bool live_dump_h3_probe =
+            probe_shards(h3, rt, live_h3_rep, live_h3_err) == Status::Ok;
+        CHECK(live_dump_h3_probe);
+        const bool live_dump_h3_family = live_h3_rep.family == Family::H3;
+        CHECK(live_dump_h3_family);
+    }
+    if (const char *v4 = dump_env_dsv4(); dump_env_readable_dir(v4)) {
+        const bool live_dump_dsv4_sniff = sniff_family(v4) == Family::Dsv4;
+        CHECK(live_dump_dsv4_sniff);
+        ShardReport live_dsv4_rep;
+        std::string live_dsv4_err;
+        const bool live_dump_dsv4_probe =
+            probe_shards(v4, rt, live_dsv4_rep, live_dsv4_err) == Status::Ok;
+        CHECK(live_dump_dsv4_probe);
+        const bool live_dump_dsv4_family = live_dsv4_rep.family == Family::Dsv4;
+        CHECK(live_dump_dsv4_family);
+    }
 }
 
 static void test_dsa() {
@@ -2612,6 +2822,7 @@ int main() {
     test_tiktoken_model();
     test_glm_eos_ids();
     test_config_and_families();
+    test_dsv4_tiny();
     test_offload_generate();
     test_glm53_container();
     test_k3_mxfp4_container();
@@ -2619,6 +2830,7 @@ int main() {
     test_kda_short_conv();
     test_dsa();
     test_shard_probe();
+    test_live_dump_env();
     test_moe_union();
     test_dense_bits_generate();
     test_mla_absorb();

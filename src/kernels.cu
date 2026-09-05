@@ -1,21 +1,45 @@
 #include "cuda_to_hip.h"
 #include "kernels.cuh"
+#include "legacy/llama_dims.hpp"
 #include <iostream>
 
-// TODO perhaps share these between main.cpp and kernels.cu to not duplicate them?
+// RoPE sin/cos for (pos, freq), freq = 0..ROPE_FREQS-1. Filled once on first rope call.
+static float *d_rope_cos = nullptr;
+static float *d_rope_sin = nullptr;
 
-constexpr int N_LAYERS = 16; // TODO: hardcoded for llama 3.2 1B, just like any other value for now
-constexpr int EMBEDDING_LENGTH = 2048;
-constexpr int KV_DIM = 512;
-constexpr int HEAD_DIM = 64;
-constexpr float SQRT_HEAD_DIM = 8;
-constexpr int NUM_Q_HEADS = 32;
-constexpr int GQA_Q_TO_K_RATIO = 4;
-constexpr int MAX_SEQ_LEN = 2048; // TODO: make it tunable
-constexpr int BLOCK_SIZE = 16;    // TODO: tunable as well, defined the size of a single page in pagedattn
-constexpr int V_OFFSET = BLOCK_SIZE * KV_DIM * sizeof(__nv_bfloat16);
-constexpr int BLOCK_BYTES = V_OFFSET * 2;                    // * 2 because K and V
-constexpr int MAX_BLOCKS_PER_SEQ = MAX_SEQ_LEN / BLOCK_SIZE; // 2048 / 16 = 128
+__global__ void initRopeTablesKernel(float *rope_cos, float *rope_sin)
+{
+    int pos = blockIdx.x;
+    int freq = threadIdx.x;
+    if (pos >= MAX_SEQ_LEN || freq >= ROPE_FREQS)
+    {
+        return;
+    }
+    int double_i = 2 * freq;
+    float theta = 1.0 / (pow(500000.0, ((float)double_i / HEAD_DIM)));
+    float angle = pos * theta;
+    rope_cos[pos * ROPE_FREQS + freq] = cos(angle);
+    rope_sin[pos * ROPE_FREQS + freq] = sin(angle);
+}
+
+static void ensureRopeTables()
+{
+    if (d_rope_cos != nullptr)
+    {
+        return;
+    }
+    const size_t n = static_cast<size_t>(MAX_SEQ_LEN) * ROPE_FREQS;
+    cudaMalloc(&d_rope_cos, n * sizeof(float));
+    cudaMalloc(&d_rope_sin, n * sizeof(float));
+    initRopeTablesKernel<<<MAX_SEQ_LEN, ROPE_FREQS>>>(d_rope_cos, d_rope_sin);
+#ifdef DEBUG
+    cudaError error = cudaGetLastError();
+    if (error != cudaError::cudaSuccess)
+    {
+        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
+    }
+#endif
+}
 
 // prefill / shared
 
@@ -87,18 +111,20 @@ void rmsNorm(__nv_bfloat16 *input, __nv_bfloat16 *output, __nv_bfloat16 *norm_we
 #endif
 }
 
-__global__ void ropeKernel(__nv_bfloat16 *input, int num_tokens, int proj_dim)
+__global__ void ropeKernel(__nv_bfloat16 *input, int num_tokens, int proj_dim, const float *rope_cos, const float *rope_sin)
 {
-    if (2 * threadIdx.x + 1 + blockIdx.x * proj_dim < num_tokens * proj_dim)
+    int pair = threadIdx.x;
+    int pos = blockIdx.x;
+    // 2*pair+1 must stay inside this token row (proj_dim elements)
+    if (pos < num_tokens && pos < MAX_SEQ_LEN && 2 * pair + 1 < proj_dim)
     {
-        // TODO: precompute thetas, angles and perhaps sin/cos vals and reuse it across all kernel invocations
-        int double_i = 2 * (threadIdx.x % 32);
-        float theta = 1.0 / (pow(500000.0, ((float)double_i / HEAD_DIM)));
-        float angle = blockIdx.x * theta;
-        __nv_bfloat16 prev_2i = input[2 * threadIdx.x + blockIdx.x * proj_dim];
-        __nv_bfloat16 prev_2i_1 = input[2 * threadIdx.x + 1 + blockIdx.x * proj_dim];
-        input[2 * threadIdx.x + blockIdx.x * proj_dim] = (__nv_bfloat16)((float)prev_2i * cos(angle) - (float)prev_2i_1 * sin(angle));
-        input[2 * threadIdx.x + 1 + blockIdx.x * proj_dim] = (__nv_bfloat16)((float)prev_2i * sin(angle) + (float)prev_2i_1 * cos(angle));
+        int freq = pair % ROPE_FREQS;
+        float cos_a = rope_cos[pos * ROPE_FREQS + freq];
+        float sin_a = rope_sin[pos * ROPE_FREQS + freq];
+        __nv_bfloat16 prev_2i = input[2 * pair + pos * proj_dim];
+        __nv_bfloat16 prev_2i_1 = input[2 * pair + 1 + pos * proj_dim];
+        input[2 * pair + pos * proj_dim] = (__nv_bfloat16)((float)prev_2i * cos_a - (float)prev_2i_1 * sin_a);
+        input[2 * pair + 1 + pos * proj_dim] = (__nv_bfloat16)((float)prev_2i * sin_a + (float)prev_2i_1 * cos_a);
     }
 }
 
@@ -113,7 +139,8 @@ void rope(__nv_bfloat16 *input, int num_tokens, int proj_dim)
         return;
     }
 
-    ropeKernel<<<num_tokens, num_threads>>>(input, num_tokens, proj_dim);
+    ensureRopeTables();
+    ropeKernel<<<num_tokens, num_threads>>>(input, num_tokens, proj_dim, d_rope_cos, d_rope_sin);
 #ifdef DEBUG
     cudaError error = cudaGetLastError();
     if (error != cudaError::cudaSuccess)
@@ -279,18 +306,19 @@ void embeddingGatherDecode(int *gpu_last_tokens, int num_tokens, __nv_bfloat16 *
 #endif
 }
 
-__global__ void ropeKernelDecode(__nv_bfloat16 *input, int position_in_sequence, int proj_dim)
+__global__ void ropeKernelDecode(__nv_bfloat16 *input, int position_in_sequence, int proj_dim, const float *rope_cos, const float *rope_sin)
 {
-    if (2 * threadIdx.x + 1 < proj_dim) // TODO: check correctness
+    int pair = threadIdx.x;
+    // 2*pair+1 must stay inside this token row (proj_dim elements)
+    if (2 * pair + 1 < proj_dim && position_in_sequence >= 0 && position_in_sequence < MAX_SEQ_LEN)
     {
-        // TODO: precompute thetas, angles and perhaps sin/cos vals and reuse it across all kernel invocations
-        int double_i = 2 * (threadIdx.x % 32);
-        float theta = 1.0 / (pow(500000.0, ((float)double_i / HEAD_DIM)));
-        float angle = position_in_sequence * theta;
-        __nv_bfloat16 prev_2i = input[2 * threadIdx.x];
-        __nv_bfloat16 prev_2i_1 = input[2 * threadIdx.x + 1];
-        input[2 * threadIdx.x] = (__nv_bfloat16)((float)prev_2i * cos(angle) - (float)prev_2i_1 * sin(angle));
-        input[2 * threadIdx.x + 1] = (__nv_bfloat16)((float)prev_2i * sin(angle) + (float)prev_2i_1 * cos(angle));
+        int freq = pair % ROPE_FREQS;
+        float cos_a = rope_cos[position_in_sequence * ROPE_FREQS + freq];
+        float sin_a = rope_sin[position_in_sequence * ROPE_FREQS + freq];
+        __nv_bfloat16 prev_2i = input[2 * pair];
+        __nv_bfloat16 prev_2i_1 = input[2 * pair + 1];
+        input[2 * pair] = (__nv_bfloat16)((float)prev_2i * cos_a - (float)prev_2i_1 * sin_a);
+        input[2 * pair + 1] = (__nv_bfloat16)((float)prev_2i * sin_a + (float)prev_2i_1 * cos_a);
     }
 }
 
@@ -305,7 +333,8 @@ void ropeDecode(__nv_bfloat16 *input, int position_in_sequence, int proj_dim)
         return;
     }
 
-    ropeKernelDecode<<<1, num_threads>>>(input, position_in_sequence, proj_dim);
+    ensureRopeTables();
+    ropeKernelDecode<<<1, num_threads>>>(input, position_in_sequence, proj_dim, d_rope_cos, d_rope_sin);
 #ifdef DEBUG
     cudaError error = cudaGetLastError();
     if (error != cudaError::cudaSuccess)

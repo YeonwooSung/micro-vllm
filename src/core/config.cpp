@@ -170,6 +170,60 @@ void apply_family_defaults(ModelConfig &cfg) {
         if (!cfg.dense_intermediate)
             cfg.dense_intermediate = 8192;
         break;
+    case Family::Dsv4:
+        if (!cfg.hidden)
+            cfg.hidden = 4096;
+        if (!cfg.n_layers)
+            cfg.n_layers = 43;
+        if (!cfg.vocab && full)
+            cfg.vocab = 129280;
+        if (!cfg.moe.n_experts && full)
+            cfg.moe.n_experts = 256;
+        if (!cfg.moe.topk)
+            cfg.moe.topk = 6;
+        if (!cfg.moe.intermediate && full)
+            cfg.moe.intermediate = 2048;
+        if (!cfg.moe.n_shared)
+            cfg.moe.n_shared = 1;
+        if (cfg.moe.routed_scale == 1.f)
+            cfg.moe.routed_scale = 1.5f;
+        if (!cfg.moe.swiglu_limit)
+            cfg.moe.swiglu_limit = 10.f;
+        if (!cfg.mla.n_heads)
+            cfg.mla.n_heads = full ? 64 : (cfg.n_q_heads > 0 ? cfg.n_q_heads : 2);
+        if (!cfg.head_dim)
+            cfg.head_dim = full ? 512 : 0;
+        if (!cfg.mla.q_lora && full)
+            cfg.mla.q_lora = 1024;
+        if (!cfg.mla.qk_rope && full)
+            cfg.mla.qk_rope = 64;
+        if (!cfg.mla.qk_nope && cfg.head_dim > cfg.mla.qk_rope)
+            cfg.mla.qk_nope = cfg.head_dim - cfg.mla.qk_rope;
+        if (!cfg.mla.v_head)
+            cfg.mla.v_head = cfg.head_dim;
+        if (!cfg.mla.kv_lora && full)
+            cfg.mla.kv_lora = cfg.head_dim;
+        if (!cfg.o_lora && full)
+            cfg.o_lora = 1024;
+        if (!cfg.o_groups && full)
+            cfg.o_groups = 8;
+        if (!cfg.sliding_window && full)
+            cfg.sliding_window = 128;
+        if (!cfg.dsa.topk && full)
+            cfg.dsa.topk = 512;
+        if (!cfg.dsa.n_heads && full)
+            cfg.dsa.n_heads = 64;
+        if (!cfg.dsa.head_dim && full)
+            cfg.dsa.head_dim = 128;
+        if (!cfg.mhc.mult)
+            cfg.mhc.mult = 4;
+        if (!cfg.mhc.iters)
+            cfg.mhc.iters = 20;
+        cfg.mla.nope = cfg.mla.qk_rope == 0;
+        cfg.mla.output_gate = false;
+        if (cfg.first_dense >= cfg.n_layers && cfg.n_layers > 0)
+            cfg.first_dense = 0;
+        break;
     default:
         break;
     }
@@ -241,6 +295,19 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
     if (has(mt, "minimax") || has(arch, "MiniMax") || has(mt, "h3") || lower_has("dit") ||
         lower_has("minimax-h3") || lower_has("transformer_blocks"))
         return Family::H3;
+    {
+        std::string mt_l = mt, arch_l = arch;
+        for (char &c : mt_l)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        for (char &c : arch_l)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        if (has(mt_l, "deepseek") || has(mt_l, "dsv4") || has(arch_l, "deepseek") ||
+            has(arch_l, "dsv4") || has(arch, "DeepseekV4") || has(arch, "DeepSeekV4") ||
+            has(arch, "DeepSeek-V4"))
+            return Family::Dsv4;
+    }
 
     // Directory name fallback.
     std::string dir = model_dir;
@@ -255,6 +322,9 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
         return Family::H3;
     if (dir.find("llama") != std::string::npos)
         return Family::Llama;
+    if (dir.find("dsv4") != std::string::npos || dir.find("deepseek-v4") != std::string::npos ||
+        dir.find("deepseek_v4") != std::string::npos || dir.find("deepseekv4") != std::string::npos)
+        return Family::Dsv4;
     return Family::Unknown;
 }
 
@@ -298,9 +368,12 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
         out.first_dense = static_cast<int>(text["mlp_layer_types"].size());
         int i = 0;
         for (const auto &kind : text["mlp_layer_types"]) {
-            if (kind.is_string() && kind.get<std::string>().find("sparse") != std::string::npos) {
-                out.first_dense = i;
-                break;
+            if (kind.is_string()) {
+                const std::string s = kind.get<std::string>();
+                if (s.find("sparse") != std::string::npos || s.find("moe") != std::string::npos) {
+                    out.first_dense = i;
+                    break;
+                }
             }
             ++i;
         }
@@ -363,7 +436,12 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
     out.mla.v_head = jnum(text, "v_head_dim", 0);
     out.n_q_heads = jnum(text, "num_attention_heads", 0);
     out.n_kv_heads = jnum(text, "num_key_value_heads", out.n_q_heads);
-    out.head_dim = out.hidden && out.n_q_heads ? out.hidden / out.n_q_heads : 0;
+    out.head_dim = jnum(text, "head_dim", 0);
+    if (!out.head_dim)
+        out.head_dim = out.hidden && out.n_q_heads ? out.hidden / out.n_q_heads : 0;
+    out.o_lora = jnum(text, "o_lora_rank", 0);
+    out.o_groups = jnum(text, "o_groups", 0);
+    out.sliding_window = jnum(text, "sliding_window", 0);
 
     out.moe.n_experts = jnum(text, "num_experts", jnum(text, "n_routed_experts", 0));
     out.moe.topk = jnum(text, "num_experts_per_token", jnum(text, "num_experts_per_tok", 0));
@@ -483,6 +561,9 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
             out.is_kda[i] = 0;
             out.is_full[i] = 1;
         }
+    } else if (out.family == Family::Dsv4 && out.n_layers > 0) {
+        out.is_kda.assign(out.n_layers, 0);
+        out.is_full.assign(out.n_layers, 1);
     }
 
     if (out.family == Family::Unknown)
@@ -530,6 +611,12 @@ RuntimeConfig runtime_from_env() {
         rt.mla_bits = std::atoi(v);
     if (const char *v = get("GLM53_BITS"))
         rt.dense_bits = std::atoi(v);
+    if (const char *v = get("DSV4_EXPERT_GB"))
+        rt.expert_gb = std::atof(v);
+    if (const char *v = get("DSV4_BITS"))
+        rt.dense_bits = std::atoi(v);
+    if (const char *v = get("DSV4_MLA_BITS"))
+        rt.mla_bits = std::atoi(v);
     if (const char *v = get("MVLLM_KV_SLOTS") ? get("MVLLM_KV_SLOTS")
                                               : (get("KV_SLOTS") ? get("KV_SLOTS")
                                                                  : get("COLI_KV_SLOTS"))) {

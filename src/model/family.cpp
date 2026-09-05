@@ -8,6 +8,7 @@ std::unique_ptr<FamilyEngine> make_kimi_k3();
 std::unique_ptr<FamilyEngine> make_glm53();
 std::unique_ptr<FamilyEngine> make_h3();
 std::unique_ptr<FamilyEngine> make_llama();
+std::unique_ptr<FamilyEngine> make_dsv4();
 
 std::unique_ptr<FamilyEngine> make_engine(Family family) {
     switch (family) {
@@ -19,6 +20,8 @@ std::unique_ptr<FamilyEngine> make_engine(Family family) {
         return make_h3();
     case Family::Llama:
         return make_llama();
+    case Family::Dsv4:
+        return make_dsv4();
     default:
         return nullptr;
     }

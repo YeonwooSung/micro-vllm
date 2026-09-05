@@ -68,7 +68,7 @@ void split_assistant_text(Family family, const std::string &text, std::string &r
                           std::string &content) {
     reasoning.clear();
     content.clear();
-    if (family == Family::Glm53 || family == Family::Llama) {
+    if (family == Family::Glm53 || family == Family::Llama || family == Family::Dsv4) {
         split_think_xml(text, reasoning, content);
     } else if (family == Family::KimiK3) {
         static const char kClose[] = "<|close|>think";

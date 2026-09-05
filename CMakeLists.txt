@@ -40,6 +40,7 @@ set(MVLLM_HOST_SOURCES
     src/io/file_io.cpp
     src/io/safetensors.cpp
     src/io/shard_probe.cpp
+    src/io/dump_env.cpp
     src/io/image.cpp
     src/io/av_mux.cpp
     src/io/h3_resize.cpp
@@ -86,6 +87,7 @@ set(MVLLM_HOST_SOURCES
     src/model/family.cpp
     src/model/kimi_k3.cpp
     src/model/glm53.cpp
+    src/model/dsv4.cpp
     src/model/h3.cpp
     src/model/h3_layout.cpp
     src/model/h3_seg.cpp

@@ -55,6 +55,29 @@ void tally_glm(const std::string &name, const std::string &prefix, int &layers, 
         experts = e + 1;
 }
 
+void tally_dsv4(const std::string &name, const std::string &prefix, int &layers, int &experts) {
+    const std::string mid = prefix + "layers.";
+    if (name.compare(0, mid.size(), mid) != 0)
+        return;
+    const bool ffn = name.find(".ffn.experts.") != std::string::npos;
+    const bool mlp = name.find(".mlp.experts.") != std::string::npos;
+    if (!ffn && !mlp)
+        return;
+    const bool packed = name.find(".w1.weight") != std::string::npos ||
+                        name.find(".w1.weight_packed") != std::string::npos ||
+                        name.find(".gate_proj.weight") != std::string::npos;
+    if (!packed)
+        return;
+    if (name.find(".scale") != std::string::npos || name.find(".qs") != std::string::npos)
+        return;
+    int l = parse_after(name, "layers.");
+    int e = parse_after(name, "experts.");
+    if (l + 1 > layers)
+        layers = l + 1;
+    if (e + 1 > experts)
+        experts = e + 1;
+}
+
 void tally_h3(const std::string &name, int &layers) {
     if (name.compare(0, 7, "blocks.") != 0)
         return;
@@ -184,6 +207,39 @@ bool probe_expert_payload(const std::vector<io::StFile> &files, const std::strin
             ep.bytes = io::st_nbytes(*hit.tensor);
             loc.pieces.push_back(ep);
         }
+    } else if (family == Family::Dsv4) {
+        static const char *v4_w[3] = {"w1", "w2", "w3"};
+        static const char *v4_half[2] = {"weight", "scale"};
+        const std::string base =
+            prefix + "layers." + std::to_string(layer) + ".ffn.experts.0.";
+        for (int k = 0; k < 6; ++k) {
+            const std::string n = base + v4_w[k / 2] + "." + v4_half[k & 1];
+            io::StHit hit = io::st_find_dir(files, n);
+            if (!hit.tensor) {
+                loc.pieces.clear();
+                break;
+            }
+            ExpertPiece ep;
+            ep.path = hit.file->path;
+            ep.offset = io::st_file_offset(*hit.file, *hit.tensor);
+            ep.bytes = io::st_nbytes(*hit.tensor);
+            loc.pieces.push_back(ep);
+        }
+        if (loc.pieces.size() != 6) {
+            loc.pieces.clear();
+            const std::string mlp =
+                prefix + "layers." + std::to_string(layer) + ".mlp.experts.0.";
+            for (int k = 0; k < 6; ++k) {
+                io::StHit hit = io::st_find_dir(files, mlp + glm_names[k]);
+                if (!hit.tensor)
+                    return false;
+                ExpertPiece ep;
+                ep.path = hit.file->path;
+                ep.offset = io::st_file_offset(*hit.file, *hit.tensor);
+                ep.bytes = io::st_nbytes(*hit.tensor);
+                loc.pieces.push_back(ep);
+            }
+        }
     } else {
         return false;
     }
@@ -241,6 +297,19 @@ int first_expert_layer(const std::vector<io::StFile> &files, const std::string &
                 if (t.name.find(".mlp.experts.0.gate_proj.weight") == std::string::npos)
                     continue;
                 if (t.name.find(".qs") != std::string::npos)
+                    continue;
+                int l = parse_after(t.name, "layers.");
+                if (l >= 0 && (best < 0 || l < best))
+                    best = l;
+            } else if (family == Family::Dsv4) {
+                if (t.name.find(prefix + "layers.") != 0)
+                    continue;
+                const bool hit =
+                    t.name.find(".ffn.experts.0.w1.weight") != std::string::npos ||
+                    t.name.find(".mlp.experts.0.gate_proj.weight") != std::string::npos ||
+                    t.name.find(".mlp.experts.0.w1.weight") != std::string::npos;
+                if (!hit || t.name.find(".scale") != std::string::npos ||
+                    t.name.find(".qs") != std::string::npos)
                     continue;
                 int l = parse_after(t.name, "layers.");
                 if (l >= 0 && (best < 0 || l < best))
@@ -362,6 +431,24 @@ Status probe_shards(const std::string &model_dir, const RuntimeConfig &rt, Shard
         int H = cfg.hidden > 0 ? cfg.hidden : 32;
         int inter = cfg.moe.intermediate > 0 ? cfg.moe.intermediate : 32;
         out.slot_bytes = glm53_expert_slot_bytes(H, inter);
+    } else if (cfg.family == Family::Dsv4) {
+        const char *dsv4_pref[] = {"model.language_model.", "model.", "", nullptr};
+        for (int i = 0; dsv4_pref[i]; ++i) {
+            int L = 0, E = 0;
+            for (const auto &f : files)
+                for (const auto &t : f.tensors)
+                    tally_dsv4(t.name, dsv4_pref[i], L, E);
+            if (E > 0) {
+                out.prefix = dsv4_pref[i];
+                layers = L;
+                experts = E;
+                out.prefix_ok = true;
+                break;
+            }
+        }
+        int H = cfg.hidden > 0 ? cfg.hidden : 32;
+        int inter = cfg.moe.intermediate > 0 ? cfg.moe.intermediate : 32;
+        out.slot_bytes = k3_expert_slot_bytes(H, inter);
     } else if (cfg.family == Family::H3) {
         for (const auto &f : files)
             for (const auto &t : f.tensors)

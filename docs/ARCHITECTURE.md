@@ -41,6 +41,7 @@ Insufficient fast memory changes speed, not router semantics.
 | llama     | LLM         | GQA + RoPE + paged KV             | none                | BF16 resident    |
 | kimi_k3   | LLM MoE     | KDA + gated MLA (NoPE) + AttnRes  | MXFP4 experts       | dense int4/int8  |
 | glm53     | LLM MoE+ViT | KDA + absorbed MLA/DSA + mHC      | int4-g64 experts    | dense load-time  |
+| dsv4      | LLM MoE     | MLA + DSA + sliding window + mHC  | MXFP4 experts       | dense FP8/synth  |
 | h3        | Video DiT   | 50 residual DiT blocks            | whole blocks        | BF16 + int8 FC   |
 
 ## Module map
@@ -51,7 +52,7 @@ src/io       aligned I/O, O_DIRECT, safetensors
 src/quant    MXFP4, int4-g64, int8-row, SiTU-GLU, clamped SwiGLU
 src/store    ExpertStore (MoE LRU + RAM/disk tiers) + BlockStore + COLIKV1 + .coli_usage
 src/tok      whitespace / HF tokenizer.json / raw ids
-src/model    family registry + llama / kimi_k3 / glm53 / h3 (+ canvas, DiT schedule)
+src/model    family registry + llama / kimi_k3 / glm53 / dsv4 / h3 (+ canvas, DiT schedule)
 src/serve    OpenAI HTTP + GET /experts /profile + mux TOOL/TOPK/HITS/EMAP/GPUS/PROF
 src/legacy   original CUDA Llama demo
 ```
@@ -112,6 +113,12 @@ GLM-5.3 container (colibri `convert_glm53.py` / official HF names):
   fixtures still run.
 - No `*.safetensors` → previous synthetic pack path.
 
+DeepSeek V4 Flash (`deepseek-ai/DeepSeek-V4-Flash-0731`): 43 layers, hidden 4096,
+256 routed MXFP4 experts + 1 shared, top-6, MLA + DSA + mHC. Official names are
+`layers.N.ffn.experts.E.w{1,2,3}.{weight,scale}` (also HF
+`layers.N.mlp.experts.E`). Dense overlay is FP8-e4m3 / BF16 at load; missing
+shards keep the synthetic pack so tiny fixtures generate.
+
 Wired (host tests cover the store path):
 
 - K3/GLM53 pack experts to `model_dir/.mvllm_*_experts.bin`, `register_expert`,
@@ -151,13 +158,18 @@ Metal / CUDA expert GEMM and H3 DiT (host engine, not `kernels.cu`):
 tensors exist, `pread`s one expert slot (or a small H3 vector). Counted
 experts must match `config.json`. Empty / fixture dirs stay on the synthetic
 pack path. Live dumps: set `MVLLM_DUMP_K3` / `MVLLM_DUMP_GLM53` / `MVLLM_DUMP_H3`
-and run smoke against those trees. Official GLM FP8 experts need
+(`COLI_DUMP_*` aliases; `MVLLM_DUMP_DSV4` / `COLI_DUMP_DSV4` reserved) and run
+`micro-vllm smoke` against those trees. Omit `--model` to pick the first
+existing dump dir in that order. Host tests (`test_live_dump_env`) sniff +
+`probe_shards` when a dump env points at a readable directory, and skip when
+the env is unset or the path is missing. Official GLM FP8 experts need
 `python/convert_glm53.py` first. K3 official MXFP4 loads without `k3_repack.py`.
 
 Not absorbed yet: none from the host-migration plan
 (`/health` failed/free_slots, SessionStore `release_all`, CLI `--function-call` also in).
 
 Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise.
+pretok L/N/S use official generated `src/tok/tok_unicode.h`.
 `uni_is_M` (Mn/Mc/Me) keeps combining marks on pretok letter-runs.
 `uni_is_P` (P*) marks pretok other-runs.
 `uni_to_upper` is the inverse 1:1 fold of `uni_to_lower`.

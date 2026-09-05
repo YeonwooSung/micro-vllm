@@ -18,7 +18,7 @@ int utf8_decode_all(const unsigned char *s, int len, uint32_t *out, int cap);
 // Encode one codepoint to a UTF-8 string.
 std::string utf8_encode_cp(uint32_t cp);
 
-// Unicode letter / number / space (binary search over compact ranges).
+// Unicode letter / number / space from official generated tok_unicode.h.
 bool uni_is_L(uint32_t cp);
 bool uni_is_N(uint32_t cp);
 bool uni_is_S(uint32_t cp);

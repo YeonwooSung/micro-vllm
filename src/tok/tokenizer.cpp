@@ -996,6 +996,23 @@ Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msg
 std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> &msgs,
                                   bool think, const std::string &effort,
                                   const std::vector<K3ToolDecl> *tools) const {
+    if (family == Family::Dsv4) {
+        std::string p = "<｜begin▁of▁sentence｜>";
+        for (const auto &m : msgs) {
+            if (m.role == "system")
+                p += m.content;
+            else if (m.role == "user")
+                p += "<｜User｜>" + m.content;
+            else if (m.role == "assistant")
+                p += "<｜Assistant｜>" + m.content + "<｜end▁of▁sentence｜>";
+            else if (m.role == "tool")
+                p += "<｜User｜>" + m.content;
+        }
+        p += "<｜Assistant｜>";
+        if (think)
+            p += "<think>";
+        return p;
+    }
     if (family == Family::Glm53) {
         auto expand_images = [](std::string s) {
             const std::string needle = "<image>";

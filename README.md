@@ -3,7 +3,7 @@
 C/C++ inference server for consumer desktops and Macs. The original CUDA
 Llama 3.2 1B demo is still here (`micro-vllm-cuda`). The `micro-vllm` binary
 is a family-aware host engine that treats NVMe, RAM, and VRAM as one hierarchy
-so Kimi K3, GLM-5.3, and MiniMax-H3 can run without a datacenter GPU.
+so Kimi K3, GLM-5.3, DeepSeek V4 Flash, and MiniMax-H3 can run without a datacenter GPU.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -38,6 +38,17 @@ Kimi K3 official MXFP4 shards load as-is (`k3_repack.py` in colibri is optional)
 Live dump smoke is header walk + one expert/`rope.inv_freq` pread; it does not
 `Engine::load` the full dense overlay.
 
+Optional live-dump paths (host tests skip when unset or the dir is missing):
+
+```bash
+export MVLLM_DUMP_K3=/path/to/kimi-k3          # or COLI_DUMP_K3
+export MVLLM_DUMP_GLM53=/path/to/glm53_i4      # or COLI_DUMP_GLM53
+export MVLLM_DUMP_H3=/path/to/minimax-h3       # or COLI_DUMP_H3
+# MVLLM_DUMP_DSV4 / COLI_DUMP_DSV4 reserved for a later family
+./build/micro-vllm smoke                       # first existing dump dir
+./build/mvllm_tests                            # gated sniff + shard_probe
+```
+
 OpenAI-compatible:
 
 - `GET  /health`
@@ -60,6 +71,7 @@ OpenAI-compatible:
 |--------|-----------------|---------|
 | `kimi_k3` | CPU forward + disk-streamed native MXFP4 experts | HF shards / `k3_repack.py`; dense BF16 at load |
 | `glm53` | CPU forward + disk-streamed int4-g64 experts (`convert_glm53.py` / HF names) | U8+`.qs` shards; dense BF16 at load |
+| `dsv4` | CPU forward + disk-streamed MXFP4 experts (MLA + DSA + mHC) | official V4 shards / synth pack; dense FP8 at load |
 | `h3` | 2-slot SSD DiT + TEXT/AUDIO/VIDEO pack + 3-axis RoPE; WAV / MP4 via ffmpeg | `FL2VA/{transformer,video_vae,audio_vae,text_encoder}` |
 | `llama` | CPU stand-in; full CUDA GQA+PagedAttention in `micro-vllm-cuda` | `model.safetensors` |
 

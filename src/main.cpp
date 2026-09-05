@@ -1,4 +1,5 @@
 #include "engine.hpp"
+#include "io/dump_env.hpp"
 #include "io/shard_probe.hpp"
 #include "serve/cli_flags.hpp"
 #include "serve/http_server.hpp"
@@ -15,7 +16,8 @@ void usage() {
     std::cerr
         << "micro-vllm — consumer-hardware inference server\n"
         << "  micro-vllm info     --model DIR\n"
-        << "  micro-vllm smoke    --model DIR   (headers + one expert/DiT payload)\n"
+        << "  micro-vllm smoke    [--model DIR] (headers + one expert/DiT payload)\n"
+        << "                      omit --model: first existing MVLLM_DUMP_* / COLI_DUMP_* dir\n"
         << "  micro-vllm generate --model DIR --prompt TEXT [--n N] [--chat] [--think|--no-think]\n"
         << "                      [--temp T] [--top-p P] [--seed S]\n"
         << "                      [--stop S] [--grammar STR] [--json] [--top-k N] [--min-p F]\n"
@@ -30,7 +32,8 @@ void usage() {
         << "  --device cpu|metal|cuda   expert GEMM / H3 DiT backend (default cpu)\n"
         << "\n"
         << "Env: MVLLM_EXPERT_GB MVLLM_BITS MVLLM_HEAD_BITS MVLLM_MLA_BITS MVLLM_DEVICE MVLLM_PORT\n"
-        << "     K3_EXPERT_GB GLM53_EXPERT_GB K3_BITS GLM53_BITS K3_MLA_BITS\n";
+        << "     K3_EXPERT_GB GLM53_EXPERT_GB K3_BITS GLM53_BITS K3_MLA_BITS\n"
+        << "     MVLLM_DUMP_K3 MVLLM_DUMP_GLM53 MVLLM_DUMP_H3 MVLLM_DUMP_DSV4 (COLI_DUMP_* aliases)\n";
 }
 
 std::string arg(int argc, char **argv, const char *key, const char *def = "") {
@@ -60,6 +63,13 @@ int main(int argc, char **argv) {
     std::string model = arg(argc, argv, "--model");
     if (model.empty())
         model = arg(argc, argv, "-m");
+    if (cmd == "smoke" && model.empty()) {
+        const char *which = nullptr;
+        if (const char *p = mvllm::dump_env_first_dir(&which)) {
+            model = p;
+            std::cerr << "using " << (which ? which : "dump env") << "=" << model << "\n";
+        }
+    }
     if (cmd != "help" && model.empty()) {
         std::cerr << "missing --model DIR\n";
         usage();

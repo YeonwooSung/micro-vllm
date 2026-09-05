@@ -72,7 +72,8 @@ Status Engine::generate(const std::string &prompt, const GenParams &gp, GenResul
             return s;
         };
     }
-    if (g2.apply_template && (family_ == Family::Glm53 || family_ == Family::KimiK3)) {
+    if (g2.apply_template &&
+        (family_ == Family::Glm53 || family_ == Family::KimiK3 || family_ == Family::Dsv4)) {
         ChatMessage m;
         m.role = "user";
         m.content = prompt;
@@ -125,6 +126,10 @@ Status Engine::generate_chat(const std::vector<ChatMessage> &msgs, const GenPara
     if (family_ == Family::Glm53 && g2.stop.empty()) {
         g2.stop.push_back("<|user|>");
         g2.stop.push_back("<|observation|>");
+    }
+    if (family_ == Family::Dsv4 && g2.stop.empty()) {
+        g2.stop.push_back("<｜User｜>");
+        g2.stop.push_back("<｜end▁of▁sentence｜>");
     }
     if (!g2.token_text) {
         g2.token_text = [this](int id) {

@@ -132,6 +132,10 @@ struct ModelConfig {
     int n_q_heads = 0;
     int n_kv_heads = 0;
     int head_dim = 0;
+    // DeepSeek V4 grouped output + sliding window (0 = unset).
+    int o_lora = 0;
+    int o_groups = 0;
+    int sliding_window = 0;
 };
 
 struct RuntimeConfig {
