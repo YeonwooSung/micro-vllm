@@ -50,7 +50,7 @@ public:
     BatchScheduler &scheduler() { return sched_; }
     FamilyEngine *family_impl() { return impl_.get(); }
 
-    Status persist_open(const std::string &path, int ver, std::string &err);
+    Status persist_open(const std::string &path, int ver, std::string &err, int slot = 0);
     void persist_close();
     int persist_nrec() const;
     const std::vector<int> &persist_hist() const;
@@ -78,6 +78,7 @@ private:
     KvPrefix prefixes_[kMaxKvSlots];
     std::vector<int> persist_hist_;
     int persist_ver_ = 0;
+    int persist_slot_ = 0;
     std::string persist_path_;
     bool persist_open_ = false;
 };

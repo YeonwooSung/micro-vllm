@@ -207,8 +207,11 @@ radius (`KvPersistV3`; `format_tag = codec<<8 | bits`).
 `Engine` opens `RuntimeConfig.kv_path` (`MVLLM_KV` / `COLI_KV`) at load,
 warms slot 0 from hist, and appends new tokens after generate.
 `FamilyEngine::export_kv_rows` copies MLA `L`/`R` (and GLM DSA `I`) from
-the slot cache; missing/KDA layers stay zero. `import_kv_rows` restores
-those rows on `persist_open` so a reopen warms slot 0 without re-prefill.
+the slot cache; Llama packs GQA K/V into L/R. Missing/KDA layers stay zero.
+`import_kv_rows` restores those rows on `persist_open(slot)` so a reopen
+warms that slot without wiping other prefixes. Empty reopen does not
+clear an existing `KvPrefix`. DSA decode uses `dsa_select_range`
+(queries only for `[q_from, q_to)`).
 SUBMIT extras, HTTP `apply_sampling_extras`, Anthropic `anthropic_to_chat`,
 and `micro-vllm generate` flags honor `persist`/`kv_path`/`coli_kv`,
 `persist_ver`, `stop_ids`, `eos_only`, and `prefix_bytes`.

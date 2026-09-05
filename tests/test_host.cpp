@@ -4604,6 +4604,97 @@ int main() {
         CHECK(job && job->reuse == 3);
         sch.cancel(sid);
     }
+    {
+        using namespace mvllm;
+        DsaConfig d;
+        d.n_heads = 1;
+        d.head_dim = 2;
+        d.topk = 2;
+        d.kpool = 2;
+        d.always_select_tail = true;
+        float q[2] = {1.f, 0.f};
+        float keys[10] = {1.f, 0.f, 1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 0.5f, 0.5f};
+        float gates[10] = {};
+        float hw[1] = {1.f};
+        int sel[8];
+        CHECK(dsa_select(sel, q, keys, gates, hw, nullptr, 5, d) == 3);
+        int ranged[8];
+        CHECK(dsa_select_range(ranged, q, keys, gates, hw, nullptr, nullptr, 5, d, 4, 5) == 0);
+        CHECK(ranged[0] == sel[0] && ranged[1] == sel[1] && ranged[2] == sel[2]);
+        CHECK(dsa_select_range(ranged, q, keys, gates, hw, nullptr, nullptr, 5, d, -1, 5) == -1);
+        const std::string kdir = tmpdir();
+        write_file(kdir + "/config.json", R"({
+          "model_type": "kimi_linear",
+          "architectures": ["KimiLinearForCausalLM"],
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "vocab_size": 32,
+          "first_k_dense_replace": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 4,
+          "q_lora_rank": 8,
+          "kv_lora_rank": 8,
+          "qk_nope_head_dim": 8,
+          "v_head_dim": 8,
+          "num_experts": 2,
+          "num_experts_per_token": 1,
+          "moe_intermediate_size": 16,
+          "routed_expert_hidden_size": 16,
+          "num_shared_experts": 1,
+          "linear_attn_config": {
+            "num_heads": 2,
+            "head_dim": 8,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1],
+            "full_attn_layers": [2],
+            "use_full_rank_gate": true
+          },
+          "bos_token_id": 0,
+          "eos_token_id": 1
+        })");
+        Engine ek;
+        RuntimeConfig rt;
+        rt.expert_gb = 0.001;
+        std::string err;
+        CHECK(ek.load(kdir, rt, err) == Status::Ok);
+        ek.prefix_commit(1, {9, 8, 7});
+        CHECK(ek.prefix_match(1, {9, 8, 7, 6}) == 3);
+        const std::string emptykv = kdir + "/empty.coli_kv";
+        CHECK(ek.persist_open(emptykv, 1, err, 0) == Status::Ok);
+        CHECK(ek.prefix_match(1, {9, 8, 7, 6}) == 3);
+        ek.prefix_commit(0, {1, 2});
+        CHECK(ek.persist_open(emptykv, 1, err, 0) == Status::Ok);
+        CHECK(ek.prefix_match(0, {1, 2, 3}) == 2);
+        const std::string ldir = tmpdir();
+        write_file(ldir + "/config.json", R"({
+          "model_type":"llama","architectures":["LlamaForCausalLM"],
+          "hidden_size":32,"num_hidden_layers":1,"vocab_size":16,
+          "num_attention_heads":4,"num_key_value_heads":2,"head_dim":8,
+          "intermediate_size":64
+        })");
+        Engine el;
+        CHECK(el.load(ldir, rt, err) == Status::Ok);
+        GenParams lgp;
+        lgp.max_new_tokens = 2;
+        lgp.apply_template = false;
+        lgp.eos = 1;
+        GenResult lgr;
+        CHECK(el.generate("hi", lgp, lgr, err) == Status::Ok);
+        const std::string lkv = ldir + "/llama.coli_kv";
+        CHECK(el.persist_open(lkv, 1, err, 0) == Status::Ok);
+        lgp.persist_path = lkv;
+        lgp.persist_ver = 1;
+        CHECK(el.generate("hi", lgp, lgr, err) == Status::Ok);
+        CHECK(el.persist_nrec() > 0);
+        FamilyEngine *fl = el.family_impl();
+        CHECK(fl != nullptr);
+        KvPersistRecord rec;
+        rec.L.assign(static_cast<size_t>(std::max(el.config().n_kv_heads, 1) *
+                                         std::max(el.config().head_dim, 1)),
+                     0.f);
+        rec.R = rec.L;
+        CHECK(fl->export_kv_rows(0, 0, 1, &rec) == 1);
+    }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
 }

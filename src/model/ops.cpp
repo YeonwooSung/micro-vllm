@@ -807,6 +807,128 @@ int dsa_index_width(const DsaConfig &dsa) {
     return dsa.always_select_tail ? topk + pool - 1 : topk;
 }
 
+int dsa_select_range(int *out, const float *queries, const float *keys, const float *gates,
+                     const float *head_w, const float *ape, const uint8_t *valid, int seq,
+                     const DsaConfig &dsa, int q_from, int q_to) {
+    const int pool = dsa.kpool > 0 ? dsa.kpool : 1;
+    const int topk = dsa.topk > 0 ? dsa.topk : 0;
+    if (!out || q_from < 0 || q_to > seq || q_from > q_to || seq < 1 || topk < pool ||
+        topk % pool != 0)
+        return -1;
+    const int nq = q_to - q_from;
+    if (nq > 0 && !queries)
+        return -1;
+
+    const int H = dsa.n_heads > 0 ? dsa.n_heads : 1;
+    const int D = dsa.head_dim > 0 ? dsa.head_dim : 1;
+    const int width = dsa_index_width(dsa);
+    const int want = topk / pool;
+    const float scale = 1.f / std::sqrt(static_cast<float>(D));
+    auto tok_ok = [&](int i) { return !valid || valid[i] != 0; };
+
+    int first = 0;
+    while (first < seq && !tok_ok(first))
+        ++first;
+
+    const int npool = (seq - first) / pool;
+    std::vector<float> pooled(static_cast<size_t>(std::max(npool, 0)) * static_cast<size_t>(D),
+                              0.f);
+    std::vector<uint8_t> complete(static_cast<size_t>(std::max(npool, 0)), 0);
+    std::vector<float> logit(static_cast<size_t>(pool));
+    if (npool > 0 && keys) {
+        for (int p = 0; p < npool; ++p) {
+            const int start = first + p * pool;
+            bool ok = true;
+            for (int j = 0; j < pool; ++j)
+                if (!tok_ok(start + j))
+                    ok = false;
+            if (!ok)
+                continue;
+            complete[static_cast<size_t>(p)] = 1;
+            for (int d = 0; d < D; ++d) {
+                float mx = -1e30f;
+                for (int j = 0; j < pool; ++j) {
+                    float g = gates ? gates[static_cast<size_t>(start + j) * D + d] : 0.f;
+                    float a = ape ? ape[static_cast<size_t>(j) * D + d] : 0.f;
+                    logit[static_cast<size_t>(j)] = g + a;
+                    if (logit[static_cast<size_t>(j)] > mx)
+                        mx = logit[static_cast<size_t>(j)];
+                }
+                float z = 0.f;
+                for (int j = 0; j < pool; ++j) {
+                    logit[static_cast<size_t>(j)] = std::exp(logit[static_cast<size_t>(j)] - mx);
+                    z += logit[static_cast<size_t>(j)];
+                }
+                float acc = 0.f;
+                for (int j = 0; j < pool; ++j)
+                    acc += (logit[static_cast<size_t>(j)] / z) *
+                           keys[static_cast<size_t>(start + j) * D + d];
+                pooled[static_cast<size_t>(p) * D + d] = acc;
+            }
+        }
+    }
+
+    std::vector<float> scores(static_cast<size_t>(std::max(npool, 0)));
+    std::vector<int> order(static_cast<size_t>(std::max(npool, 0)));
+    for (int qi = 0; qi < nq; ++qi) {
+        int *row = out + static_cast<size_t>(qi) * width;
+        for (int i = 0; i < width; ++i)
+            row[i] = -1;
+        const int q = q_from + qi;
+        if (!tok_ok(q))
+            continue;
+
+        int nvis = 0;
+        const float *qrow = queries + static_cast<size_t>(qi) * H * D;
+        for (int p = 0; p < npool; ++p) {
+            const int last = first + (p + 1) * pool - 1;
+            if (!complete[static_cast<size_t>(p)] || last > q)
+                continue;
+            float s = 0.f;
+            const float *pk = pooled.data() + static_cast<size_t>(p) * D;
+            for (int h = 0; h < H; ++h) {
+                float dot = 0.f;
+                const float *qh = qrow + static_cast<size_t>(h) * D;
+                for (int d = 0; d < D; ++d)
+                    dot += qh[d] * pk[d];
+                if (dot < 0.f)
+                    dot = 0.f;
+                float hw = head_w ? head_w[static_cast<size_t>(qi) * H + h] : 1.f;
+                s += hw * dot * scale;
+            }
+            scores[static_cast<size_t>(p)] = s;
+            order[static_cast<size_t>(nvis++)] = p;
+        }
+        const int take = std::min(want, nvis);
+        if (take > 0)
+            std::partial_sort(order.begin(), order.begin() + take, order.begin() + nvis,
+                              [&](int a, int b) {
+                                  if (scores[static_cast<size_t>(a)] != scores[static_cast<size_t>(b)])
+                                      return scores[static_cast<size_t>(a)] >
+                                             scores[static_cast<size_t>(b)];
+                                  return a < b;
+                              });
+        int used = 0;
+        for (int r = 0; r < take; ++r) {
+            const int p = order[static_cast<size_t>(r)];
+            for (int j = 0; j < pool && used < topk; ++j)
+                row[used++] = first + p * pool + j;
+        }
+        if (dsa.always_select_tail) {
+            int visible = 0;
+            for (int i = first; i <= q; ++i)
+                if (tok_ok(i))
+                    ++visible;
+            const int rem = visible % pool;
+            const int tail_start = first + visible - rem;
+            for (int j = 0; j < rem && topk + j < width; ++j)
+                if (tail_start + j <= q && tok_ok(tail_start + j))
+                    row[topk + j] = tail_start + j;
+        }
+    }
+    return 0;
+}
+
 int dsa_select(int *out, const float *queries, const float *keys, const float *gates,
                const float *head_w, const float *ape, int seq, const DsaConfig &dsa) {
     const int width = dsa_index_width(dsa);
@@ -816,73 +938,11 @@ int dsa_select(int *out, const float *queries, const float *keys, const float *g
         out[i] = -1;
     if (!queries || !keys || seq <= 0)
         return width;
-    const int H = dsa.n_heads > 0 ? dsa.n_heads : 1;
-    const int D = dsa.head_dim > 0 ? dsa.head_dim : 1;
     const int pool = dsa.kpool > 0 ? dsa.kpool : 1;
     const int topk = dsa.topk > 0 ? dsa.topk : 0;
     if (topk < pool || topk % pool != 0)
         return width;
-    const int npool = seq / pool;
-    const int want = topk / pool;
-    const float scale = 1.f / std::sqrt(static_cast<float>(D));
-    std::vector<float> scores(static_cast<size_t>(std::max(npool, 0)), -1e30f);
-    std::vector<float> pooled(static_cast<size_t>(D));
-    std::vector<float> logit(static_cast<size_t>(pool));
-    for (int p = 0; p < npool; ++p) {
-        for (int d = 0; d < D; ++d) {
-            float mx = -1e30f;
-            for (int j = 0; j < pool; ++j) {
-                float g = gates ? gates[static_cast<size_t>(p * pool + j) * D + d] : 0.f;
-                float a = ape ? ape[static_cast<size_t>(j) * D + d] : 0.f;
-                logit[static_cast<size_t>(j)] = g + a;
-                if (logit[static_cast<size_t>(j)] > mx)
-                    mx = logit[static_cast<size_t>(j)];
-            }
-            float z = 0.f;
-            for (int j = 0; j < pool; ++j) {
-                logit[static_cast<size_t>(j)] = std::exp(logit[static_cast<size_t>(j)] - mx);
-                z += logit[static_cast<size_t>(j)];
-            }
-            float acc = 0.f;
-            for (int j = 0; j < pool; ++j)
-                acc += (logit[static_cast<size_t>(j)] / z) *
-                       keys[static_cast<size_t>(p * pool + j) * D + d];
-            pooled[static_cast<size_t>(d)] = acc;
-        }
-        float s = 0.f;
-        for (int h = 0; h < H; ++h) {
-            float dot = 0.f;
-            const float *qh = queries + static_cast<size_t>(h) * D;
-            for (int d = 0; d < D; ++d)
-                dot += qh[d] * pooled[static_cast<size_t>(d)];
-            if (dot < 0.f)
-                dot = 0.f;
-            float hw = head_w ? head_w[h] : 1.f;
-            s += hw * dot * scale;
-        }
-        scores[static_cast<size_t>(p)] = s;
-    }
-    std::vector<int> order(static_cast<size_t>(npool));
-    for (int i = 0; i < npool; ++i)
-        order[static_cast<size_t>(i)] = i;
-    std::sort(order.begin(), order.end(), [&](int a, int b) {
-        if (scores[static_cast<size_t>(a)] != scores[static_cast<size_t>(b)])
-            return scores[static_cast<size_t>(a)] > scores[static_cast<size_t>(b)];
-        return a < b;
-    });
-    int used = 0;
-    const int take = std::min(want, npool);
-    for (int r = 0; r < take; ++r) {
-        int p = order[static_cast<size_t>(r)];
-        for (int j = 0; j < pool && used < topk; ++j)
-            out[used++] = p * pool + j;
-    }
-    if (dsa.always_select_tail) {
-        int rem = seq % pool;
-        int start = seq - rem;
-        for (int j = 0; j < rem && topk + j < width; ++j)
-            out[topk + j] = start + j;
-    }
+    dsa_select_range(out, queries, keys, gates, head_w, ape, nullptr, seq, dsa, seq - 1, seq);
     return width;
 }
 

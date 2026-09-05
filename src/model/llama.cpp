@@ -447,6 +447,111 @@ public:
         slots_[slot].live = false;
     }
 
+    // GQA K/V rows → persist L/R [n_layers, nkv*hd]. Caller pre-sizes dest.
+    int export_kv_rows(int slot, int pos0, int n, KvPersistRecord *rows) const override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        const LlamaSlot &sl = slots_[slot];
+        if (!sl.have)
+            return 0;
+        const int nkv = std::max(cfg_.n_kv_heads, 1);
+        const int hd = std::max(cfg_.head_dim, 1);
+        const int kvd = nkv * hd;
+        const int nL = cfg_.n_layers;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0 || pos >= sl.pos)
+                return t;
+            KvPersistRecord &rec = rows[t];
+            const size_t src0 = static_cast<size_t>(pos) * static_cast<size_t>(kvd);
+            for (int l = 0; l < nL; ++l) {
+                const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(kvd);
+                if (kvd > 0 && l < static_cast<int>(sl.k_cache.size()) &&
+                    src0 + static_cast<size_t>(kvd) <= sl.k_cache[static_cast<size_t>(l)].size() &&
+                    dst < rec.L.size()) {
+                    int ncopy = std::min(kvd, static_cast<int>(rec.L.size() - dst));
+                    if (ncopy > 0)
+                        std::memcpy(rec.L.data() + dst,
+                                    sl.k_cache[static_cast<size_t>(l)].data() + src0,
+                                    static_cast<size_t>(ncopy) * sizeof(float));
+                }
+                if (kvd > 0 && l < static_cast<int>(sl.v_cache.size()) &&
+                    src0 + static_cast<size_t>(kvd) <= sl.v_cache[static_cast<size_t>(l)].size() &&
+                    dst < rec.R.size()) {
+                    int ncopy = std::min(kvd, static_cast<int>(rec.R.size() - dst));
+                    if (ncopy > 0)
+                        std::memcpy(rec.R.data() + dst,
+                                    sl.v_cache[static_cast<size_t>(l)].data() + src0,
+                                    static_cast<size_t>(ncopy) * sizeof(float));
+                }
+            }
+        }
+        return n;
+    }
+
+    // Inverse: persist L/R → k_cache / v_cache, then history / pos.
+    int import_kv_rows(int slot, int pos0, int n, const KvPersistRecord *rows) override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        LlamaSlot &sl = slots_[slot];
+        const int nkv = std::max(cfg_.n_kv_heads, 1);
+        const int hd = std::max(cfg_.head_dim, 1);
+        const int kvd = nkv * hd;
+        const int nL = cfg_.n_layers;
+        int t_max = pos0 + n;
+        if (t_max < sl.pos)
+            t_max = sl.pos;
+        if (t_max < 1)
+            t_max = 1;
+        t_max += std::max(rt_.max_seq, 64);
+        const bool caches_small = static_cast<int>(sl.k_cache.size()) < nL ||
+                                  static_cast<int>(sl.v_cache.size()) < nL;
+        if (!sl.have || caches_small)
+            slot_alloc(sl, t_max);
+        else
+            slot_ensure_t(sl, t_max);
+        int written = 0;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0)
+                return t;
+            const KvPersistRecord &rec = rows[t];
+            const size_t dst0 = static_cast<size_t>(pos) * static_cast<size_t>(kvd);
+            for (int l = 0; l < nL; ++l) {
+                const size_t src = static_cast<size_t>(l) * static_cast<size_t>(kvd);
+                if (kvd > 0 && l < static_cast<int>(sl.k_cache.size()) &&
+                    dst0 < sl.k_cache[static_cast<size_t>(l)].size() && src < rec.L.size()) {
+                    int ncopy = std::min(kvd, static_cast<int>(rec.L.size() - src));
+                    const int room =
+                        static_cast<int>(sl.k_cache[static_cast<size_t>(l)].size() - dst0);
+                    if (ncopy > room)
+                        ncopy = room;
+                    if (ncopy > 0)
+                        std::memcpy(sl.k_cache[static_cast<size_t>(l)].data() + dst0,
+                                    rec.L.data() + src, static_cast<size_t>(ncopy) * sizeof(float));
+                }
+                if (kvd > 0 && l < static_cast<int>(sl.v_cache.size()) &&
+                    dst0 < sl.v_cache[static_cast<size_t>(l)].size() && src < rec.R.size()) {
+                    int ncopy = std::min(kvd, static_cast<int>(rec.R.size() - src));
+                    const int room =
+                        static_cast<int>(sl.v_cache[static_cast<size_t>(l)].size() - dst0);
+                    if (ncopy > room)
+                        ncopy = room;
+                    if (ncopy > 0)
+                        std::memcpy(sl.v_cache[static_cast<size_t>(l)].data() + dst0,
+                                    rec.R.data() + src, static_cast<size_t>(ncopy) * sizeof(float));
+                }
+            }
+            if (static_cast<int>(sl.history.size()) <= pos)
+                sl.history.resize(static_cast<size_t>(pos) + 1, 0);
+            sl.history[static_cast<size_t>(pos)] = rec.token;
+            ++written;
+        }
+        sl.pos = std::max(sl.pos, pos0 + written);
+        sl.have = sl.pos > 0;
+        return written;
+    }
+
 private:
     Status generate_cached(int cslot, const std::vector<int> &prompt, const GenParams &gp,
                            GenResult &out, std::string &err) {

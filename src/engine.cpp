@@ -44,8 +44,7 @@ Status Engine::load(const std::string &model_dir, const RuntimeConfig &rt, std::
     sched_.bind(this, &sessions_);
     if (!rt_.kv_path.empty()) {
         std::string perr;
-        if (persist_open(rt_.kv_path, rt_.kv_persist_ver, perr) == Status::Ok)
-            sessions_.commit(0, persist_hist_);
+        persist_open(rt_.kv_path, rt_.kv_persist_ver, perr);
     }
     return Status::Ok;
 }
@@ -199,9 +198,12 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
             return s;
         };
     }
+    int slot = g2.cache_slot >= 0 ? g2.cache_slot : 0;
+    if (slot < 0 || slot >= kMaxKvSlots)
+        slot = 0;
     if (!g2.persist_path.empty()) {
         const int ver = g2.persist_ver ? g2.persist_ver : rt_.kv_persist_ver;
-        Status pst = persist_open(g2.persist_path, ver, err);
+        Status pst = persist_open(g2.persist_path, ver, err, slot);
         if (pst != Status::Ok)
             return pst;
     }
@@ -231,9 +233,6 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
     if (g2.eos < 0 && eos >= 0)
         g2.eos = eos;
 
-    int slot = g2.cache_slot >= 0 ? g2.cache_slot : 0;
-    if (slot < 0 || slot >= kMaxKvSlots)
-        slot = 0;
     if (prefixes_[slot].cap() <= 0) {
         int pcap = static_cast<int>(ids.size()) + g2.max_new_tokens + rt_.max_seq;
         if (pcap < 8)
@@ -276,8 +275,17 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
 KvPersistConfig Engine::make_persist_cfg() const {
     KvPersistConfig pcfg;
     pcfg.n_layers = cfg_.n_layers > 0 ? cfg_.n_layers : 1;
-    pcfg.kv_lora = cfg_.mla.kv_lora > 0 ? cfg_.mla.kv_lora : 0;
-    pcfg.qk_rope = cfg_.mla.qk_rope > 0 ? cfg_.mla.qk_rope : 0;
+    if (cfg_.mla.kv_lora > 0) {
+        pcfg.kv_lora = cfg_.mla.kv_lora;
+        pcfg.qk_rope = cfg_.mla.qk_rope > 0 ? cfg_.mla.qk_rope : 0;
+    } else if (cfg_.n_kv_heads > 0 && cfg_.head_dim > 0) {
+        // Llama GQA: pack K into L and V into R (n_kv_heads * head_dim).
+        pcfg.kv_lora = cfg_.n_kv_heads * cfg_.head_dim;
+        pcfg.qk_rope = cfg_.n_kv_heads * cfg_.head_dim;
+    } else {
+        pcfg.kv_lora = 0;
+        pcfg.qk_rope = 0;
+    }
     pcfg.index_hd = cfg_.dsa.head_dim > 0 ? cfg_.dsa.head_dim : 0;
     pcfg.vocab = cfg_.vocab > 0 ? cfg_.vocab : 0;
     pcfg.has_index.assign(static_cast<size_t>(pcfg.n_layers), 0);
@@ -289,12 +297,14 @@ KvPersistConfig Engine::make_persist_cfg() const {
     return pcfg;
 }
 
-Status Engine::persist_open(const std::string &path, int ver, std::string &err) {
+Status Engine::persist_open(const std::string &path, int ver, std::string &err, int slot) {
     persist_close();
     if (ver != 1 && ver != 2 && ver != 3) {
         err = "unsupported kv persist version";
         return Status::InvalidArgument;
     }
+    if (slot < 0 || slot >= kMaxKvSlots)
+        slot = 0;
     const KvPersistConfig pcfg = make_persist_cfg();
     Status st = Status::InvalidArgument;
     if (ver == 1)
@@ -313,6 +323,7 @@ Status Engine::persist_open(const std::string &path, int ver, std::string &err) 
     }
     persist_path_ = path;
     persist_ver_ = ver;
+    persist_slot_ = slot;
     persist_open_ = true;
 
     persist_hist_.clear();
@@ -326,14 +337,16 @@ Status Engine::persist_open(const std::string &path, int ver, std::string &err) 
         persist_v3_.load(persist_hist_, &rows, lerr);
 
     const int n = static_cast<int>(persist_hist_.size());
-    int cap = n + rt_.max_seq;
-    if (cap < 1)
-        cap = 1;
-    prefixes_[0].alloc(cap);
-    if (n > 0)
-        prefixes_[0].record(persist_hist_.data(), 0, n);
+    if (n > 0) {
+        int cap = n + rt_.max_seq;
+        if (cap < 1)
+            cap = 1;
+        prefixes_[slot].alloc(cap);
+        prefixes_[slot].record(persist_hist_.data(), 0, n);
+        sessions_.commit(slot, persist_hist_);
+    }
     if (impl_ && !rows.empty())
-        impl_->import_kv_rows(0, 0, static_cast<int>(rows.size()), rows.data());
+        impl_->import_kv_rows(slot, 0, static_cast<int>(rows.size()), rows.data());
     return Status::Ok;
 }
 
@@ -344,6 +357,7 @@ void Engine::persist_close() {
     persist_hist_.clear();
     persist_path_.clear();
     persist_ver_ = 0;
+    persist_slot_ = 0;
     persist_open_ = false;
 }
 

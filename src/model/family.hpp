@@ -232,6 +232,11 @@ int dsa_index_width(const DsaConfig &dsa);
 // Score k-pool groups with ReLU(q·k), take top-k pools, optional tail. Unused slots = -1.
 int dsa_select(int *out, const float *queries, const float *keys, const float *gates,
                const float *head_w, const float *ape, int seq, const DsaConfig &dsa);
+// Official decode range: keys/gates/valid cover [0, seq); queries/head_w/out cover [q_from, q_to)
+// indexed from 0. out is nq * width. Returns 0 or -1.
+int dsa_select_range(int *out, const float *queries, const float *keys, const float *gates,
+                     const float *head_w, const float *ape, const uint8_t *valid, int seq,
+                     const DsaConfig &dsa, int q_from, int q_to);
 
 void layernorm(const float *x, const float *w, const float *b, float *y, int n, float eps);
 
