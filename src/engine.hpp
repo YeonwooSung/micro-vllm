@@ -55,6 +55,10 @@ public:
     int persist_nrec() const;
     const std::vector<int> &persist_hist() const;
     int prefix_reuse_len(int slot) const; // KvPrefix::len for slot
+    // Official all-or-nothing reuse; seeds the slot from session hist if empty.
+    int prefix_match(int slot, const std::vector<int> &ids);
+    void prefix_commit(int slot, const std::vector<int> &hist);
+    Status persist_commit(int slot, const std::vector<int> &hist, std::string &err);
 
 private:
     KvPersistConfig make_persist_cfg() const;

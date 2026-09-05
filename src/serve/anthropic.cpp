@@ -378,6 +378,42 @@ bool anthropic_to_chat(const std::string &body, std::vector<ChatMessage> &msgs, 
         }
     }
 
+    if (j.contains("persist") && j["persist"].is_string())
+        gp.persist_path = j["persist"].get<std::string>();
+    if (j.contains("kv_path") && j["kv_path"].is_string())
+        gp.persist_path = j["kv_path"].get<std::string>();
+    if (j.contains("coli_kv") && j["coli_kv"].is_string())
+        gp.persist_path = j["coli_kv"].get<std::string>();
+    if (j.contains("persist_ver") && j["persist_ver"].is_number_integer()) {
+        const int v = j["persist_ver"].get<int>();
+        if (v >= 1 && v <= 3)
+            gp.persist_ver = v;
+    }
+    if (j.contains("kv_ver") && j["kv_ver"].is_number_integer()) {
+        const int v = j["kv_ver"].get<int>();
+        if (v >= 1 && v <= 3)
+            gp.persist_ver = v;
+    }
+    if (j.contains("prefix_bytes") && j["prefix_bytes"].is_number_integer()) {
+        const int v = j["prefix_bytes"].get<int>();
+        if (v >= 0)
+            gp.prefix_bytes = v;
+    }
+    if (j.contains("prefix_reuse") && j["prefix_reuse"].is_number_integer()) {
+        const int v = j["prefix_reuse"].get<int>();
+        if (v >= 0)
+            gp.prefix_reuse = v;
+    }
+    if (j.contains("stop_ids") && j["stop_ids"].is_array()) {
+        gp.stop_ids.clear();
+        for (const auto &x : j["stop_ids"]) {
+            if (x.is_number_integer())
+                gp.stop_ids.push_back(x.get<int>());
+        }
+    }
+    if (j.contains("eos_only") && j["eos_only"].is_boolean())
+        gp.eos_only = j["eos_only"].get<bool>();
+
     if (j.contains("thinking") && !j["thinking"].is_null()) {
         if (!j["thinking"].is_object()) {
             err = "`thinking` must be an object.";

@@ -209,8 +209,11 @@ warms slot 0 from hist, and appends new tokens after generate.
 `FamilyEngine::export_kv_rows` copies MLA `L`/`R` (and GLM DSA `I`) from
 the slot cache; missing/KDA layers stay zero. `import_kv_rows` restores
 those rows on `persist_open` so a reopen warms slot 0 without re-prefill.
-SUBMIT extras and HTTP `apply_sampling_extras` honor `persist`/`kv_path`/
-`coli_kv`, `persist_ver`, `stop_ids`, `eos_only`, and `prefix_bytes`. Raw mux `prefix_bytes` becomes a `prefix_reuse` token count
+SUBMIT extras, HTTP `apply_sampling_extras`, Anthropic `anthropic_to_chat`,
+and `micro-vllm generate` flags honor `persist`/`kv_path`/`coli_kv`,
+`persist_ver`, `stop_ids`, `eos_only`, and `prefix_bytes`.
+The mux scheduler uses `Engine::prefix_match` (KvPrefix, not LCP) and
+`persist_commit` when a job finishes. Raw mux `prefix_bytes` becomes a `prefix_reuse` token count
 (capped by prompt length; K3CHAT1 skipped). `KvPrefix::reuse` still wins
 when the recorded ids are a strict prefix.
 

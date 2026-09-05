@@ -4513,6 +4513,97 @@ int main() {
         CHECK(!extract_json_int_array("{\"stop_ids\":1}", "stop_ids", ids));
         CHECK(!extract_json_int_array("{}", "stop_ids", ids));
     }
+    {
+        using namespace mvllm;
+        std::vector<ChatMessage> msgs;
+        GenParams gp;
+        std::string err;
+        CHECK(anthropic_to_chat(
+            "{\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+            "\"persist\":\"/tmp/a.coli_kv\",\"persist_ver\":2,\"prefix_bytes\":4,"
+            "\"stop_ids\":[3,5],\"eos_only\":true}",
+            msgs, gp, err));
+        CHECK(gp.persist_path == "/tmp/a.coli_kv");
+        CHECK(gp.persist_ver == 2);
+        CHECK(gp.prefix_bytes == 4);
+        CHECK(gp.stop_ids.size() == 2 && gp.stop_ids[0] == 3 && gp.stop_ids[1] == 5);
+        CHECK(gp.eos_only);
+        char a0[] = "micro-vllm";
+        char a1[] = "--persist";
+        char a2[] = "/tmp/b.coli_kv";
+        char a3[] = "--persist-ver";
+        char a4[] = "3";
+        char a5[] = "--stop-id";
+        char a6[] = "9";
+        char a7[] = "--eos-only";
+        char a8[] = "--prefix-bytes";
+        char a9[] = "6";
+        char *av[] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9};
+        GenParams cgp;
+        CliGenExtras cex;
+        std::string cerr;
+        CHECK(apply_cli_gen_flags(10, av, cgp, cex, cerr));
+        CHECK(cgp.persist_path == "/tmp/b.coli_kv");
+        CHECK(cgp.persist_ver == 3);
+        CHECK(cgp.stop_ids.size() == 1 && cgp.stop_ids[0] == 9);
+        CHECK(cgp.eos_only && cgp.prefix_bytes == 6);
+        char b0[] = "x";
+        char b1[] = "--persist-ver";
+        char b2[] = "9";
+        char *bv[] = {b0, b1, b2};
+        CHECK(!apply_cli_gen_flags(3, bv, cgp, cex, cerr));
+        const std::string kdir = tmpdir();
+        write_file(kdir + "/config.json", R"({
+          "model_type": "kimi_linear",
+          "architectures": ["KimiLinearForCausalLM"],
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "vocab_size": 32,
+          "first_k_dense_replace": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 4,
+          "q_lora_rank": 8,
+          "kv_lora_rank": 8,
+          "qk_nope_head_dim": 8,
+          "v_head_dim": 8,
+          "num_experts": 2,
+          "num_experts_per_token": 1,
+          "moe_intermediate_size": 16,
+          "routed_expert_hidden_size": 16,
+          "num_shared_experts": 1,
+          "linear_attn_config": {
+            "num_heads": 2,
+            "head_dim": 8,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1],
+            "full_attn_layers": [2],
+            "use_full_rank_gate": true
+          },
+          "bos_token_id": 0,
+          "eos_token_id": 1
+        })");
+        Engine ek;
+        RuntimeConfig rt;
+        rt.expert_gb = 0.001;
+        CHECK(ek.load(kdir, rt, err) == Status::Ok);
+        CHECK(ek.prefix_match(0, {1, 2, 3}) == 0);
+        ek.prefix_commit(0, {1, 2, 3});
+        CHECK(ek.prefix_match(0, {1, 2, 3, 4}) == 3);
+        CHECK(ek.prefix_match(0, {1, 2}) == 0);
+        const std::string kvpath = kdir + "/sched.coli_kv";
+        CHECK(ek.persist_open(kvpath, 1, err) == Status::Ok);
+        CHECK(ek.persist_commit(0, {1, 2, 3}, err) == Status::Ok);
+        CHECK(ek.persist_nrec() == 3);
+        ek.prefix_commit(0, {1, 2, 3});
+        BatchScheduler &sch = ek.scheduler();
+        sch.configure(4, 10);
+        std::string serr;
+        uint64_t sid = sch.submit(0, {1, 2, 3, 4}, {}, serr);
+        CHECK(sid != 0);
+        const BatchJob *job = sch.job(sid);
+        CHECK(job && job->reuse == 3);
+        sch.cancel(sid);
+    }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
 }

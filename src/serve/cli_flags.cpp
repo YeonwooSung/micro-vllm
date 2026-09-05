@@ -265,6 +265,62 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
             gp.apply_template = true;
             continue;
         }
+        if (eq(a, "--persist") || eq(a, "--kv")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v)
+                continue;
+            gp.persist_path = v;
+            ++i;
+            continue;
+        }
+        if (eq(a, "--persist-ver")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v)
+                continue;
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, "--persist-ver", err))
+                return false;
+            if (n < 1 || n > 3) {
+                err = std::string("bad --persist-ver: ") + v;
+                return false;
+            }
+            gp.persist_ver = n;
+            continue;
+        }
+        if (eq(a, "--prefix-bytes") || eq(a, "--prefix-reuse")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v)
+                continue;
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, a, err))
+                return false;
+            if (n < 0) {
+                err = std::string("bad ") + a + ": " + v;
+                return false;
+            }
+            if (eq(a, "--prefix-bytes"))
+                gp.prefix_bytes = n;
+            else
+                gp.prefix_reuse = n;
+            continue;
+        }
+        if (eq(a, "--stop-id")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v)
+                continue;
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, "--stop-id", err))
+                return false;
+            gp.stop_ids.push_back(n);
+            continue;
+        }
+        if (eq(a, "--eos-only")) {
+            gp.eos_only = true;
+            continue;
+        }
     }
     return true;
 }

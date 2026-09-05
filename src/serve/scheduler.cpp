@@ -84,7 +84,14 @@ uint64_t BatchScheduler::submit(int slot, const std::vector<int> &ids, const Gen
     job.slot = slot;
     job.ids = ids;
     job.gp = gp;
-    job.reuse = sessions_->match(slot, ids);
+    // Official KvPrefix reuse is all-or-nothing; no LCP fallback.
+    int official = engine_->prefix_match(slot, ids);
+    if (official > 0)
+        job.reuse = official;
+    else if (gp.prefix_reuse > 0)
+        job.reuse = gp.prefix_reuse;
+    else
+        job.reuse = 0;
     job.state = BatchJobState::Queued;
     job.status = Status::Ok;
     job.out.prompt_tokens = static_cast<int>(ids.size());
@@ -128,6 +135,11 @@ int BatchScheduler::pump() {
     auto finish_done = [&](BatchJob &j) {
         end_slot(engine_, j.slot);
         commit_and_release(sessions_, j);
+        std::vector<int> hist = j.ids;
+        hist.insert(hist.end(), j.out.tokens.begin(), j.out.tokens.end());
+        engine_->prefix_commit(j.slot, hist);
+        std::string perr;
+        engine_->persist_commit(j.slot, hist, perr); // no-op if persist closed
         j.state = BatchJobState::Done;
         if (j.status != Status::Ok && j.err.empty())
             j.status = Status::Ok;

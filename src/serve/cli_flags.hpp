@@ -12,9 +12,10 @@ struct CliGenExtras {
     std::vector<float> image_rgb;
 };
 
-// Apply `micro-vllm generate` flags onto gp. Repeatable --stop. --json sets
-// json_object_gbnf(). --image PATH is decoded into extras.image_rgb.
-// Returns false only on a bad numeric flag or unreadable --image/--grammar file.
+// Apply `micro-vllm generate` flags onto gp. Repeatable --stop / --stop-id.
+// --json sets json_object_gbnf(). --image PATH is decoded into extras.image_rgb.
+// --persist/--kv PATH, --persist-ver 1..3, --prefix-bytes/--prefix-reuse N>=0,
+// --eos-only. Returns false on a bad numeric flag or unreadable --image/--grammar.
 bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex, std::string &err);
 
 // Apply `micro-vllm video` flags onto hp. Repeatable --ref-image.

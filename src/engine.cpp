@@ -367,6 +367,42 @@ int Engine::prefix_reuse_len(int slot) const {
     return prefixes_[slot].len();
 }
 
+int Engine::prefix_match(int slot, const std::vector<int> &ids) {
+    if (slot < 0 || slot >= kMaxKvSlots)
+        slot = 0;
+    if (prefixes_[slot].cap() <= 0) {
+        int pcap = static_cast<int>(ids.size()) + rt_.max_seq;
+        if (pcap < 8)
+            pcap = 8;
+        prefixes_[slot].alloc(pcap);
+        const std::vector<int> &prev = sessions_.history(slot);
+        if (!prev.empty())
+            prefixes_[slot].record(prev.data(), 0, static_cast<int>(prev.size()));
+    }
+    return prefixes_[slot].reuse(ids.empty() ? nullptr : ids.data(),
+                                 static_cast<int>(ids.size()));
+}
+
+void Engine::prefix_commit(int slot, const std::vector<int> &hist) {
+    if (slot < 0 || slot >= kMaxKvSlots)
+        return;
+    const int n = static_cast<int>(hist.size());
+    if (prefixes_[slot].cap() < n)
+        prefixes_[slot].grow(n + 64, 0);
+    if (n > 0)
+        prefixes_[slot].record(hist.data(), 0, n);
+}
+
+Status Engine::persist_commit(int slot, const std::vector<int> &hist, std::string &err) {
+    if (!persist_open_)
+        return Status::Ok;
+    Status st = persist_append_tail(slot, hist, err);
+    persist_hist_ = hist;
+    if (st != Status::Ok)
+        err.clear();
+    return Status::Ok;
+}
+
 Status Engine::persist_append_tail(int slot, const std::vector<int> &hist, std::string &err) {
     if (!persist_open_)
         return Status::Ok;
