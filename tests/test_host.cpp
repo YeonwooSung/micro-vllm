@@ -34,6 +34,7 @@
 #include "store/route_usage.hpp"
 #include "store/route_trace.hpp"
 #include "store/kv_prefix.hpp"
+#include "store/kv_row.hpp"
 #include "quant/int8_dyn.hpp"
 #include "quant/native_act.hpp"
 #include "quant/bf16.hpp"
@@ -44,6 +45,8 @@
 #include "tok/sample_nuc.hpp"
 #include "tok/stop_set.hpp"
 #include "tok/logprob.hpp"
+#include "tok/utf8.hpp"
+#include "tok/logit_dump.hpp"
 #include "tok/json_schema.hpp"
 #include "tok/k3_chat1.hpp"
 #include "tok/decode_post.hpp"
@@ -4277,6 +4280,57 @@ int main() {
         CHECK(h3_layout_sig_equal(sig, sig2));
         sig2[1] = 9;
         CHECK(!h3_layout_sig_equal(sig, sig2));
+    }
+    {
+        using namespace mvllm;
+        float sequence_a[4 * 3] = {};
+        float sequence_b[4 * 3] = {};
+        float *a2 = kv_row(sequence_a, 2, 3);
+        float *b1 = kv_row(sequence_b, 1, 3);
+        CHECK(a2 == &sequence_a[6]);
+        CHECK(b1 == &sequence_b[3]);
+        a2[0] = 20.f;
+        b1[2] = 12.f;
+        CHECK(sequence_a[6] == 20.f && sequence_b[5] == 12.f);
+        CHECK(sequence_a[5] == 0.f && sequence_b[6] == 0.f);
+        float storage[5 * 7] = {};
+        CHECK(kv_row(static_cast<const float *>(storage), 4, 7) == &storage[28]);
+        CHECK(kv_row_bytes(2, 3, 4) == 24);
+        CHECK(kv_row_ok(2, 3, 12) && !kv_row_ok(2, 3, 8));
+        CHECK(kv_row(static_cast<float *>(nullptr), 0, 3) == nullptr);
+        uint8_t bytes[8] = {};
+        CHECK(kv_row8(bytes, 1, 4) == &bytes[4]);
+    }
+    {
+        using namespace mvllm;
+        uint32_t cp = 0;
+        const unsigned char A[] = {'A'};
+        CHECK(utf8_next(A, 1, 0, &cp) == 1 && cp == 0x41);
+        const unsigned char e[] = {0xC3, 0xA9};
+        CHECK(utf8_next(e, 2, 0, &cp) == 2 && cp == 0xE9);
+        std::string grin = utf8_encode_cp(0x1F600);
+        CHECK(grin.size() == 4);
+        CHECK(static_cast<unsigned char>(grin[0]) == 0xF0);
+        char buf[8] = {};
+        CHECK(utf8_put(buf, 0x41) == 1 && buf[0] == 'A');
+        uint32_t cps[8];
+        CHECK(utf8_decode_all(e, 2, cps, 8) == 1 && cps[0] == 0xE9);
+        CHECK(utf8_next(A, 1, 5, &cp) == 0);
+    }
+    {
+        using namespace mvllm;
+        const float lo[] = {0.f, 3.f, 1.f, 2.f};
+        LogitTop top[5];
+        CHECK(logit_topn(lo, 4, top, 5) == 4);
+        CHECK(top[0].id == 1 && top[0].logit == 3.f);
+        CHECK(top[1].id == 3 && top[1].logit == 2.f);
+        CHECK(top[4].id == -1);
+        std::string dump = logit_dump_line(lo, 4);
+        CHECK(dump.find("[LOGITS] 1:3.000000 3:2.000000 2:1.000000 0:0.000000") == 0);
+        CHECK(dump.back() == '\n');
+        std::string gap = logit_gap_line(0, lo, 4);
+        CHECK(gap.find("LOGITGAP pos=0 top1=1:3.000000 top2=3:2.000000 gap=1.") == 0);
+        CHECK(logit_dump_line(nullptr, 0) == "[LOGITS]\n");
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

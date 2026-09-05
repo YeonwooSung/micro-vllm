@@ -1,0 +1,21 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+namespace mvllm {
+
+// One UTF-8 sequence at s[i]. Invalid/truncated lead is a single byte.
+// Returns bytes consumed, or 0 if s/cp is null or i is out of range (*cp = 0).
+int utf8_next(const unsigned char *s, int len, int i, uint32_t *cp);
+
+// Write UTF-8 for cp into o (1-4 bytes). Returns bytes written, or 0 if o is null.
+int utf8_put(char *o, uint32_t cp);
+
+// Decode every codepoint in s[0,len) into out (at most cap). Returns count written.
+int utf8_decode_all(const unsigned char *s, int len, uint32_t *out, int cap);
+
+// Encode one codepoint to a UTF-8 string.
+std::string utf8_encode_cp(uint32_t cp);
+
+} // namespace mvllm

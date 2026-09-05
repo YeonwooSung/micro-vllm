@@ -176,8 +176,12 @@ KV prefix reuse (`KvPrefix`) is all-or-nothing: the next prompt must strictly
 extend the recorded fed ids, else prefill from scratch. Tainted state (ids
 cannot describe the input) never reuses. Equal or shorter prompts cannot rewind.
 
-`logprob_target` is official double softmax log p(token). H3 layout
-`signature[5]` is `(text_len, latent_t, latent_h, latent_w, audio_t)`;
+`logprob_target` is official double softmax log p(token). Ragged decode
+rows are `kv_row(base, pos, width)` per sequence. UTF-8 is official
+`utf8_next`/`utf8_put` (invalid lead = one byte). Logit dump is
+`[LOGITS] id:%.6f` top-5 and `LOGITGAP` top1/top2.
+
+H3 layout `signature[5]` is `(text_len, latent_t, latent_h, latent_w, audio_t)`;
 segment names are `text`/`cond`/`ref_img`/`ref_audio`/`audio`/`video`.
 
 DSA (GLM full-attn): k-pool indexer + top-k slots into absorbed MLA. Missing

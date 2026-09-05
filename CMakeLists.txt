@@ -58,6 +58,7 @@ set(MVLLM_HOST_SOURCES
     src/store/route_usage.cpp
     src/store/route_trace.cpp
     src/store/kv_prefix.cpp
+    src/store/kv_row.cpp
     src/tok/tokenizer.cpp
     src/tok/k3_tools.cpp
     src/tok/k3_chat1.cpp
@@ -66,6 +67,8 @@ set(MVLLM_HOST_SOURCES
     src/tok/sample_nuc.cpp
     src/tok/stop_set.cpp
     src/tok/logprob.cpp
+    src/tok/utf8.cpp
+    src/tok/logit_dump.cpp
     src/tok/json_schema.cpp
     src/tok/decode_post.cpp
     src/tok/glm_tools.cpp
