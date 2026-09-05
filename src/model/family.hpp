@@ -121,6 +121,22 @@ struct H3GenResult {
     std::string note;
 };
 
+// Mux turn telemetry: EMAP/HITS over sparse MoE rows × experts.
+// emap[i] = (tier<<6)|heat; hits[i] is 0/1 per expert (not packed).
+// entropy[r] is Shannon bits of this turn's routes on sparse row r.
+struct RouteTelem {
+    int rows = 0;
+    int cols = 0;
+    std::vector<uint8_t> emap;
+    std::vector<uint8_t> hits;
+    std::vector<float> entropy;
+    int vram = 0;
+    int ram = 0;
+    int disk = 0;
+    double vram_gb = 0;
+    double ram_gb = 0;
+};
+
 class FamilyEngine {
 public:
     virtual ~FamilyEngine() = default;
@@ -138,6 +154,12 @@ public:
     virtual void expert_stats(ExpertStoreStats &out) const { out = {}; }
     virtual uint64_t block_hits() const { return 0; }
     virtual uint64_t block_misses() const { return 0; }
+    // Official mux EMAP/HITS/ENTROPY/TIERS snapshot. consume_hits clears the
+    // turn-hit bitmap after copy (hits_emit). Default: empty (no MoE).
+    virtual void route_telem(RouteTelem &out, bool consume_hits = true) {
+        (void)consume_hits;
+        out = {};
+    }
 
     // Optional mux hooks. Default: no persistent slot (always full prefill).
     virtual Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp,

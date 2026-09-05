@@ -43,6 +43,12 @@ public:
         else
             out = {};
     }
+    void route_telem(RouteTelem &out, bool consume_hits = true) {
+        if (impl_)
+            impl_->route_telem(out, consume_hits);
+        else
+            out = {};
+    }
     uint64_t block_hits() const { return impl_ ? impl_->block_hits() : 0; }
     uint64_t block_misses() const { return impl_ ? impl_->block_misses() : 0; }
     SessionStore &sessions() { return sessions_; }

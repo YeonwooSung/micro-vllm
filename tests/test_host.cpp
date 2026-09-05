@@ -284,7 +284,21 @@ static void test_expert_store() {
     store.release(v);
     ExpertKey keys[2] = {{1, 0}, {1, 3}};
     CHECK(store.prefetch(keys, 2, err) == Status::Ok);
+    CHECK(store.resident(0, 2));
+    CHECK(!store.resident(0, 1));
+    CHECK(!store.resident(-1, 0));
+    int tiers[8];
+    CHECK(store.fill_tiers(tiers, 8) == 8);
+    CHECK(tiers[2] == 1); // layer 0 expert 2
+    CHECK(tiers[1] == 0); // evicted
+    int ram = 0, disk = 0;
+    store.count_tiers(ram, disk);
+    CHECK(ram >= 1 && ram + disk == nL * nE);
+    CHECK(store.fill_tiers(nullptr, 8) == 0);
     store.close();
+    CHECK(!store.resident(0, 2));
+    store.count_tiers(ram, disk);
+    CHECK(ram == 0 && disk == 0);
 
     // 8 GiB / 4 KiB / 2 layers would be ~1M slots without the n_experts cap.
     CHECK(expert_store_slots_per_layer(2, 4, 4096, 8LL * 1024 * 1024 * 1024) == 4);
@@ -1011,6 +1025,38 @@ static void test_offload_generate() {
     CHECK(st.requests > 0);
     CHECK(st.misses + st.hits == st.requests);
     CHECK(gr.completion_tokens > 0);
+    {
+        RouteTelem rt;
+        ek.route_telem(rt, false);
+        CHECK(rt.cols == 4);
+        CHECK(rt.rows >= 1);
+        CHECK(static_cast<int>(rt.emap.size()) == rt.rows * rt.cols);
+        CHECK(static_cast<int>(rt.hits.size()) == rt.rows * rt.cols);
+        CHECK(static_cast<int>(rt.entropy.size()) == rt.rows);
+        CHECK(rt.ram + rt.disk == rt.rows * rt.cols);
+        int hits = 0, heat = 0;
+        for (uint8_t h : rt.hits)
+            hits += h ? 1 : 0;
+        for (uint8_t b : rt.emap)
+            if (b & 63)
+                ++heat;
+        CHECK(hits > 0);
+        CHECK(heat > 0);
+        std::string turn = mux_format_turn_telem(
+            "HWINFO 1 1.00 1.00 0 0.00 cpu|none", 1, 0, 0, 0, 0, 0, 0, 0, rt.entropy.data(),
+            static_cast<int>(rt.entropy.size()), rt.vram, rt.ram, rt.disk, rt.vram_gb, rt.ram_gb,
+            rt.rows, rt.cols, rt.emap.data(), rt.rows, rt.cols, rt.hits.data());
+        CHECK(turn.find("EMAP ") != std::string::npos);
+        CHECK(turn.find("HITS ") != std::string::npos);
+        CHECK(turn.find("ENTROPY ") != std::string::npos);
+        RouteTelem a, b;
+        ek.route_telem(a, true);
+        ek.route_telem(b, false);
+        int after = 0;
+        for (uint8_t h : b.hits)
+            after += h ? 1 : 0;
+        CHECK(after == 0);
+    }
 
     std::string gdir = tmpdir();
     write_file(gdir + "/config.json", R"({
@@ -1047,6 +1093,25 @@ static void test_offload_generate() {
     CHECK(gst.requests > 0);
     CHECK(gst.misses + gst.hits == gst.requests);
     CHECK(gr.completion_tokens > 0);
+    {
+        RouteTelem rt;
+        eg.route_telem(rt, true);
+        CHECK(rt.cols == 4);
+        CHECK(rt.rows >= 1);
+        CHECK(static_cast<int>(rt.emap.size()) == rt.rows * rt.cols);
+        CHECK(static_cast<int>(rt.hits.size()) == rt.rows * rt.cols);
+        int hits = 0;
+        for (uint8_t h : rt.hits)
+            hits += h ? 1 : 0;
+        CHECK(hits > 0);
+        CHECK(rt.ram + rt.disk == rt.rows * rt.cols);
+        RouteTelem cleared;
+        eg.route_telem(cleared, false);
+        int after = 0;
+        for (uint8_t h : cleared.hits)
+            after += h ? 1 : 0;
+        CHECK(after == 0);
+    }
 
     std::string hdir = tmpdir();
     write_file(hdir + "/config.json", R"({"model_type":"minimax_h3","architectures":["MiniMaxH3"]})");

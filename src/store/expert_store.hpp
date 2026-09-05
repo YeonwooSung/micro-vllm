@@ -93,6 +93,15 @@ public:
     int64_t expert_bytes() const { return expert_bytes_; }
     int n_layers() const { return n_layers_; }
 
+    // True iff this expert is currently in a valid LRU slot (RAM tier).
+    bool resident(int layer, int expert) const;
+    // Fill tier[i] for i in [0, min(n, n_layers*n_experts)):
+    //   i = layer * n_experts + expert, row-major.
+    //   1 if resident, else 0. Returns how many cells written.
+    int fill_tiers(int *tier, int n) const;
+    // ram = valid occupied slots; disk = n_layers * n_experts - ram.
+    void count_tiers(int &ram, int &disk) const;
+
     ~ExpertStore() { close(); }
     ExpertStore() = default;
     ExpertStore(const ExpertStore &) = delete;
@@ -140,7 +149,7 @@ private:
     ExpertStoreStats stats_{};
     bool open_ = false;
     bool use_direct_ = true;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::thread prefetch_th_;
     Status prefetch_st_ = Status::Ok;
     std::string prefetch_err_;

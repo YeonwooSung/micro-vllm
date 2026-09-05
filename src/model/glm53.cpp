@@ -3,6 +3,7 @@
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
+#include "../serve/mux_frames.hpp"
 #include "../serve/session.hpp"
 #include "../store/route_trace.hpp"
 #include "../store/route_usage.hpp"
@@ -154,6 +155,12 @@ public:
         Status ust = usage_.init("glm53", cfg_.n_layers, std::max(cfg_.moe.n_experts, 1), err);
         if (ust != Status::Ok)
             return ust;
+        {
+            const int ne = usage_.n_experts();
+            const size_t n = static_cast<size_t>(usage_.n_layers() + 1) * static_cast<size_t>(ne);
+            ehit_.assign(n, 0);
+            turn_c_.assign(n, 0u);
+        }
         for (int l = 0; l < cfg_.first_dense; ++l)
             usage_.drop_row(l);
         std::string uerr;
@@ -292,6 +299,89 @@ public:
     }
 
     void expert_stats(ExpertStoreStats &out) const override { store_.stats(out); }
+
+    void route_telem(RouteTelem &out, bool consume_hits) override {
+        if (!loaded_ || usage_.n_experts() < 1) {
+            out = {};
+            return;
+        }
+        const int cols = usage_.n_experts();
+        const int nL = usage_.n_layers();
+        std::vector<int> live;
+        live.reserve(static_cast<size_t>(nL + 1));
+        for (int l = 0; l <= nL; ++l) {
+            if (!usage_.has_row(l))
+                continue;
+            if (l == nL) {
+                bool any = false;
+                for (int e = 0; e < cols; ++e) {
+                    if (usage_.get(l, e)) {
+                        any = true;
+                        break;
+                    }
+                    const size_t i =
+                        static_cast<size_t>(l) * static_cast<size_t>(cols) + static_cast<size_t>(e);
+                    if ((i < ehit_.size() && ehit_[i]) || (i < turn_c_.size() && turn_c_[i])) {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any)
+                    continue;
+            }
+            live.push_back(l);
+        }
+        const int rows = static_cast<int>(live.size());
+        const size_t cells = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        out.rows = rows;
+        out.cols = cols;
+        out.emap.assign(cells, 0);
+        out.hits.assign(cells, 0);
+        out.entropy.assign(static_cast<size_t>(rows), 0.f);
+        out.vram = 0;
+        out.vram_gb = 0;
+        int ram = 0;
+        int disk = 0;
+        for (int r = 0; r < rows; ++r) {
+            const int l = live[static_cast<size_t>(r)];
+            uint64_t sum = 0;
+            for (int e = 0; e < cols; ++e) {
+                const size_t dst =
+                    static_cast<size_t>(r) * static_cast<size_t>(cols) + static_cast<size_t>(e);
+                const size_t src =
+                    static_cast<size_t>(l) * static_cast<size_t>(cols) + static_cast<size_t>(e);
+                const int tier = store_.resident(l, e) ? 1 : 0;
+                out.emap[dst] = mux_emap_byte(tier, usage_.get(l, e));
+                out.hits[dst] = (src < ehit_.size()) ? ehit_[src] : 0;
+                if (tier)
+                    ++ram;
+                else
+                    ++disk;
+                if (src < turn_c_.size())
+                    sum += turn_c_[src];
+            }
+            if (sum == 0)
+                continue;
+            double H = 0.0;
+            for (int e = 0; e < cols; ++e) {
+                const size_t src =
+                    static_cast<size_t>(l) * static_cast<size_t>(cols) + static_cast<size_t>(e);
+                const uint32_t c = (src < turn_c_.size()) ? turn_c_[src] : 0u;
+                if (!c)
+                    continue;
+                const double p = static_cast<double>(c) / static_cast<double>(sum);
+                H -= p * std::log2(p);
+            }
+            out.entropy[static_cast<size_t>(r)] = static_cast<float>(H);
+        }
+        out.ram = ram;
+        out.disk = disk;
+        out.ram_gb = static_cast<double>(store_.expert_bytes()) * static_cast<double>(ram) / 1e9;
+        if (consume_hits) {
+            std::fill(ehit_.begin(), ehit_.end(), 0);
+            std::fill(turn_c_.begin(), turn_c_.end(), 0u);
+        }
+    }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
                           std::string &err) override {
@@ -1631,9 +1721,10 @@ private:
             }
             moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
                      wt.data() + static_cast<size_t>(c) * K, scores.data());
-            usage_.count(layer, idx.data() + static_cast<size_t>(c) * K, K);
-            trace_.emit(c, layer, idx.data() + static_cast<size_t>(c) * K,
-                        wt.data() + static_cast<size_t>(c) * K, K, terr);
+            const int *ids = idx.data() + static_cast<size_t>(c) * K;
+            usage_.count(layer, ids, K);
+            mark_hits(layer, ids, K);
+            trace_.emit(c, layer, ids, wt.data() + static_cast<size_t>(c) * K, K, terr);
         }
         trace_.end();
         std::vector<int> uniq(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1)));
@@ -1840,10 +1931,30 @@ private:
         }
     }
 
+    void mark_hits(int layer, const int *ids, int k) {
+        if (!ids || k <= 0 || layer < 0 || layer > usage_.n_layers())
+            return;
+        const int ne = usage_.n_experts();
+        if (ne < 1)
+            return;
+        const size_t base = static_cast<size_t>(layer) * static_cast<size_t>(ne);
+        if (base + static_cast<size_t>(ne) > ehit_.size())
+            return;
+        for (int i = 0; i < k; ++i) {
+            const int e = ids[i];
+            if (e >= 0 && e < ne) {
+                ehit_[base + static_cast<size_t>(e)] = 1;
+                ++turn_c_[base + static_cast<size_t>(e)];
+            }
+        }
+    }
+
     ModelConfig cfg_{};
     RuntimeConfig rt_{};
     ExpertStore store_;
     RouteUsage usage_;
+    std::vector<uint8_t> ehit_;
+    std::vector<uint32_t> turn_c_;
     RouteTrace trace_;
     bool loaded_ = false;
     bool from_checkpoint_ = false;

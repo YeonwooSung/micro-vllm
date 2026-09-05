@@ -134,13 +134,17 @@ static void emit_turn_telem(Engine &engine, uint64_t id) {
     const HwInfo hw = hw_probe();
     std::string hwline = mux_format_hwinfo(hw.cores, hw.ram_total_gb, hw.ram_avail_gb, hw.ngpu,
                                            hw.vram_total_gb, hw.cpu, hw.gpu);
-    ExpertStoreStats st{};
-    engine.expert_stats(st);
-    (void)st;
-    const int disk = engine.config().moe.n_experts > 0 ? engine.config().moe.n_experts : 0;
-    const std::string block =
-        mux_format_turn_telem(hwline, id, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, disk, 0.0,
-                              rss_gb(), 0, 0, nullptr, 0, 0, nullptr);
+    RouteTelem rt;
+    engine.route_telem(rt, true);
+    const int disk = rt.disk > 0 ? rt.disk
+                                 : (engine.config().moe.n_experts > 0 ? engine.config().moe.n_experts
+                                                                     : 0);
+    const double ram_gb = rt.ram_gb > 0.0 ? rt.ram_gb : rss_gb();
+    const std::string block = mux_format_turn_telem(
+        hwline, id, 0, 0, 0, 0, 0, 0, 0, rt.entropy.empty() ? nullptr : rt.entropy.data(),
+        static_cast<int>(rt.entropy.size()), rt.vram, rt.ram, disk, rt.vram_gb, ram_gb, rt.rows,
+        rt.cols, rt.emap.empty() ? nullptr : rt.emap.data(), rt.rows, rt.cols,
+        rt.hits.empty() ? nullptr : rt.hits.data());
     fwrite(block.data(), 1, block.size(), stdout);
     fflush(stdout);
 }

@@ -433,6 +433,56 @@ Status ExpertStore::prefetch(const ExpertKey *keys, size_t count, std::string &e
     return Status::Ok;
 }
 
+bool ExpertStore::resident(int layer, int expert) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!open_)
+        return false;
+    if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_experts_)
+        return false;
+    const Layer &L = layers_[static_cast<size_t>(layer)];
+    const int idx = L.by_expert[static_cast<size_t>(expert)];
+    if (idx < 0 || idx >= static_cast<int>(L.slots.size()))
+        return false;
+    const Slot &slot = L.slots[static_cast<size_t>(idx)];
+    return slot.valid && slot.eid == expert;
+}
+
+int ExpertStore::fill_tiers(int *tier, int n) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!open_ || !tier || n <= 0)
+        return 0;
+    int written = 0;
+    for (int layer = 0; layer < n_layers_ && written < n; ++layer) {
+        const Layer &L = layers_[static_cast<size_t>(layer)];
+        for (int expert = 0; expert < n_experts_ && written < n; ++expert) {
+            int t = 0;
+            const int idx = L.by_expert[static_cast<size_t>(expert)];
+            if (idx >= 0 && idx < static_cast<int>(L.slots.size())) {
+                const Slot &slot = L.slots[static_cast<size_t>(idx)];
+                if (slot.valid && slot.eid == expert)
+                    t = 1;
+            }
+            tier[written++] = t;
+        }
+    }
+    return written;
+}
+
+void ExpertStore::count_tiers(int &ram, int &disk) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    ram = 0;
+    disk = 0;
+    if (!open_)
+        return;
+    for (const Layer &layer : layers_) {
+        for (const Slot &slot : layer.slots) {
+            if (slot.valid)
+                ++ram;
+        }
+    }
+    disk = n_layers_ * n_experts_ - ram;
+}
+
 void ExpertStore::stats(ExpertStoreStats &out) const {
     out = stats_;
     uint64_t occupied = 0;

@@ -3,6 +3,7 @@
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
+#include "../serve/mux_frames.hpp"
 #include "../serve/session.hpp"
 #include "../store/route_trace.hpp"
 #include "../store/route_usage.hpp"
@@ -180,6 +181,12 @@ public:
         Status ust = usage_.init("kimi_k3", cfg_.n_layers, std::max(cfg_.moe.n_experts, 1), err);
         if (ust != Status::Ok)
             return ust;
+        {
+            const size_t cells = static_cast<size_t>(usage_.n_layers() + 1) *
+                                 static_cast<size_t>(usage_.n_experts());
+            ehit_.assign(cells, 0);
+            turn_c_.assign(cells, 0);
+        }
         for (int l = 0; l < cfg_.first_dense; ++l)
             usage_.drop_row(l);
         {
@@ -603,6 +610,95 @@ public:
     }
 
     void expert_stats(ExpertStoreStats &out) const override { store_.stats(out); }
+
+    void route_telem(RouteTelem &out, bool consume_hits) override {
+        if (!loaded_ || usage_.n_experts() < 1) {
+            out = {};
+            return;
+        }
+        const int cols = usage_.n_experts();
+        const int last = usage_.n_layers();
+        auto cell = [cols](int layer, int e) -> size_t {
+            return static_cast<size_t>(layer) * static_cast<size_t>(cols) +
+                   static_cast<size_t>(e);
+        };
+        auto hit_at = [&](int layer, int e) -> uint8_t {
+            const size_t ix = cell(layer, e);
+            return ix < ehit_.size() ? ehit_[ix] : static_cast<uint8_t>(0);
+        };
+        auto turn_at = [&](int layer, int e) -> uint32_t {
+            const size_t ix = cell(layer, e);
+            return ix < turn_c_.size() ? turn_c_[ix] : 0u;
+        };
+
+        std::vector<int> live;
+        live.reserve(static_cast<size_t>(last) + 1);
+        for (int layer = 0; layer <= last; ++layer) {
+            if (!usage_.has_row(layer))
+                continue;
+            if (layer == last) {
+                bool any = false;
+                for (int e = 0; e < cols; ++e) {
+                    if (usage_.get(layer, e) || hit_at(layer, e)) {
+                        any = true;
+                        break;
+                    }
+                }
+                if (!any)
+                    continue;
+            }
+            live.push_back(layer);
+        }
+
+        out = {};
+        out.rows = static_cast<int>(live.size());
+        out.cols = cols;
+        const size_t ncell = static_cast<size_t>(out.rows) * static_cast<size_t>(cols);
+        out.emap.assign(ncell, 0);
+        out.hits.assign(ncell, 0);
+        out.entropy.assign(static_cast<size_t>(out.rows), 0.f);
+
+        int ram = 0;
+        int disk = 0;
+        for (int r = 0; r < out.rows; ++r) {
+            const int layer = live[static_cast<size_t>(r)];
+            const size_t row0 = static_cast<size_t>(r) * static_cast<size_t>(cols);
+            uint64_t sum = 0;
+            for (int e = 0; e < cols; ++e) {
+                const int tier = store_.resident(layer, e) ? 1 : 0;
+                if (tier)
+                    ++ram;
+                else
+                    ++disk;
+                out.emap[row0 + static_cast<size_t>(e)] =
+                    mux_emap_byte(tier, usage_.get(layer, e));
+                out.hits[row0 + static_cast<size_t>(e)] = hit_at(layer, e) ? 1 : 0;
+                sum += turn_at(layer, e);
+            }
+            if (sum == 0)
+                continue;
+            double H = 0.0;
+            const double inv = 1.0 / static_cast<double>(sum);
+            for (int e = 0; e < cols; ++e) {
+                const uint32_t c = turn_at(layer, e);
+                if (!c)
+                    continue;
+                const double p = static_cast<double>(c) * inv;
+                H -= p * std::log2(p);
+            }
+            out.entropy[static_cast<size_t>(r)] = static_cast<float>(H);
+        }
+        out.vram = 0;
+        out.vram_gb = 0;
+        out.ram = ram;
+        out.disk = disk;
+        out.ram_gb = static_cast<double>(store_.expert_bytes()) * static_cast<double>(ram) / 1e9;
+
+        if (consume_hits) {
+            std::fill(ehit_.begin(), ehit_.end(), static_cast<uint8_t>(0));
+            std::fill(turn_c_.begin(), turn_c_.end(), 0u);
+        }
+    }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
                           std::string &err) override {
@@ -1646,6 +1742,25 @@ private:
         return Status::Ok;
     }
 
+    void turn_mark(int layer, const int *ids, int k) {
+        if (!ids || k <= 0 || layer < 0 || layer > usage_.n_layers())
+            return;
+        const int nE = usage_.n_experts();
+        if (nE < 1)
+            return;
+        for (int i = 0; i < k; ++i) {
+            const int e = ids[i];
+            if (e < 0 || e >= nE)
+                continue;
+            const size_t ix =
+                static_cast<size_t>(layer) * static_cast<size_t>(nE) + static_cast<size_t>(e);
+            if (ix < ehit_.size())
+                ehit_[ix] = 1;
+            if (ix < turn_c_.size())
+                ++turn_c_[ix];
+        }
+    }
+
     Status moe_layer(int layer, const float *x, float *h, std::string &err) {
         return moe_layer_n(layer, x, h, 1, err);
     }
@@ -1673,6 +1788,7 @@ private:
             moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
                      wt.data() + static_cast<size_t>(c) * K, scores.data());
             usage_.count(layer, idx.data() + static_cast<size_t>(c) * K, K);
+            turn_mark(layer, idx.data() + static_cast<size_t>(c) * K, K);
             {
                 std::string terr;
                 (void)trace_.emit(c, layer, idx.data() + static_cast<size_t>(c) * K,
@@ -1903,6 +2019,8 @@ private:
     K3Slot slots_[kMaxKvSlots];
     RouteUsage usage_;
     RouteTrace trace_;
+    std::vector<uint8_t> ehit_;
+    std::vector<uint32_t> turn_c_;
 };
 
 std::unique_ptr<FamilyEngine> make_kimi_k3() { return std::make_unique<KimiK3Engine>(); }

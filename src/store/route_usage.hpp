@@ -17,6 +17,7 @@ public:
     void drop_row(int layer); // dense layer: no experts
     void count(int layer, const int *ids, int k);
     uint32_t get(int layer, int expert) const;
+    bool has_row(int layer) const { return row(layer) != nullptr; }
     int n_layers() const { return n_layers_; } // inclusive
     int n_experts() const { return n_experts_; }
 
