@@ -187,6 +187,14 @@ public:
         (void)rows;
         return 0;
     }
+    // Restore slot KV from persist rows (same layout as export). Returns rows written.
+    virtual int import_kv_rows(int slot, int pos0, int n, const KvPersistRecord *rows) {
+        (void)slot;
+        (void)pos0;
+        (void)n;
+        (void)rows;
+        return 0;
+    }
 };
 
 std::unique_ptr<FamilyEngine> make_engine(Family family);

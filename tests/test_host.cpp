@@ -4498,6 +4498,20 @@ int main() {
         grow.R.assign(static_cast<size_t>(gl) * static_cast<size_t>(gqr), 0.f);
         grow.I.assign(static_cast<size_t>(std::max(eg.config().dsa.head_dim, 0)), 0.f);
         CHECK(fg->export_kv_rows(0, 0, 1, &grow) == 1);
+        KvPersistRecord restored;
+        restored.L.assign(one.L.size(), 0.f);
+        restored.R.assign(one.R.size(), 0.f);
+        ek.persist_close();
+        CHECK(ek.persist_open(kvpath, 1, err) == Status::Ok);
+        CHECK(fe->export_kv_rows(0, 0, 1, &restored) == 1);
+        CHECK(restored.L == one.L);
+        CHECK(restored.R == one.R);
+        std::vector<int> ids;
+        CHECK(extract_json_int_array("{\"stop_ids\":[7,9,0]}", "stop_ids", ids));
+        CHECK(ids.size() == 3 && ids[0] == 7 && ids[2] == 0);
+        CHECK(extract_json_int_array("{\"stop_ids\":[]}", "stop_ids", ids) && ids.empty());
+        CHECK(!extract_json_int_array("{\"stop_ids\":1}", "stop_ids", ids));
+        CHECK(!extract_json_int_array("{}", "stop_ids", ids));
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

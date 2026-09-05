@@ -316,13 +316,14 @@ Status Engine::persist_open(const std::string &path, int ver, std::string &err) 
     persist_open_ = true;
 
     persist_hist_.clear();
+    std::vector<KvPersistRecord> rows;
     std::string lerr;
     if (ver == 1)
-        persist_v1_.load(persist_hist_, nullptr, lerr);
+        persist_v1_.load(persist_hist_, &rows, lerr);
     else if (ver == 2)
-        persist_v2_.load(persist_hist_, nullptr, lerr);
+        persist_v2_.load(persist_hist_, &rows, lerr);
     else
-        persist_v3_.load(persist_hist_, nullptr, lerr);
+        persist_v3_.load(persist_hist_, &rows, lerr);
 
     const int n = static_cast<int>(persist_hist_.size());
     int cap = n + rt_.max_seq;
@@ -331,6 +332,8 @@ Status Engine::persist_open(const std::string &path, int ver, std::string &err) 
     prefixes_[0].alloc(cap);
     if (n > 0)
         prefixes_[0].record(persist_hist_.data(), 0, n);
+    if (impl_ && !rows.empty())
+        impl_->import_kv_rows(0, 0, static_cast<int>(rows.size()), rows.data());
     return Status::Ok;
 }
 

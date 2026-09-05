@@ -207,9 +207,10 @@ radius (`KvPersistV3`; `format_tag = codec<<8 | bits`).
 `Engine` opens `RuntimeConfig.kv_path` (`MVLLM_KV` / `COLI_KV`) at load,
 warms slot 0 from hist, and appends new tokens after generate.
 `FamilyEngine::export_kv_rows` copies MLA `L`/`R` (and GLM DSA `I`) from
-the slot cache; missing/KDA layers stay zero. SUBMIT extras
-`persist`/`kv_path`/`coli_kv` plus `persist_ver` overlay the path for that
-request. Raw mux `prefix_bytes` becomes a `prefix_reuse` token count
+the slot cache; missing/KDA layers stay zero. `import_kv_rows` restores
+those rows on `persist_open` so a reopen warms slot 0 without re-prefill.
+SUBMIT extras and HTTP `apply_sampling_extras` honor `persist`/`kv_path`/
+`coli_kv`, `persist_ver`, `stop_ids`, `eos_only`, and `prefix_bytes`. Raw mux `prefix_bytes` becomes a `prefix_reuse` token count
 (capped by prompt length; K3CHAT1 skipped). `KvPrefix::reuse` still wins
 when the recorded ids are a strict prefix.
 

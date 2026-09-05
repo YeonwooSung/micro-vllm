@@ -513,6 +513,98 @@ public:
         return n;
     }
 
+    // Inverse of export: restore mla_cache / dsa_ikeys / history from persist rows.
+    int import_kv_rows(int slot, int pos0, int n, const KvPersistRecord *rows) override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        Glm53Slot &sl = slots_[slot];
+        const int kvL = std::max(cfg_.mla.kv_lora, 0);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const int stride = kvL + qr;
+        const int ID = std::max(cfg_.dsa.head_dim, 0);
+        const int L = cfg_.n_layers;
+        const int headroom = std::max(rt_.max_seq, 256);
+        const int t_max = std::max(std::max(pos0 + n, sl.pos), 1) + headroom;
+        bool caches_small = static_cast<int>(sl.mla_cache.size()) < L;
+        if (!caches_small && stride > 0) {
+            const size_t need = static_cast<size_t>(std::max(pos0 + n, 1)) * static_cast<size_t>(stride);
+            for (int l = 0; l < L; ++l) {
+                if (sl.mla_cache[l].size() < need) {
+                    caches_small = true;
+                    break;
+                }
+            }
+        }
+        if (ID > 0 && cfg_.dsa.topk > 0 && static_cast<int>(sl.dsa_ikeys.size()) < L)
+            caches_small = true;
+        if (!sl.have || caches_small)
+            slot_alloc(sl, t_max);
+        else
+            slot_ensure_t(sl, t_max);
+
+        int written = 0;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0)
+                continue;
+            const KvPersistRecord &rec = rows[t];
+            if (stride > 0) {
+                for (int l = 0; l < L; ++l) {
+                    if (l >= static_cast<int>(sl.mla_cache.size()) || sl.mla_cache[l].empty())
+                        continue;
+                    std::vector<float> &cache = sl.mla_cache[l];
+                    const size_t dst0 = static_cast<size_t>(pos) * static_cast<size_t>(stride);
+                    if (dst0 + static_cast<size_t>(stride) > cache.size())
+                        continue;
+                    float *dst = cache.data() + dst0;
+                    if (kvL > 0) {
+                        const size_t src = static_cast<size_t>(l) * static_cast<size_t>(kvL);
+                        if (src < rec.L.size()) {
+                            const int ncopy = std::min(kvL, static_cast<int>(rec.L.size() - src));
+                            if (ncopy > 0)
+                                std::memcpy(dst, rec.L.data() + src,
+                                            static_cast<size_t>(ncopy) * sizeof(float));
+                        }
+                    }
+                    if (qr > 0) {
+                        const size_t src = static_cast<size_t>(l) * static_cast<size_t>(qr);
+                        if (src < rec.R.size()) {
+                            const int ncopy = std::min(qr, static_cast<int>(rec.R.size() - src));
+                            if (ncopy > 0)
+                                std::memcpy(dst + kvL, rec.R.data() + src,
+                                            static_cast<size_t>(ncopy) * sizeof(float));
+                        }
+                    }
+                }
+            }
+            if (ID > 0 && !cfg_.is_full.empty()) {
+                size_t ioff = 0;
+                for (int l = 0; l < L; ++l) {
+                    const bool full =
+                        (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
+                    if (!full)
+                        continue;
+                    if (ioff + static_cast<size_t>(ID) <= rec.I.size() &&
+                        l < static_cast<int>(sl.dsa_ikeys.size())) {
+                        std::vector<float> &ik = sl.dsa_ikeys[l];
+                        const size_t koff = static_cast<size_t>(pos) * static_cast<size_t>(ID);
+                        if (koff + static_cast<size_t>(ID) <= ik.size())
+                            std::memcpy(ik.data() + koff, rec.I.data() + ioff,
+                                        static_cast<size_t>(ID) * sizeof(float));
+                    }
+                    ioff += static_cast<size_t>(ID);
+                }
+            }
+            if (static_cast<int>(sl.history.size()) <= pos)
+                sl.history.resize(static_cast<size_t>(pos) + 1);
+            sl.history[static_cast<size_t>(pos)] = rec.token;
+            written = t + 1;
+        }
+        sl.pos = std::max(sl.pos, pos0 + written);
+        sl.have = sl.pos > 0;
+        return written;
+    }
+
 private:
     int mhc_mult() const { return cfg_.mhc.mult > 0 ? cfg_.mhc.mult : 1; }
 

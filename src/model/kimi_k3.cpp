@@ -795,6 +795,77 @@ public:
         return n;
     }
 
+    // Inverse of export: L/R layer-major → mla_cache[l][pos] (L then R).
+    int import_kv_rows(int slot, int pos0, int n, const KvPersistRecord *rows) override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        K3Slot &sl = slots_[slot];
+        const int kvL = std::max(cfg_.mla.kv_lora, 0);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const int stride = kvL + qr;
+        const int nL = cfg_.n_layers;
+        int t_max = pos0 + n;
+        if (t_max < sl.pos)
+            t_max = sl.pos;
+        if (t_max < 1)
+            t_max = 1;
+        t_max += std::max(rt_.max_seq, 64);
+        const bool cache_missing =
+            sl.mla_cache.empty() || static_cast<int>(sl.mla_cache.size()) < nL;
+        if (!sl.have || cache_missing) {
+            slot_alloc(sl, t_max);
+            slot_ensure_t(sl, t_max);
+        } else {
+            slot_ensure_t(sl, t_max);
+        }
+        int written = 0;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0)
+                return t;
+            const KvPersistRecord &rec = rows[t];
+            for (int l = 0; l < nL; ++l) {
+                const bool have_row = stride > 0 && l < static_cast<int>(sl.mla_cache.size()) &&
+                                      !sl.mla_cache[l].empty();
+                const size_t row0 = static_cast<size_t>(pos) * static_cast<size_t>(stride);
+                if (!have_row || row0 >= sl.mla_cache[l].size())
+                    continue;
+                float *dst = sl.mla_cache[l].data() + row0;
+                const int dst_cap = static_cast<int>(sl.mla_cache[l].size() - row0);
+                if (kvL > 0) {
+                    const size_t src = static_cast<size_t>(l) * static_cast<size_t>(kvL);
+                    if (src < rec.L.size()) {
+                        int ncopy = std::min(kvL, static_cast<int>(rec.L.size() - src));
+                        if (ncopy > dst_cap)
+                            ncopy = dst_cap;
+                        if (ncopy > 0)
+                            std::memcpy(dst, rec.L.data() + src,
+                                        static_cast<size_t>(ncopy) * sizeof(float));
+                    }
+                }
+                if (qr > 0) {
+                    const size_t src = static_cast<size_t>(l) * static_cast<size_t>(qr);
+                    if (src < rec.R.size()) {
+                        int ncopy = std::min(qr, static_cast<int>(rec.R.size() - src));
+                        const int room = dst_cap - kvL;
+                        if (ncopy > room)
+                            ncopy = room;
+                        if (ncopy > 0)
+                            std::memcpy(dst + kvL, rec.R.data() + src,
+                                        static_cast<size_t>(ncopy) * sizeof(float));
+                    }
+                }
+            }
+            if (static_cast<int>(sl.history.size()) <= pos)
+                sl.history.resize(static_cast<size_t>(pos) + 1, 0);
+            sl.history[static_cast<size_t>(pos)] = rec.token;
+            ++written;
+        }
+        sl.pos = std::max(sl.pos, pos0 + written);
+        sl.have = (sl.pos > 0);
+        return written;
+    }
+
 private:
     const float *sw_attn(int l) const {
         return (l < static_cast<int>(d_.attn_sw.size()) && !d_.attn_sw[l].empty())

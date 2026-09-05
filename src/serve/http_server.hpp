@@ -65,6 +65,7 @@ bool extract_json_int(const std::string &body, const char *key, int &out);
 bool extract_json_number(const std::string &body, const char *key, float &out);
 bool extract_json_bool(const std::string &body, const char *key, bool &out);
 bool extract_json_logit_bias(const std::string &body, std::vector<std::pair<int, float>> &out);
+bool extract_json_int_array(const std::string &body, const char *key, std::vector<int> &out);
 bool extract_response_format(const std::string &body, std::string &grammar, std::string &err);
 bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &out);
 bool extract_image_url_from_part(const std::string &part, std::string &url);

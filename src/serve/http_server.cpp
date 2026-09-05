@@ -542,6 +542,28 @@ void apply_sampling_extras(const std::string &body, GenParams &gp) {
         gp.logprobs = lp_n;
     }
     extract_json_logit_bias(body, gp.logit_bias);
+
+    // persist / kv_path / coli_kv: last present wins
+    std::string persist;
+    if (extract_json_string(body, "persist", persist))
+        gp.persist_path = persist;
+    if (extract_json_string(body, "kv_path", persist))
+        gp.persist_path = persist;
+    if (extract_json_string(body, "coli_kv", persist))
+        gp.persist_path = persist;
+    int pver = 0;
+    if (extract_json_int(body, "persist_ver", pver) && pver >= 1 && pver <= 3)
+        gp.persist_ver = pver;
+    if (extract_json_int(body, "kv_ver", pver) && pver >= 1 && pver <= 3)
+        gp.persist_ver = pver;
+    int pb = 0;
+    if (extract_json_int(body, "prefix_bytes", pb) && pb >= 0)
+        gp.prefix_bytes = pb;
+    int pr = 0;
+    if (extract_json_int(body, "prefix_reuse", pr) && pr >= 0)
+        gp.prefix_reuse = pr;
+    extract_json_int_array(body, "stop_ids", gp.stop_ids);
+    extract_json_bool(body, "eos_only", gp.eos_only);
 }
 
 std::string openai_logprobs_content(Engine *engine, const GenResult &out) {
@@ -1789,6 +1811,108 @@ bool extract_json_number(const std::string &body, const char *key, float &out) {
             }
         }
         pos += 1;
+    }
+    return false;
+}
+
+bool extract_json_int_array(const std::string &body, const char *key, std::vector<int> &out) {
+    if (!key)
+        return false;
+    std::string pat = std::string("\"") + key + "\"";
+    size_t pos = 0;
+    while ((pos = body.find(pat, pos)) != std::string::npos) {
+        size_t i = skip_ws(body, pos + pat.size());
+        if (i >= body.size() || body[i] != ':') {
+            pos += 1;
+            continue;
+        }
+        i = skip_ws(body, i + 1);
+        if (i >= body.size() || body[i] != '[') {
+            pos += 1;
+            continue;
+        }
+        ++i;
+        std::vector<int> vals;
+        auto skip_value = [&]() -> bool {
+            i = skip_ws(body, i);
+            if (i >= body.size())
+                return false;
+            if (body[i] == '"') {
+                std::string dummy;
+                return parse_json_string(body, i, dummy);
+            }
+            if (body[i] == '{' || body[i] == '[') {
+                int depth = 0;
+                bool in_str = false;
+                for (; i < body.size(); ++i) {
+                    const char c = body[i];
+                    if (in_str) {
+                        if (c == '\\') {
+                            ++i;
+                            continue;
+                        }
+                        if (c == '"')
+                            in_str = false;
+                        continue;
+                    }
+                    if (c == '"')
+                        in_str = true;
+                    else if (c == '{' || c == '[')
+                        ++depth;
+                    else if (c == '}' || c == ']') {
+                        --depth;
+                        if (depth == 0) {
+                            ++i;
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            while (i < body.size() && body[i] != ',' && body[i] != ']' && body[i] != '}' &&
+                   !std::isspace(static_cast<unsigned char>(body[i])))
+                ++i;
+            return true;
+        };
+        while (i < body.size()) {
+            i = skip_ws(body, i);
+            if (i < body.size() && body[i] == ']') {
+                out = std::move(vals);
+                return true;
+            }
+            const size_t start = i;
+            if (i < body.size() && body[i] == '-')
+                ++i;
+            if (i < body.size() && std::isdigit(static_cast<unsigned char>(body[i]))) {
+                while (i < body.size() && std::isdigit(static_cast<unsigned char>(body[i])))
+                    ++i;
+                if (i < body.size() && (body[i] == '.' || body[i] == 'e' || body[i] == 'E')) {
+                    i = start;
+                    if (!skip_value())
+                        return false;
+                } else {
+                    try {
+                        vals.push_back(std::stoi(body.substr(start, i - start)));
+                    } catch (...) {
+                    }
+                }
+            } else {
+                i = start;
+                if (!skip_value())
+                    return false;
+            }
+            i = skip_ws(body, i);
+            if (i < body.size() && body[i] == ',') {
+                ++i;
+                continue;
+            }
+            if (i < body.size() && body[i] == ']') {
+                out = std::move(vals);
+                return true;
+            }
+            return false;
+        }
+        return false;
     }
     return false;
 }
