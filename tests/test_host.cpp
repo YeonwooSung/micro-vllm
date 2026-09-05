@@ -1049,13 +1049,21 @@ static void test_offload_generate() {
         CHECK(turn.find("EMAP ") != std::string::npos);
         CHECK(turn.find("HITS ") != std::string::npos);
         CHECK(turn.find("ENTROPY ") != std::string::npos);
+        CHECK(ek.hits_seq() == 0);
+        std::string ej = experts_json(&ek, true);
+        CHECK(ej.find("\"rows\":") != std::string::npos);
+        CHECK(ej.find("\"map\":\"") != std::string::npos);
+        CHECK(ej.find("\"entropy\":[") != std::string::npos);
+        CHECK(experts_json(&ek, false) == mux_format_experts_json(0, 0, nullptr, nullptr, 0));
         RouteTelem a, b;
         ek.route_telem(a, true);
+        CHECK(ek.hits_seq() == 1);
         ek.route_telem(b, false);
         int after = 0;
         for (uint8_t h : b.hits)
             after += h ? 1 : 0;
         CHECK(after == 0);
+        CHECK(b.entropy.size() == a.entropy.size()); // consume clears hits only
     }
 
     std::string gdir = tmpdir();
@@ -3737,6 +3745,18 @@ int main() {
         CHECK(mux_format_emap(1, 2, em) == "EMAP 1 2 0080\n");
         uint8_t hit[3] = {1, 0, 1};
         CHECK(mux_format_hits(1, 3, hit) == "HITS 1 3 05\n");
+        CHECK(mux_hits_hex(1, 3, hit) == "05");
+        std::vector<uint8_t> bm;
+        mux_hits_pack(1, 3, hit, bm);
+        CHECK(bm.size() == 1 && bm[0] == 0x05);
+        CHECK(mux_format_experts_json(0, 0, nullptr, nullptr, 0) ==
+              "{\"rows\":0,\"cols\":0,\"map\":\"\",\"hits\":\"\",\"seq\":0}");
+        CHECK(mux_format_experts_json(1, 2, em, hit, 4) ==
+              "{\"rows\":1,\"cols\":2,\"map\":\"0080\",\"hits\":\"01\",\"seq\":4}");
+        float ejent[2] = {1.5f, 2.f};
+        CHECK(mux_format_experts_json(1, 2, em, hit, 4, ejent, 2) ==
+              "{\"rows\":1,\"cols\":2,\"map\":\"0080\",\"hits\":\"01\",\"seq\":4,\"entropy\":[1.5,2]}");
+        CHECK(experts_json(nullptr) == mux_format_experts_json(0, 0, nullptr, nullptr, 0));
         std::string perf = mux_format_perf(9, 0.5, 0.1, 0, 0, 0, 0, 0);
         CHECK(perf.find("PERF 9 ") == 0);
         CHECK(perf.back() == '\n');

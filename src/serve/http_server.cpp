@@ -1,5 +1,6 @@
 #include "http_server.hpp"
 #include "anthropic.hpp"
+#include "mux_frames.hpp"
 #include "../engine.hpp"
 #include "../io/image.hpp"
 #include "../tok/glm_tools.hpp"
@@ -649,6 +650,17 @@ std::string health_json(Engine *engine) {
     return os.str();
 }
 
+std::string experts_json(Engine *engine, bool authed) {
+    if (!engine || !authed)
+        return mux_format_experts_json(0, 0, nullptr, nullptr, 0);
+    RouteTelem rt;
+    engine->route_telem(rt, false);
+    return mux_format_experts_json(rt.rows, rt.cols, rt.emap.empty() ? nullptr : rt.emap.data(),
+                                  rt.hits.empty() ? nullptr : rt.hits.data(), engine->hits_seq(),
+                                  rt.entropy.empty() ? nullptr : rt.entropy.data(),
+                                  static_cast<int>(rt.entropy.size()));
+}
+
 std::string openai_model_object(const std::string &id) {
     return "{\"id\":\"" + json_escape(id) +
            "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"micro-vllm\"}";
@@ -822,7 +834,8 @@ void HttpServer::handle_client(int cfd) {
         }
 
         const bool v1 = path.size() >= 4 && path.compare(0, 4, "/v1/") == 0;
-        if (method == "OPTIONS" && (path == "/health" || path == "/metrics" || v1)) {
+        if (method == "OPTIONS" &&
+            (path == "/health" || path == "/experts" || path == "/metrics" || v1)) {
             http_options(cfd);
             ::close(cfd);
             return;
@@ -836,6 +849,9 @@ void HttpServer::handle_client(int cfd) {
 
         if (method == "GET" && path == "/health") {
             http_reply(cfd, 200, "OK", health_json(engine_), request_id);
+        } else if (method == "GET" && path == "/experts") {
+            http_reply(cfd, 200, "OK", experts_json(engine_, api_key_ok(authorization, x_api_key)),
+                       request_id);
         } else if (method == "GET" && (path == "/metrics" || path == "/v1/metrics")) {
             uint64_t requests = 0;
             uint64_t tokens_out = 0;

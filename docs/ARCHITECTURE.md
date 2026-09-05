@@ -52,7 +52,7 @@ src/quant    MXFP4, int4-g64, int8-row, SiTU-GLU, clamped SwiGLU
 src/store    ExpertStore (MoE LRU + RAM/disk tiers) + BlockStore + COLIKV1 + .coli_usage
 src/tok      whitespace / HF tokenizer.json / raw ids
 src/model    family registry + llama / kimi_k3 / glm53 / h3 (+ canvas, DiT schedule)
-src/serve    OpenAI HTTP + mux TOOL/TOPK/HITS/EMAP telemetry frames
+src/serve    OpenAI HTTP + GET /experts + mux TOOL/TOPK/HITS/EMAP telemetry frames
 src/legacy   original CUDA Llama demo
 ```
 
@@ -251,7 +251,10 @@ K3/GLM `generate` counts routed ids and saves `model_dir/.coli_usage`.
 Immediately before DONE: HWINFO, PERF, ENTROPY (if any), TIERS, EMAP, HITS
 (`mux_format_turn_telem`). K3/GLM `route_telem` fills EMAP from
 `.coli_usage` heat + ExpertStore RAM/disk tiers, HITS from this-turn
-routes (cleared on consume), and per-sparse-row Shannon ENTROPY.
+routes (cleared on consume; turn entropy stays), and per-sparse-row Shannon
+ENTROPY. Mux emits mid-turn `HITS` every 6 tokens. PERF `dt` is wall
+seconds since ACCEPT. `GET /experts` returns `{rows,cols,map,hits,seq}`
+(`mux_format_experts_json`; empty unless authed).
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

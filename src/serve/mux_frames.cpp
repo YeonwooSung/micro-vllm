@@ -156,27 +156,74 @@ std::string mux_format_emap(int rows, int cols, const uint8_t *bytes) {
     return out;
 }
 
+void mux_hits_pack(int rows, int cols, const uint8_t *hit, std::vector<uint8_t> &bm) {
+    const size_t bits = dim_count(rows, cols);
+    const size_t nb = (bits + 7) / 8;
+    bm.assign(nb, 0);
+    if (!hit)
+        return;
+    for (size_t bit = 0; bit < bits; ++bit) {
+        if (hit[bit])
+            bm[bit >> 3] = static_cast<uint8_t>(bm[bit >> 3] | (1u << (bit & 7)));
+    }
+}
+
+std::string mux_hits_hex(int rows, int cols, const uint8_t *hit) {
+    std::vector<uint8_t> bm;
+    mux_hits_pack(rows, cols, hit, bm);
+    return mux_hex_encode(bm.data(), bm.size());
+}
+
 std::string mux_format_hits(int rows, int cols, const uint8_t *hit) {
     if (rows < 0)
         rows = 0;
     if (cols < 0)
         cols = 0;
-    const size_t bits = dim_count(rows, cols);
-    const size_t nb = (bits + 7) / 8;
-    std::vector<uint8_t> bm(nb, 0);
-    if (hit) {
-        for (size_t bit = 0; bit < bits; ++bit) {
-            if (hit[bit])
-                bm[bit >> 3] = static_cast<uint8_t>(bm[bit >> 3] | (1u << (bit & 7)));
-        }
-    }
+    std::vector<uint8_t> bm;
+    mux_hits_pack(rows, cols, hit, bm);
     std::string out = "HITS ";
     out.append(std::to_string(rows));
     out.push_back(' ');
     out.append(std::to_string(cols));
     out.push_back(' ');
-    out.append(mux_hex_encode(bm.data(), nb));
+    out.append(mux_hex_encode(bm.data(), bm.size()));
     out.push_back('\n');
+    return out;
+}
+
+std::string mux_format_experts_json(int rows, int cols, const uint8_t *emap, const uint8_t *hits,
+                                    int seq, const float *entropy, int n_entropy) {
+    if (rows < 0)
+        rows = 0;
+    if (cols < 0)
+        cols = 0;
+    const size_t n = dim_count(rows, cols);
+    std::string map;
+    if (emap && n)
+        map = mux_hex_encode(emap, n);
+    std::string hits_hex;
+    if (hits)
+        hits_hex = mux_hits_hex(rows, cols, hits);
+    std::string out = "{\"rows\":";
+    out.append(std::to_string(rows));
+    out.append(",\"cols\":");
+    out.append(std::to_string(cols));
+    out.append(",\"map\":\"");
+    out.append(map);
+    out.append("\",\"hits\":\"");
+    out.append(hits_hex);
+    out.append("\",\"seq\":");
+    out.append(std::to_string(seq));
+    if (entropy && n_entropy > 0) {
+        out.append(",\"entropy\":[");
+        for (int i = 0; i < n_entropy; ++i) {
+            if (i)
+                out.push_back(',');
+            append_f(out, static_cast<double>(entropy[i]));
+        }
+        out.push_back(']');
+    }
+    out.push_back('}');
     return out;
 }
 

@@ -377,10 +377,8 @@ public:
         out.ram = ram;
         out.disk = disk;
         out.ram_gb = static_cast<double>(store_.expert_bytes()) * static_cast<double>(ram) / 1e9;
-        if (consume_hits) {
+        if (consume_hits)
             std::fill(ehit_.begin(), ehit_.end(), 0);
-            std::fill(turn_c_.begin(), turn_c_.end(), 0u);
-        }
     }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,

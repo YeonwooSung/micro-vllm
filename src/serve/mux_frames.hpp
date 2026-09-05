@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mvllm {
 
@@ -33,6 +34,15 @@ void mux_emap_fill(uint8_t *out, const int *tier, const uint32_t *usage, int n);
 std::string mux_format_emap(int rows, int cols, const uint8_t *bytes);
 // HITS rows cols hex  — 1 bit per expert, bm[bit>>3] |= 1<<(bit&7).
 std::string mux_format_hits(int rows, int cols, const uint8_t *hit);
+// Pack 0/1 hit flags into the official HITS bitmap (bytes = (rows*cols+7)/8).
+// rows/cols <0 treated as 0. hit==null → all-zero bitmap.
+void mux_hits_pack(int rows, int cols, const uint8_t *hit, std::vector<uint8_t> &bm);
+// Lowercase hex of packed HITS bitmap (no header). Empty if rows*cols==0.
+std::string mux_hits_hex(int rows, int cols, const uint8_t *hit);
+// Compact JSON. No spaces. entropy uses %.6g via snprintf (same as mux_format_entropy).
+// rows/cols <0 → 0. emap==null → map "". hits==null → hits "".
+std::string mux_format_experts_json(int rows, int cols, const uint8_t *emap, const uint8_t *hits,
+                                    int seq, const float *entropy = nullptr, int n_entropy = 0);
 
 // PERF id dt t_edisk t_ewait t_emm t_attn t_kvb t_head  (seconds)
 std::string mux_format_perf(uint64_t id, double dt, double t_edisk, double t_ewait, double t_emm,

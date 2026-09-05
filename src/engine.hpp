@@ -48,7 +48,10 @@ public:
             impl_->route_telem(out, consume_hits);
         else
             out = {};
+        if (consume_hits && out.rows > 0)
+            ++hits_seq_;
     }
+    int hits_seq() const { return hits_seq_; }
     uint64_t block_hits() const { return impl_ ? impl_->block_hits() : 0; }
     uint64_t block_misses() const { return impl_ ? impl_->block_misses() : 0; }
     SessionStore &sessions() { return sessions_; }
@@ -87,6 +90,7 @@ private:
     int persist_slot_ = 0;
     std::string persist_path_;
     bool persist_open_ = false;
+    int hits_seq_ = 0;
 };
 
 } // namespace mvllm

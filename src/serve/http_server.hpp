@@ -71,6 +71,9 @@ bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &ou
 bool extract_image_url_from_part(const std::string &part, std::string &url);
 bool api_key_ok(const std::string &authorization, const std::string &x_api_key = {});
 std::string health_json(Engine *engine);
+// Official GET /experts body. engine==null or !authed → empty rows/cols/map/hits, seq 0.
+// consume_hits is always false.
+std::string experts_json(Engine *engine, bool authed = true);
 std::string openai_model_object(const std::string &id);
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
                          int running = 0, int queued = 0, int max_queue = 0);

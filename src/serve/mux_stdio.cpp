@@ -12,6 +12,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cerrno>
 #include <climits>
@@ -40,6 +41,7 @@ struct Flight {
     int prompt_tokens = 0;
     int max_tokens = 0;
     int emitted = 0;
+    double t0 = 0; // steady_clock seconds at ACCEPT
     bool cancelled = false;
     std::vector<float> image_rgb;
     int image_w = 0;
@@ -115,6 +117,25 @@ static void emit_data(uint64_t id, const std::string &piece) {
     fflush(stdout);
 }
 
+static double mono_now() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Mid-turn HITS ~every 6 generated tokens. consume_hits only; ENTROPY stays.
+static void emit_hits_pulse(Engine &engine, uint64_t id, int emitted) {
+    (void)id;
+    if (emitted <= 0 || emitted % 6 != 0)
+        return;
+    RouteTelem rt;
+    engine.route_telem(rt, true);
+    if (rt.rows > 0 && !rt.hits.empty()) {
+        const std::string line = mux_format_hits(rt.rows, rt.cols, rt.hits.data());
+        fwrite(line.data(), 1, line.size(), stdout);
+        fflush(stdout);
+    }
+}
+
 static int stop_kind_of(bool stopped_by_stop, int length_limited) {
     if (stopped_by_stop)
         return 2;
@@ -130,7 +151,7 @@ static void emit_done(uint64_t id, int emitted, int prompt_tokens, int length_li
     fflush(stdout);
 }
 
-static void emit_turn_telem(Engine &engine, uint64_t id) {
+static void emit_turn_telem(Engine &engine, uint64_t id, double t0) {
     const HwInfo hw = hw_probe();
     std::string hwline = mux_format_hwinfo(hw.cores, hw.ram_total_gb, hw.ram_avail_gb, hw.ngpu,
                                            hw.vram_total_gb, hw.cpu, hw.gpu);
@@ -140,8 +161,9 @@ static void emit_turn_telem(Engine &engine, uint64_t id) {
                                  : (engine.config().moe.n_experts > 0 ? engine.config().moe.n_experts
                                                                      : 0);
     const double ram_gb = rt.ram_gb > 0.0 ? rt.ram_gb : rss_gb();
+    const double dt = (t0 == 0.0) ? 0.0 : (mono_now() - t0);
     const std::string block = mux_format_turn_telem(
-        hwline, id, 0, 0, 0, 0, 0, 0, 0, rt.entropy.empty() ? nullptr : rt.entropy.data(),
+        hwline, id, dt, 0, 0, 0, 0, 0, 0, rt.entropy.empty() ? nullptr : rt.entropy.data(),
         static_cast<int>(rt.entropy.size()), rt.vram, rt.ram, disk, rt.vram_gb, ram_gb, rt.rows,
         rt.cols, rt.emap.empty() ? nullptr : rt.emap.data(), rt.rows, rt.cols,
         rt.hits.empty() ? nullptr : rt.hits.data());
@@ -631,7 +653,15 @@ struct Mux {
             }
             take_pending_image(id, fl, gp);
             Engine *eng = &engine;
-            gp.on_token = [eng, id](int tok) { emit_data(id, eng->decode_token(tok)); };
+            Mux *self = this;
+            gp.on_token = [eng, self, id](int tok) {
+                emit_data(id, eng->decode_token(tok));
+                Flight *live = self->find(id);
+                if (!live)
+                    return;
+                ++live->emitted;
+                emit_hits_pulse(*eng, id, live->emitted);
+            };
             gp.token_text = [eng](int tid) { return eng->decode_token(tid); };
             std::string serr;
             uint64_t sid = engine.scheduler().submit(slot, ids, gp, serr);
@@ -650,6 +680,7 @@ struct Mux {
             if (k3 || engine.family() == Family::KimiK3)
                 emit_tool_sideband(id);
             fl.sched_id = sid;
+            fl.t0 = mono_now();
             flights[id] = std::move(fl);
             sched_to_client[sid] = id;
             emit_stat();
@@ -664,6 +695,7 @@ struct Mux {
         emit_accept(id, prompt_tokens);
         if (k3 || engine.family() == Family::KimiK3)
             emit_tool_sideband(id);
+        fl.t0 = mono_now();
         flights[id] = std::move(fl);
         emit_stat();
         if (Flight *stored = find(id)) {
@@ -683,6 +715,7 @@ struct Mux {
                 return;
             emit_data(id, eng->decode_token(tok));
             ++live->emitted;
+            emit_hits_pulse(*eng, id, live->emitted);
             self->poll_controls(id);
         };
         gp.token_text = [eng](int tid) { return eng->decode_token(tid); };
@@ -713,7 +746,7 @@ struct Mux {
             emit_topk_rows(engine, id, out);
         const int emitted = live ? live->emitted : static_cast<int>(out.tokens.size());
         const int limited = length_limited_of(out.tokens, max_tokens, engine.config(), gp.eos);
-        emit_turn_telem(engine, id);
+        emit_turn_telem(engine, id, live ? live->t0 : 0);
         emit_done(id, emitted, prompt_tokens, limited, stop_kind_of(out.stopped_by_stop, limited));
         forget(id);
     }
@@ -743,7 +776,7 @@ struct Mux {
                 const int emitted = static_cast<int>(job->out.tokens.size());
                 const int limited = length_limited_of(job->out.tokens, fl->max_tokens,
                                                       engine.config(), job->gp.eos);
-                emit_turn_telem(engine, fl->id);
+                emit_turn_telem(engine, fl->id, fl->t0);
                 emit_done(fl->id, emitted, fl->prompt_tokens, limited,
                           stop_kind_of(job->out.stopped_by_stop, limited));
             }
