@@ -239,4 +239,62 @@ int fp8_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
     return 0;
 }
 
+namespace {
+
+constexpr int kFp4Scale = 32;
+
+bool bad_fp4_matvec(int O, int I) {
+    return O <= 0 || I <= 0 || (I % kFp8Tile) != 0;
+}
+
+void fp4_matvec_xhat(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+                     const float *xhat) {
+    const int packed_cols = I / 2;
+    const int ng = I / kFp4Scale;
+    for (int o = 0; o < O; ++o) {
+        float acc = 0.f;
+        const uint8_t *row = w + static_cast<size_t>(o) * static_cast<size_t>(packed_cols);
+        const uint8_t *row_sc = scales + static_cast<size_t>(o) * static_cast<size_t>(ng);
+        for (int g = 0; g < ng; ++g) {
+            float sc = e8m0_decode(row_sc[g]);
+            if (!std::isfinite(sc))
+                sc = 0.f;
+            const int base = g * kFp4Scale;
+            for (int k = 0; k < kFp4Scale; k += 2) {
+                const uint8_t byte = row[(base + k) / 2];
+                acc += e2m1_decode(byte & 0xF) * xhat[base + k] * sc;
+                acc += e2m1_decode(byte >> 4) * xhat[base + k + 1] * sc;
+            }
+        }
+        y[o] = acc;
+    }
+}
+
+} // namespace
+
+int fp4_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+               const float *x) {
+    if (!y || !w || !scales || !x || bad_fp4_matvec(O, I))
+        return -1;
+
+    std::vector<float> xhat;
+    if (qdq_xhat(xhat, x, I) != 0)
+        return -1;
+    fp4_matvec_xhat(y, w, scales, O, I, xhat.data());
+    return 0;
+}
+
+int fp4_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
+                    const uint8_t *wb, const uint8_t *sb, int O, int I, const float *x) {
+    if (!ya || !yb || !wa || !sa || !wb || !sb || !x || bad_fp4_matvec(O, I))
+        return -1;
+
+    std::vector<float> xhat;
+    if (qdq_xhat(xhat, x, I) != 0)
+        return -1;
+    fp4_matvec_xhat(ya, wa, sa, O, I, xhat.data());
+    fp4_matvec_xhat(yb, wb, sb, O, I, xhat.data());
+    return 0;
+}
+
 } // namespace mvllm

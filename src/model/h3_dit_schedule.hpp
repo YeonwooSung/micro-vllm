@@ -58,4 +58,12 @@ private:
 int h3_res_step(float *output, const float *sample, const float *denoised,
                 const float *old_denoised, int n, const float *sigmas, int step, int total_steps);
 
+// mod is [time_rows, 3*6*hidden] row-major F32 AdaLN (same as h3_adaln_mod).
+// Mean |mod| of slots 2 and 5 over modalities and hidden. -1 on bad args.
+double h3_adaln_gate_score(const float *mod, int time_rows, int hidden);
+
+// active[i]=0 when scores[i] < min_score or scores[i] < 0. n_blocks must be >0.
+// Returns how many stay active, or -1 on bad args.
+int h3_dit_prune_blocks(uint8_t *active, const double *scores, int n_blocks, double min_score);
+
 } // namespace mvllm

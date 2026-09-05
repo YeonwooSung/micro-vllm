@@ -1,7 +1,9 @@
 #include "h3_dit_schedule.hpp"
+#include "h3_adaln.hpp"
 
 #include <cmath>
 #include <cstdint>
+#include <cstddef>
 
 namespace mvllm {
 namespace {
@@ -285,6 +287,41 @@ int h3_res_step(float *output, const float *sample, const float *denoised,
                                        h * (b1 * denoised[i] + b2 * old_denoised[i]));
     }
     return 1;
+}
+
+double h3_adaln_gate_score(const float *mod, int time_rows, int hidden) {
+    if (!mod || time_rows < 1 || hidden < 1)
+        return -1.0;
+    double total = 0.0;
+    size_t samples = 0;
+    const size_t hidden_n = static_cast<size_t>(hidden);
+    for (int row = 0; row < time_rows; ++row) {
+        for (int modality = 0; modality < kH3AdalnModalities; ++modality) {
+            for (int slot = 2; slot <= 5; slot += 3) {
+                const size_t base =
+                    ((static_cast<size_t>(row) * kH3AdalnModalities * kH3AdalnSlots +
+                      static_cast<size_t>(modality) * kH3AdalnSlots + static_cast<size_t>(slot)) *
+                     hidden_n);
+                for (int column = 0; column < hidden; ++column)
+                    total += std::fabs(static_cast<double>(mod[base + static_cast<size_t>(column)]));
+                samples += hidden_n;
+            }
+        }
+    }
+    return samples ? total / static_cast<double>(samples) : -1.0;
+}
+
+int h3_dit_prune_blocks(uint8_t *active, const double *scores, int n_blocks, double min_score) {
+    if (!active || !scores || n_blocks < 1)
+        return -1;
+    int stay = 0;
+    for (int i = 0; i < n_blocks; ++i) {
+        if (scores[i] < min_score || scores[i] < 0.0)
+            active[i] = 0;
+        if (active[i])
+            ++stay;
+    }
+    return stay;
 }
 
 } // namespace mvllm

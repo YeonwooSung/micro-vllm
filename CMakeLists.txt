@@ -49,6 +49,7 @@ set(MVLLM_HOST_SOURCES
     src/quant/kv_tq.cpp
     src/quant/int8_dyn.cpp
     src/quant/native_act.cpp
+    src/quant/native_fp4.cpp
     src/quant/bf16.cpp
     src/store/expert_store.cpp
     src/store/block_store.cpp

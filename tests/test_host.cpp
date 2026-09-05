@@ -37,6 +37,7 @@
 #include "store/kv_row.hpp"
 #include "quant/int8_dyn.hpp"
 #include "quant/native_act.hpp"
+#include "quant/native_fp4.hpp"
 #include "quant/bf16.hpp"
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
@@ -4164,6 +4165,38 @@ int main() {
         CHECK_NEAR(ya[0], y[0], 1e-5);
         CHECK_NEAR(yb[1], y[1], 1e-5);
         CHECK(fp8_matvec(y.data(), w.data(), tsc, 2, 127, x.data()) == -1);
+        std::vector<uint8_t> w4(2 * 64, 0x22);
+        uint8_t s4[2 * 4];
+        for (int i = 0; i < 8; ++i)
+            s4[i] = 0x7f;
+        std::vector<float> y4(2, 0.f), ya4(2, 0.f), yb4(2, 0.f);
+        CHECK(fp4_matvec(y4.data(), w4.data(), s4, 2, 128, x.data()) == 0);
+        CHECK(std::isfinite(y4[0]) && y4[0] != 0.f);
+        CHECK(fp4_dual_matvec(ya4.data(), yb4.data(), w4.data(), s4, w4.data(), s4, 2, 128,
+                              x.data()) == 0);
+        CHECK_NEAR(ya4[0], y4[0], 1e-5);
+        CHECK(fp4_matvec(y4.data(), w4.data(), s4, 2, 64, x.data()) == -1);
+        std::vector<uint8_t> w16(16 * 64, 0x22);
+        std::vector<uint8_t> s16(16 * 4, 0x7f);
+        std::vector<float> xq(128, 1.f), yr(16, 0.f);
+        CHECK(fp4_matvec_rows16(yr.data(), w16.data(), s16.data(), 16, 128, xq.data()) == 0);
+        CHECK(std::isfinite(yr[0]) && yr[0] != 0.f);
+        CHECK(fp4_matvec_rows16(yr.data(), w16.data(), s16.data(), 15, 128, xq.data()) == -1);
+        const int hid = 2;
+        std::vector<float> mod(static_cast<size_t>(1 * 3 * 6 * hid), 0.f);
+        for (int m = 0; m < 3; ++m) {
+            for (int sl : {2, 5}) {
+                const size_t b = static_cast<size_t>((m * 6 + sl) * hid);
+                mod[b] = 1.f;
+                mod[b + 1] = 1.f;
+            }
+        }
+        CHECK_NEAR(h3_adaln_gate_score(mod.data(), 1, hid), 1.0, 1e-9);
+        CHECK(h3_adaln_gate_score(nullptr, 1, hid) < 0);
+        uint8_t act[3] = {1, 1, 1};
+        const double scs[3] = {0.5, 0.1, -1.0};
+        CHECK(h3_dit_prune_blocks(act, scs, 3, 0.2) == 1);
+        CHECK(act[0] == 1 && act[1] == 0 && act[2] == 0);
     }
     {
         using namespace mvllm;

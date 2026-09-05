@@ -28,4 +28,13 @@ int fp8_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
 int fp8_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
                     const uint8_t *wb, const uint8_t *sb, int O, int I, const float *x);
 
+// y = W x with dynamic E4M3 x (block 128) and packed E2M1 W * UE8M0 per 32 cols.
+// W is [O, I/2] (low nibble = even col). Returns 0 or -1.
+int fp4_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+               const float *x);
+
+// Shared-qdq dual: one x QDQ, two matvecs.
+int fp4_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
+                    const uint8_t *wb, const uint8_t *sb, int O, int I, const float *x);
+
 } // namespace mvllm
