@@ -47,11 +47,14 @@ set(MVLLM_HOST_SOURCES
     src/quant/weight.cpp
     src/quant/kv_fp8.cpp
     src/quant/kv_tq.cpp
+    src/quant/int8_dyn.cpp
     src/store/expert_store.cpp
     src/store/block_store.cpp
     src/store/kv_persist.cpp
     src/store/kv_persist_v2.cpp
+    src/store/kv_persist_v3.cpp
     src/store/route_usage.cpp
+    src/store/route_trace.cpp
     src/tok/tokenizer.cpp
     src/tok/k3_tools.cpp
     src/tok/k3_chat1.cpp

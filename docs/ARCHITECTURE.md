@@ -188,7 +188,8 @@ rows, optional DSA index). `nrec` is fsynced last. Mismatched geometry is
 ignored (empty reopen). Host F32 only. MLA latent rows can be stored as
 e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale) or PolarQuant /
 rotated int4 (`kv_tq_*` / `kv_q4_*`). COLIKV2 stores e4m3 L/R + per-row
-scale (`KvPersistV2`).
+scale (`KvPersistV2`). COLIKV3 stores PolarQuant or rotated-int4 L/R +
+radius (`KvPersistV3`; `format_tag = codec<<8 | bits`).
 
 Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
@@ -197,6 +198,10 @@ plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters. Buffer reader
 
 `.coli_usage`: sparse `layer expert count` with `-1`/`-2` headers (FNV-1a
 engine id). All-zero history is a zero-byte file. Atomic tmp+rename.
+`ROUTE_TRACE` lines are `<call> <row> <layer> <id>:<gate.4f> …`.
+
+H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
+X, `y = (w_sc[o]*x_sc[s])*dot_i32`.
 
 H3 AdaLN time embed (official two-SiLU MLP): `SiLU(W_out SiLU(W_in x+b)+b)`
 then per-block `W_adaln @ temb + b`. Serving reuse mask keeps step 0, the

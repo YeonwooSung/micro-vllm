@@ -29,7 +29,10 @@
 #include "store/expert_store.hpp"
 #include "store/kv_persist.hpp"
 #include "store/kv_persist_v2.hpp"
+#include "store/kv_persist_v3.hpp"
 #include "store/route_usage.hpp"
+#include "store/route_trace.hpp"
+#include "quant/int8_dyn.hpp"
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
 #include "tok/gbnf.hpp"
@@ -3981,6 +3984,102 @@ int main() {
         CHECK(idx[0] == 0 && idx[1] == 1);
         CHECK_NEAR(w[0], 0.5f, 1e-6);
         CHECK_NEAR(w[1], 0.5f, 1e-6);
+    }
+    {
+        using namespace mvllm;
+        const int ids[2] = {2, 5};
+        const float gates[2] = {0.6f, 0.4f};
+        CHECK(route_trace_format(0, 0, 3, ids, gates, 2) == "0 0 3 2:0.6000 5:0.4000\n");
+        RouteTraceEvent ev;
+        CHECK(route_trace_parse("0 0 3 2:0.6000 5:0.4000", ev));
+        CHECK(ev.call == 0 && ev.row == 0 && ev.layer == 3);
+        CHECK(ev.ids.size() == 2 && ev.ids[0] == 2 && ev.ids[1] == 5);
+        CHECK_NEAR(ev.gates[0], 0.6f, 1e-4);
+        CHECK(!route_trace_parse("junk", ev));
+        std::string sink, err;
+        RouteTrace tr;
+        CHECK(tr.attach(&sink, err));
+        CHECK(tr.emit(0, 3, ids, gates, 2, err));
+        tr.end();
+        CHECK(tr.call() == 1);
+        CHECK(sink == "0 0 3 2:0.6000 5:0.4000\n");
+        const std::string dir = tmpdir();
+        RouteTrace tf;
+        CHECK(tf.open(dir + "/route.txt", err));
+        CHECK(tf.emit(1, 2, ids, gates, 2, err));
+        tf.close();
+        std::ifstream in(dir + "/route.txt");
+        std::string line;
+        std::getline(in, line);
+        CHECK(line == "0 1 2 2:0.6000 5:0.4000");
+    }
+    {
+        using namespace mvllm;
+        KvPersistConfig cfg;
+        cfg.n_layers = 1;
+        cfg.kv_lora = 4;
+        cfg.qk_rope = 4;
+        cfg.vocab = 16;
+        KvPersistV3Options opt;
+        KvPersistV3 kp;
+        std::string err;
+        const std::string dir = tmpdir();
+        CHECK(kp.open(dir + "/cache.coli_kv3", cfg, opt, err) == Status::Ok);
+        CHECK(kp.nrec() == 0);
+        CHECK(kp.codec() == 0 && kp.bits() == 4);
+        CHECK(kp.record_bytes() == 16);
+        KvPersistRecord r;
+        r.L = {0.7f, -1.2f, 0.3f, 2.1f};
+        r.R = {0.5f, 0.5f, -0.5f, 0.25f};
+        int hist = 9;
+        CHECK(kp.append(&hist, 1, &r, 1, err) == Status::Ok);
+        CHECK(kp.nrec() == 1);
+        kp.close();
+        KvPersistV3 kp2;
+        CHECK(kp2.open(dir + "/cache.coli_kv3", cfg, opt, err) == Status::Ok);
+        std::vector<int> loaded;
+        std::vector<KvPersistRecord> rows;
+        CHECK(kp2.load(loaded, &rows, err) == 1);
+        CHECK(loaded[0] == 9);
+        CHECK(rows[0].L.size() == 4);
+        float den = 0.f, num = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            float d = rows[0].L[static_cast<size_t>(i)] - r.L[static_cast<size_t>(i)];
+            num += d * d;
+            den += r.L[static_cast<size_t>(i)] * r.L[static_cast<size_t>(i)];
+        }
+        CHECK(std::sqrt(num / den) < 0.25f);
+        KvPersistV3Options q4;
+        q4.codec = 1;
+        KvPersistV3 mismatch;
+        CHECK(mismatch.open(dir + "/cache.coli_kv3", cfg, q4, err) == Status::Ok);
+        CHECK(mismatch.nrec() == 0);
+    }
+    {
+        using namespace mvllm;
+        const float x[2] = {1.f, 0.f};
+        const float W[4] = {1.f, 0.f, 0.f, 1.f};
+        int8_t wq[4];
+        float wsc[2];
+        int8_quant_rows(W, 2, 2, wq, wsc);
+        float y[2] = {};
+        int8_dyn_gemm(y, x, wq, wsc, nullptr, 1, 2, 2);
+        CHECK_NEAR(y[0], 1.f, 1e-5);
+        CHECK_NEAR(y[1], 0.f, 1e-5);
+        int8_t q[2];
+        float sc = 0.f;
+        int8_quant_row(x, 2, q, &sc);
+        CHECK(q[0] == 127 && q[1] == 0);
+        CHECK_NEAR(sc, 1.f / 127.f, 1e-6);
+        const float bias[2] = {0.5f, -0.25f};
+        int8_dyn_gemm(y, x, wq, wsc, bias, 1, 2, 2);
+        CHECK_NEAR(y[0], 1.5f, 1e-5);
+        CHECK_NEAR(y[1], -0.25f, 1e-5);
+        float z[2] = {};
+        int8_t zq[2];
+        float zs = 9.f;
+        int8_quant_row(z, 2, zq, &zs);
+        CHECK(zq[0] == 0 && zq[1] == 0 && zs == 0.f);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
