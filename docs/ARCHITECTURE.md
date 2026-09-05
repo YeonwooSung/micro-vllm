@@ -49,7 +49,7 @@ Insufficient fast memory changes speed, not router semantics.
 src/core     types, ModelConfig, RuntimeConfig
 src/io       aligned I/O, O_DIRECT, safetensors
 src/quant    MXFP4, int4-g64, int8-row, SiTU-GLU, clamped SwiGLU
-src/store    ExpertStore (MoE LRU) + BlockStore (DiT 2-slot stream) + COLIKV1 persist
+src/store    ExpertStore (MoE LRU) + BlockStore + COLIKV1 + .coli_usage
 src/tok      whitespace / HF tokenizer.json / raw ids
 src/model    family registry + llama / kimi_k3 / glm53 / h3 (+ canvas, DiT schedule)
 src/serve    OpenAI HTTP + mux TOOL/TOPK/HITS/EMAP telemetry frames
@@ -190,7 +190,14 @@ e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale).
 
 Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
-plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters.
+plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters. Buffer reader
+`mux_parse_command` accepts SUBMIT/STOP/CANCEL/IMAGE (NeedMore vs BadFrame).
+
+`.coli_usage`: sparse `layer expert count` with `-1`/`-2` headers (FNV-1a
+engine id). All-zero history is a zero-byte file. Atomic tmp+rename.
+
+H3 AdaLN time embed (official two-SiLU MLP): `SiLU(W_out SiLU(W_in x+b)+b)`
+then per-block `W_adaln @ temb + b`.
 
 H3 RGB resize: portable bilinear + edge-extend (official vImage HQ path
 without Accelerate). Identity geometry still copies.

@@ -20,9 +20,11 @@
 #include "model/h3_mm.hpp"
 #include "model/h3_dit_schedule.hpp"
 #include "model/h3_canvas.hpp"
+#include "model/h3_adaln.hpp"
 #include "store/block_store.hpp"
 #include "store/expert_store.hpp"
 #include "store/kv_persist.hpp"
+#include "store/route_usage.hpp"
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
 #include "tok/gbnf.hpp"
@@ -35,6 +37,7 @@
 #include "serve/anthropic.hpp"
 #include "serve/mux_stdio.hpp"
 #include "serve/mux_frames.hpp"
+#include "serve/mux_codec.hpp"
 #include "serve/cli_flags.hpp"
 
 #include <algorithm>
@@ -3697,6 +3700,110 @@ int main() {
         kv_fp8_dequant_row_gs(qg, scales, bg, 4, 2);
         for (int i = 0; i < 4; ++i)
             CHECK(std::fabs(bg[i] - src[i]) < 0.05f);
+    }
+    {
+        using namespace mvllm;
+        MuxWireProfile prof;
+        MuxCommand cmd;
+        size_t used = 99;
+        CHECK(mux_parse_command(nullptr, 0, prof, cmd, &used) == MuxRead::Eof);
+        CHECK(used == 0);
+        const char *stop = "STOP 7\n";
+        CHECK(mux_parse_command(reinterpret_cast<const uint8_t *>(stop), 7, prof, cmd, &used) ==
+              MuxRead::Ok);
+        CHECK(used == 7 && cmd.kind == MuxCmd::Stop && cmd.id == 7);
+        const char *part = "STOP 7";
+        CHECK(mux_parse_command(reinterpret_cast<const uint8_t *>(part), 6, prof, cmd, &used) ==
+              MuxRead::NeedMore);
+        CHECK(used == 0);
+        const char *ign = "PING 1\n";
+        CHECK(mux_parse_command(reinterpret_cast<const uint8_t *>(ign), 7, prof, cmd, &used) ==
+              MuxRead::Ignored);
+        const char *img = "IMAGE 3 4 1 2\nABCD\n";
+        CHECK(mux_parse_command(reinterpret_cast<const uint8_t *>(img), 19, prof, cmd, &used) ==
+              MuxRead::Ok);
+        CHECK(cmd.kind == MuxCmd::Image && cmd.id == 3 && cmd.grid_h == 1 && cmd.grid_w == 2);
+        CHECK(cmd.payload.size() == 4 && cmd.payload[0] == 'A' && cmd.payload[3] == 'D');
+        const char *sub = "SUBMIT 9 0 2 16 0.8 0.9\nhi\n";
+        CHECK(mux_parse_command(reinterpret_cast<const uint8_t *>(sub), 27, prof, cmd, &used) ==
+              MuxRead::Ok);
+        CHECK(cmd.kind == MuxCmd::Submit && cmd.id == 9 && cmd.slot == 0);
+        CHECK(cmd.max_tokens == 16);
+        CHECK_NEAR(cmd.temperature, 0.8f, 1e-6);
+        CHECK_NEAR(cmd.top_p, 0.9f, 1e-6);
+        CHECK(cmd.payload.size() == 2 && cmd.payload[0] == 'h' && cmd.payload[1] == 'i');
+        const char *bad = "STOP 7 extra\n";
+        CHECK(mux_parse_command(reinterpret_cast<const uint8_t *>(bad), 13, prof, cmd, &used) ==
+              MuxRead::BadRequest);
+    }
+    {
+        using namespace mvllm;
+        CHECK(route_usage_hash("kimi_k3") == 1820578806u);
+        RouteUsage ru;
+        std::string err;
+        CHECK(ru.init("kimi_k3", 5, 8, err) == Status::Ok);
+        CHECK(ru.n_layers() == 5 && ru.n_experts() == 8);
+        ru.drop_row(0);
+        int ids[3] = {2, 5, 2};
+        ru.count(3, ids, 3);
+        CHECK(ru.get(3, 2) == 2 && ru.get(3, 5) == 1);
+        CHECK(ru.get(0, 1) == 0);
+        const std::string dir = tmpdir();
+        const std::string path = dir + "/.coli_usage";
+        CHECK(ru.save(path, err));
+        std::ifstream in(path);
+        std::string line;
+        std::getline(in, line);
+        CHECK(line == "-1 5 8");
+        std::getline(in, line);
+        CHECK(line == "-2 1 1820578806");
+        RouteUsage ru2;
+        CHECK(ru2.init("kimi_k3", 5, 8, err) == Status::Ok);
+        CHECK(ru2.load(path, false, err) == 2);
+        CHECK(ru2.get(3, 2) == 2 && ru2.get(3, 5) == 1);
+        RouteUsage other;
+        CHECK(other.init("glm_moe_dsa", 5, 8, err) == Status::Ok);
+        CHECK(other.load(path, false, err) == -1);
+        CHECK(other.load(path, true, err) == 2);
+        RouteUsage empty;
+        CHECK(empty.init("kimi_k3", 2, 4, err) == Status::Ok);
+        CHECK(empty.save(dir + "/empty.coli_usage", err));
+        std::ifstream ez(dir + "/empty.coli_usage", std::ios::binary | std::ios::ate);
+        CHECK(ez.tellg() == 0);
+        ru.decay(0.5);
+        CHECK(ru.get(3, 2) == 1 && ru.get(3, 5) == 1);
+    }
+    {
+        using namespace mvllm;
+        CHECK(h3_adaln_out(1) == 18);
+        CHECK(h3_adaln_out(0) == 0);
+        float x[2] = {1.f, 0.f};
+        h3_silu(x, 2);
+        CHECK_NEAR(x[0], 1.f / (1.f + std::exp(-1.f)), 1e-6);
+        CHECK_NEAR(x[1], 0.f, 1e-6);
+        const float feat[2] = {1.f, 0.5f};
+        const float win[4] = {1.f, 0.f, 0.f, 1.f};
+        const float bin[2] = {0.1f, -0.2f};
+        const float wout[4] = {0.5f, 1.f, -1.f, 0.25f};
+        const float bout[2] = {0.f, 0.3f};
+        const float wad[4] = {1.f, 0.5f, 0.f, 2.f};
+        const float bad[2] = {0.f, -0.1f};
+        float temb[2] = {}, mod[2] = {};
+        CHECK(h3_time_embed(feat, 1, 2, win, bin, 2, wout, bout, 2, temb));
+        CHECK_NEAR(temb[0], 0.375678211f, 1e-5);
+        CHECK_NEAR(temb[1], -0.184072331f, 1e-5);
+        CHECK(h3_adaln_mod(temb, 1, 2, wad, bad, 2, mod));
+        CHECK_NEAR(mod[0], 0.283642054f, 1e-5);
+        CHECK_NEAR(mod[1], -0.468144655f, 1e-5);
+        CHECK(!h3_time_embed(feat, 0, 2, win, bin, 2, wout, bout, 2, temb));
+        const float ident[4] = {1.f, 0.f, 0.f, 1.f};
+        const float fx[2] = {1.f, 0.f};
+        float t2[2] = {};
+        CHECK(h3_time_embed(fx, 1, 2, ident, nullptr, 2, ident, nullptr, 2, t2));
+        const float s1 = 1.f / (1.f + std::exp(-1.f));
+        const float s2 = s1 / (1.f + std::exp(-s1));
+        CHECK_NEAR(t2[0], s2, 1e-5);
+        CHECK_NEAR(t2[1], 0.f, 1e-6);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

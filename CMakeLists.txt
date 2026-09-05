@@ -49,6 +49,7 @@ set(MVLLM_HOST_SOURCES
     src/store/expert_store.cpp
     src/store/block_store.cpp
     src/store/kv_persist.cpp
+    src/store/route_usage.cpp
     src/tok/tokenizer.cpp
     src/tok/k3_tools.cpp
     src/tok/k3_chat1.cpp
@@ -58,6 +59,7 @@ set(MVLLM_HOST_SOURCES
     src/tok/glm_tools.cpp
     src/serve/mux_stdio.cpp
     src/serve/mux_frames.cpp
+    src/serve/mux_codec.cpp
     src/serve/cli_flags.cpp
     src/serve/anthropic.cpp
     src/model/ops.cpp
@@ -73,6 +75,7 @@ set(MVLLM_HOST_SOURCES
     src/model/h3_audio_vae.cpp
     src/model/h3_dit_schedule.cpp
     src/model/h3_canvas.cpp
+    src/model/h3_adaln.cpp
     src/model/llama.cpp
     src/serve/http_server.cpp
     src/serve/session.cpp
