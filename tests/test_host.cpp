@@ -33,6 +33,8 @@
 #include "store/route_usage.hpp"
 #include "store/route_trace.hpp"
 #include "quant/int8_dyn.hpp"
+#include "quant/native_act.hpp"
+#include "quant/bf16.hpp"
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
 #include "tok/gbnf.hpp"
@@ -46,6 +48,7 @@
 #include "serve/mux_stdio.hpp"
 #include "serve/mux_frames.hpp"
 #include "serve/mux_codec.hpp"
+#include "serve/mux_submit.hpp"
 #include "serve/hwinfo.hpp"
 #include "serve/cli_flags.hpp"
 
@@ -4080,6 +4083,69 @@ int main() {
         float zs = 9.f;
         int8_quant_row(z, 2, zq, &zs);
         CHECK(zq[0] == 0 && zq[1] == 0 && zs == 0.f);
+    }
+    {
+        using namespace mvllm;
+        MuxSubmit s;
+        CHECK(mux_submit_parse("SUBMIT 42 3 17 64 0.7 0.95", s));
+        CHECK(s.id == 42 && s.slot == 3 && s.bytes == 17 && s.max_tokens == 64);
+        CHECK_NEAR(s.temperature, 0.7f, 1e-6);
+        CHECK_NEAR(s.top_p, 0.95f, 1e-6);
+        CHECK(s.gbytes == 0 && s.logprobs == 0 && s.tok_ids == 0);
+        CHECK(mux_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512 logprobs=32 ids=1", s));
+        CHECK(s.gbytes == 512 && s.logprobs == 32 && s.tok_ids == 1);
+        CHECK(!mux_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512 foo=1", s));
+        MuxSubmitExt ext;
+        CHECK(mux_submit_ext("", ext) == 0);
+        CHECK(mux_submit_ext("logprobs=5", ext) == 1 && ext.logprobs == 5);
+        CHECK(mux_submit_ext("logprobs=33", ext) == -1);
+        int ids[8];
+        CHECK(mux_ids_parse("  5\n7\t9  ", 9, ids, 8, 100) == 3);
+        CHECK(ids[0] == 5 && ids[1] == 7 && ids[2] == 9);
+        CHECK(mux_ids_parse("1 2 3", 5, ids, 2, 100) == 2);
+        CHECK(mux_ids_parse("99", 2, ids, 8, 50) == -1);
+    }
+    {
+        using namespace mvllm;
+        CHECK_NEAR(e8m0_decode(0x7e), 0.5f, 1e-6);
+        CHECK_NEAR(e8m0_decode(0x7f), 1.f, 1e-6);
+        CHECK_NEAR(e8m0_decode(0x80), 2.f, 1e-6);
+        CHECK(std::isnan(e8m0_decode(0xff)));
+        const float *tab = e8m0_table();
+        CHECK(tab && tab[0x7f] == e8m0_decode(0x7f));
+        CHECK(e4m3fn_encode(1.f) != 0);
+        CHECK_NEAR(e4m3fn_decode(e4m3fn_encode(1.f)), 1.f, 1e-6);
+        CHECK(e4m3fn_encode(std::numeric_limits<float>::quiet_NaN()) == 0x7f);
+        std::vector<float> in(128, 1.f), out(128, 0.f);
+        uint8_t sc = 0;
+        CHECK(fp8_activation_qdq(out.data(), &sc, in.data(), 128, 128) == 0);
+        CHECK(sc == 119);
+        for (float v : out)
+            CHECK_NEAR(v, 1.f, 1e-5);
+        std::vector<float> in4(32, 1.f), out4(32, 0.f);
+        uint8_t sc4 = 0;
+        CHECK(fp4_activation_qdq(out4.data(), &sc4, in4.data(), 32, 32) == 0);
+        CHECK(sc4 == 125);
+        float pin[20], pout[20];
+        uint8_t psc = 0;
+        for (int i = 0; i < 20; ++i)
+            pin[i] = 1.f;
+        CHECK(fp8_activation_qdq(pout, &psc, pin, 20, 64) == 0);
+        CHECK(psc == 119);
+        CHECK(fp8_activation_qdq(pout, &psc, pin, 0, 64) == -1);
+    }
+    {
+        using namespace mvllm;
+        CHECK(bf16_round(1.00390625f) == 1.0f);
+        CHECK(bf16_round(1.01171875f) == 1.015625f);
+        CHECK(bf16_decode(bf16_encode(1.0f)) == 1.0f);
+        float h[4] = {1.f, 2.f, 3.f, 4.f};
+        CHECK(hadamard_bf16(h, 4) == 0);
+        CHECK_NEAR(h[0], 5.f, 1e-5);
+        CHECK_NEAR(h[1], -1.f, 1e-5);
+        CHECK_NEAR(h[2], -2.f, 1e-5);
+        CHECK_NEAR(h[3], 0.f, 1e-5);
+        CHECK(hadamard_bf16(h, 3) == -1);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

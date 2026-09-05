@@ -195,6 +195,12 @@ Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
 plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters. Buffer reader
 `mux_parse_command` accepts SUBMIT/STOP/CANCEL/IMAGE (NeedMore vs BadFrame).
+SUBMIT extras are `logprobs=` / `ids=` (`mux_submit_ext`); `ids=1` payloads
+are ASCII token ids (`mux_ids_parse`).
+
+Native act QDQ: UE8M0 block scales with E4M3fn (NaN→0x7f) or E2M1.
+BF16 is high-16 nearest-even; Hadamard-BF16 is unnormalized FWHT then
+`bf16_round(v/sqrt(n))`.
 
 `.coli_usage`: sparse `layer expert count` with `-1`/`-2` headers (FNV-1a
 engine id). All-zero history is a zero-byte file. Atomic tmp+rename.

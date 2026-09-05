@@ -48,6 +48,8 @@ set(MVLLM_HOST_SOURCES
     src/quant/kv_fp8.cpp
     src/quant/kv_tq.cpp
     src/quant/int8_dyn.cpp
+    src/quant/native_act.cpp
+    src/quant/bf16.cpp
     src/store/expert_store.cpp
     src/store/block_store.cpp
     src/store/kv_persist.cpp
@@ -65,6 +67,7 @@ set(MVLLM_HOST_SOURCES
     src/serve/mux_stdio.cpp
     src/serve/mux_frames.cpp
     src/serve/mux_codec.cpp
+    src/serve/mux_submit.cpp
     src/serve/hwinfo.cpp
     src/serve/cli_flags.cpp
     src/serve/anthropic.cpp
