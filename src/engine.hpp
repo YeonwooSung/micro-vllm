@@ -61,6 +61,9 @@ public:
     int profile_seq() const { return profile_seq_; }
     void profile_turns(std::vector<ProfileTurn> &out) const { out = profile_; }
     void record_profile(const ProfileTurn &turn);
+    int take_repin(RepinEvent *out, int cap) {
+        return impl_ ? impl_->take_repin(out, cap) : 0;
+    }
     uint64_t block_hits() const { return impl_ ? impl_->block_hits() : 0; }
     uint64_t block_misses() const { return impl_ ? impl_->block_misses() : 0; }
     SessionStore &sessions() { return sessions_; }

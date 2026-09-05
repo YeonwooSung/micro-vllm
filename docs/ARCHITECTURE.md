@@ -260,7 +260,10 @@ Turn telem includes host `GPUS 0` and a `PROF` line (wall/tokens/phases).
 `GET /experts` returns `{rows,cols,map,hits,seq}`
 (`mux_format_experts_json`; empty unless authed).
 `GET /profile` returns a rolling 120-turn PROF window
-(`profile_json`; empty unless authed). `mux_format_repin` is the REPIN line.
+(`profile_json`; empty unless authed). LRU evictions queue `REPIN`
+(old_tier=1 RAM); mux emits them mid-turn and before DONE.
+Streaming chat/completions send a `colibri` SSE frame before `[DONE]`;
+JSON responses attach the same object.
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

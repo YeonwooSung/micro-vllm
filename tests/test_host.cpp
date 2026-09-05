@@ -286,6 +286,13 @@ static void test_expert_store() {
     CHECK(store.prefetch(keys, 2, err) == Status::Ok);
     CHECK(store.resident(0, 2));
     CHECK(!store.resident(0, 1));
+    {
+        RepinEvent ev[4];
+        int nr = store.take_repin(ev, 4);
+        CHECK(nr >= 1);
+        CHECK(ev[0].layer == 0 && ev[0].eid == 1 && ev[0].old_tier == 1 && ev[0].gpu == 0);
+        CHECK(store.take_repin(ev, 4) == 0);
+    }
     CHECK(!store.resident(-1, 0));
     int tiers[8];
     CHECK(store.fill_tiers(tiers, 8) == 8);
@@ -1092,6 +1099,14 @@ static void test_offload_generate() {
         CHECK(pj.find("\"wall_s\":") != std::string::npos);
         CHECK(profile_json(&ek, false) == "{\"seq\":0,\"turns\":[]}");
         CHECK(profile_json(nullptr) == "{\"seq\":0,\"turns\":[]}");
+        CHECK(colibri_json(nullptr) ==
+              "{\"stats\":{},\"perf\":{},\"topk\":[],\"entropy\":[],\"gpus\":[],\"repin\":[]}");
+        std::string cj = colibri_json(&ek);
+        CHECK(cj.find("\"stats\":{") != std::string::npos);
+        CHECK(cj.find("\"profile_seq\":") != std::string::npos);
+        CHECK(cj.find("\"perf\":{") != std::string::npos);
+        CHECK(openai_sse_colibri(nullptr).find("data: {\"colibri\":") == 0);
+        CHECK(with_colibri("{\"ok\":true}", nullptr).find("\"colibri\":") != std::string::npos);
     }
 
     std::string gdir = tmpdir();

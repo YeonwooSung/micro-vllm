@@ -56,6 +56,15 @@ struct ExpertStoreStats {
     uint64_t evictions = 0;
 };
 
+// Same layout as family.hpp RepinEvent (layer, eid, old_tier, gpu).
+struct RepinEvent;
+struct ExpertRepin {
+    int layer = 0;
+    int eid = 0;
+    int old_tier = 1; // 1 = RAM (this store has no VRAM)
+    int gpu = 0;
+};
+
 // Per-layer LRU over file-backed expert blobs.
 // lookup() must be paired with exactly one release() on success.
 // prefetch() is advisory and never holds a lease.
@@ -105,6 +114,9 @@ public:
     int fill_tiers(int *tier, int n) const;
     // ram = valid occupied slots; disk = n_layers * n_experts - ram.
     void count_tiers(int &ram, int &disk) const;
+
+    // Consume queued LRU swaps into out[0..cap). Returns count written. Thread-safe.
+    int take_repin(RepinEvent *out, int cap);
 
     ~ExpertStore() { close(); }
     ExpertStore() = default;
@@ -159,6 +171,7 @@ private:
     std::thread prefetch_th_;
     Status prefetch_st_ = Status::Ok;
     std::string prefetch_err_;
+    std::vector<ExpertRepin> repin_; // official REPIN swaps; cap 64
 };
 
 // LRU slots per layer: budget against 4 KiB-aligned blobs, never more than n_experts.

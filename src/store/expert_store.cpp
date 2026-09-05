@@ -1,6 +1,7 @@
 #include "expert_store.hpp"
 
 #include "../io/file_io.hpp"
+#include "../model/family.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -138,6 +139,10 @@ void ExpertStore::close() {
     t_edisk_ = 0;
     t_ewait_ = 0;
     open_ = false;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        repin_.clear();
+    }
 }
 
 Status ExpertStore::register_expert(const ExpertLoc &loc, std::string &err) {
@@ -299,8 +304,15 @@ Status ExpertStore::load_into(int layer, int eid, Slot &slot, std::string &err) 
 
     Layer &L = layers_[static_cast<size_t>(layer)];
     if (slot.valid && slot.eid >= 0 && slot.eid != eid) {
-        if (slot.eid < n_experts_) L.by_expert[static_cast<size_t>(slot.eid)] = -1;
+        const int evicted = slot.eid;
+        if (evicted < n_experts_) L.by_expert[static_cast<size_t>(evicted)] = -1;
         ++stats_.evictions;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (repin_.size() >= 64)
+                repin_.erase(repin_.begin());
+            repin_.push_back({layer, evicted, 1, 0});
+        }
     }
     slot.eid = eid;
     slot.valid = true;
@@ -507,6 +519,22 @@ void ExpertStore::take_io_perf(double &edisk, double &ewait, bool reset) {
         t_edisk_ = 0;
         t_ewait_ = 0;
     }
+}
+
+int ExpertStore::take_repin(RepinEvent *out, int cap) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!out || cap <= 0)
+        return 0;
+    const int n = std::min(cap, static_cast<int>(repin_.size()));
+    for (int i = 0; i < n; ++i) {
+        const ExpertRepin &e = repin_[static_cast<size_t>(i)];
+        out[i].layer = e.layer;
+        out[i].eid = e.eid;
+        out[i].old_tier = e.old_tier;
+        out[i].gpu = e.gpu;
+    }
+    repin_.erase(repin_.begin(), repin_.begin() + n);
+    return n;
 }
 
 void ExpertStore::stats(ExpertStoreStats &out) const {

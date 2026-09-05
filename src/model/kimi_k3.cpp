@@ -627,6 +627,7 @@ public:
     }
 
     void expert_stats(ExpertStoreStats &out) const override { store_.stats(out); }
+    int take_repin(RepinEvent *out, int cap) override { return store_.take_repin(out, cap); }
 
     void route_telem(RouteTelem &out, bool consume_hits) override {
         if (!loaded_ || usage_.n_experts() < 1) {

@@ -696,6 +696,71 @@ std::string profile_json(Engine *engine, bool authed) {
     return os.str();
 }
 
+std::string colibri_json(Engine *engine) {
+    if (!engine)
+        return "{\"stats\":{},\"perf\":{},\"topk\":[],\"entropy\":[],\"gpus\":[],\"repin\":[]}";
+    std::ostringstream os;
+    os << "{\"stats\":{\"hits_seq\":" << engine->hits_seq()
+       << ",\"profile_seq\":" << engine->profile_seq() << "},\"perf\":";
+    std::vector<ProfileTurn> turns;
+    engine->profile_turns(turns);
+    if (turns.empty()) {
+        os << "{}";
+    } else {
+        const ProfileTurn &t = turns.back();
+        char fbuf[32];
+        auto append_f = [&](double v) {
+            std::snprintf(fbuf, sizeof(fbuf), "%.3f", v);
+            os << fbuf;
+        };
+        os << "{\"wall_s\":";
+        append_f(t.wall_s);
+        os << ",\"prompt_tokens\":" << t.prompt_tokens << ",\"completion_tokens\":"
+           << t.completion_tokens << ",\"expert_disk_s\":";
+        append_f(t.expert_disk_s);
+        os << ",\"expert_wait_s\":";
+        append_f(t.expert_wait_s);
+        os << ",\"expert_matmul_s\":";
+        append_f(t.expert_matmul_s);
+        os << ",\"attention_s\":";
+        append_f(t.attention_s);
+        os << ",\"lm_head_s\":";
+        append_f(t.lm_head_s);
+        os << ",\"forwards\":" << static_cast<unsigned long long>(t.forwards) << '}';
+    }
+    os << ",\"topk\":[],\"entropy\":[";
+    RouteTelem rt;
+    engine->route_telem(rt, false);
+    char ebuf[32];
+    for (size_t i = 0; i < rt.entropy.size(); ++i) {
+        if (i)
+            os << ',';
+        std::snprintf(ebuf, sizeof(ebuf), "%.6g", static_cast<double>(rt.entropy[i]));
+        os << ebuf;
+    }
+    os << "],\"gpus\":[],\"repin\":[";
+    RepinEvent ev[16];
+    const int n = engine->take_repin(ev, 16);
+    for (int i = 0; i < n; ++i) {
+        if (i)
+            os << ',';
+        os << "{\"layer\":" << ev[i].layer << ",\"eid\":" << ev[i].eid
+           << ",\"old_tier\":" << ev[i].old_tier << ",\"gpu\":" << ev[i].gpu << '}';
+    }
+    os << "]}";
+    return os.str();
+}
+
+std::string openai_sse_colibri(Engine *engine) {
+    return "data: {\"colibri\":" + colibri_json(engine) + "}\n\n";
+}
+
+std::string with_colibri(const std::string &body, Engine *engine) {
+    if (body.empty() || body.back() != '}')
+        return body;
+    return body.substr(0, body.size() - 1) + ",\"colibri\":" + colibri_json(engine) + "}";
+}
+
 std::string openai_model_object(const std::string &id) {
     return "{\"id\":\"" + json_escape(id) +
            "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"micro-vllm\"}";
@@ -1261,6 +1326,8 @@ void HttpServer::handle_client(int cfd) {
                                 out.reasoning_tokens);
                             send_all(cfd, uev.data(), uev.size());
                         }
+                        std::string coli = openai_sse_colibri(engine_);
+                        send_all(cfd, coli.data(), coli.size());
                         std::string done = openai_sse_done();
                         send_all(cfd, done.data(), done.size());
                     } else if (chat) {
@@ -1269,35 +1336,37 @@ void HttpServer::handle_client(int cfd) {
                         std::vector<K3ParsedCall> calls;
                         if (parse_family_tool_calls(engine_->family(), out.text, stripped, calls)) {
                             http_reply(cfd, 200, "OK",
-                                       with_choice_logprobs(
-                                           openai_chat_tools_response(id, model, stripped, calls,
-                                                                      out.prompt_tokens,
-                                                                      out.completion_tokens,
-                                                                      out.reasoning_tokens),
-                                           lp),
+                                       with_colibri(with_choice_logprobs(
+                                                        openai_chat_tools_response(
+                                                            id, model, stripped, calls,
+                                                            out.prompt_tokens, out.completion_tokens,
+                                                            out.reasoning_tokens),
+                                                        lp),
+                                                    engine_),
                                        request_id);
                         } else {
                             const char *fr = sse_finish_reason(out, gp, engine_->config());
                             http_reply(cfd, 200, "OK",
-                                       with_choice_logprobs(
-                                           openai_chat_response(id, model, out.text,
-                                                                out.prompt_tokens,
-                                                                out.completion_tokens, out.reasoning,
-                                                                fr, gp.prefix_reuse,
-                                                                out.reasoning_tokens),
-                                           lp),
+                                       with_colibri(with_choice_logprobs(
+                                                        openai_chat_response(
+                                                            id, model, out.text, out.prompt_tokens,
+                                                            out.completion_tokens, out.reasoning, fr,
+                                                            gp.prefix_reuse, out.reasoning_tokens),
+                                                        lp),
+                                                    engine_),
                                        request_id);
                         }
                     } else {
                         const char *fr = sse_finish_reason(out, gp, engine_->config());
                         const std::string text = echo ? prompt + out.text : out.text;
                         http_reply(cfd, 200, "OK",
-                                   with_choice_logprobs(
-                                       openai_chat_response(id, model, text, out.prompt_tokens,
-                                                            out.completion_tokens, out.reasoning,
-                                                            fr, gp.prefix_reuse,
-                                                            out.reasoning_tokens),
-                                       openai_logprobs_content(engine_, out)),
+                                   with_colibri(with_choice_logprobs(
+                                                    openai_chat_response(
+                                                        id, model, text, out.prompt_tokens,
+                                                        out.completion_tokens, out.reasoning, fr,
+                                                        gp.prefix_reuse, out.reasoning_tokens),
+                                                    openai_logprobs_content(engine_, out)),
+                                                engine_),
                                    request_id);
                     }
                 }

@@ -76,6 +76,12 @@ std::string health_json(Engine *engine);
 std::string experts_json(Engine *engine, bool authed = true);
 // Official GET /profile body. engine==null or !authed → {"seq":0,"turns":[]}.
 std::string profile_json(Engine *engine, bool authed = true);
+// Compact no-space JSON object (no wrapping {"colibri":...}).
+// engine==null → {"stats":{},"perf":{},"topk":[],"entropy":[],"gpus":[],"repin":[]}
+std::string colibri_json(Engine *engine);
+std::string openai_sse_colibri(Engine *engine); // data: {"colibri":<colibri_json>}\n\n
+// Insert ,"colibri":<obj> before the final '}' of a JSON object body.
+std::string with_colibri(const std::string &body, Engine *engine);
 std::string openai_model_object(const std::string &id);
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
                          int running = 0, int queued = 0, int max_queue = 0);

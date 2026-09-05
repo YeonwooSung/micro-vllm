@@ -162,6 +162,14 @@ struct ProfileTurn {
     uint64_t forwards = 0;
 };
 
+// Official REPIN layer eid old_tier gpu. old_tier 0 disk / 1 RAM / 2 VRAM.
+struct RepinEvent {
+    int layer = 0;
+    int eid = 0;
+    int old_tier = 1;
+    int gpu = 0;
+};
+
 class FamilyEngine {
 public:
     virtual ~FamilyEngine() = default;
@@ -189,6 +197,12 @@ public:
     virtual void turn_perf(TurnPerf &out, bool reset = false) {
         (void)reset;
         out = {};
+    }
+    // Consume queued REPIN swaps into out[0..cap). Returns count written.
+    virtual int take_repin(RepinEvent *out, int cap) {
+        (void)out;
+        (void)cap;
+        return 0;
     }
 
     // Optional mux hooks. Default: no persistent slot (always full prefill).

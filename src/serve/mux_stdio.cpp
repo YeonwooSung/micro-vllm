@@ -122,6 +122,16 @@ static double mono_now() {
         .count();
 }
 
+static void emit_repin(Engine &engine) {
+    RepinEvent ev[16];
+    int n = engine.take_repin(ev, 16);
+    for (int i = 0; i < n; ++i) {
+        const std::string line = mux_format_repin(ev[i].layer, ev[i].eid, ev[i].old_tier, ev[i].gpu);
+        fwrite(line.data(), 1, line.size(), stdout);
+        fflush(stdout);
+    }
+}
+
 // Mid-turn HITS ~every 6 generated tokens. consume_hits only; ENTROPY stays.
 static void emit_hits_pulse(Engine &engine, uint64_t id, int emitted) {
     (void)id;
@@ -134,6 +144,7 @@ static void emit_hits_pulse(Engine &engine, uint64_t id, int emitted) {
         fwrite(line.data(), 1, line.size(), stdout);
         fflush(stdout);
     }
+    emit_repin(engine);
 }
 
 static int stop_kind_of(bool stopped_by_stop, int length_limited) {
@@ -184,6 +195,7 @@ static void emit_turn_telem(Engine &engine, uint64_t id, double t0, int prompt_t
                         pf.t_attn, pf.t_head, static_cast<uint64_t>(std::max(completion_tokens, 0)));
     fwrite(prof.data(), 1, prof.size(), stdout);
     fflush(stdout);
+    emit_repin(engine);
 }
 
 static bool parse_u64(const std::string &s, uint64_t &v) {
