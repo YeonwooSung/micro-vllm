@@ -89,4 +89,13 @@ std::string openai_model_object(const std::string &id);
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
                          int running = 0, int queued = 0, int max_queue = 0);
 
+// Strip :port / [ipv6]:port, lowercase. Empty Host → empty name.
+std::string host_header_name(const std::string &host_header);
+
+// Official LOOPBACK: 127.0.0.1, localhost, ::1, "" (empty).
+// extra_csv is comma-separated extra names (COLI_ALLOWED_HOSTS). "*" accepts all.
+// bind_host is also allowed (strip []).
+bool host_allowed(const std::string &host_header, const std::string &bind_host,
+                  const std::string &extra_csv);
+
 } // namespace mvllm

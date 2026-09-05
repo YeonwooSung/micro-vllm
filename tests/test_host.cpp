@@ -3580,6 +3580,24 @@ int main() {
         CHECK(queue_error_json("queue_full").find("\"code\":\"queue_full\"") != std::string::npos);
         CHECK(queue_error_json("queue_timeout").find("queue_timeout") != std::string::npos);
         CHECK(queue_wait_header(0.0123).find("x-colibri-queue-wait-ms: 12") != std::string::npos);
+        CHECK(host_header_name("LocalHost:8000") == "localhost");
+        CHECK(host_header_name("[::1]:8000") == "::1");
+        CHECK(host_allowed("evil.example", "127.0.0.1", "") == false);
+        CHECK(host_allowed("127.0.0.1:8000", "0.0.0.0", ""));
+        CHECK(host_allowed("proxy.local", "127.0.0.1", "proxy.local"));
+        CHECK(host_allowed("any.example", "127.0.0.1", "*"));
+        CHECK(io::mime_type("x.html") == "text/html; charset=utf-8");
+        CHECK(io::url_unquote("/a%2eb") == "/a.b");
+        {
+            std::string root = tmpdir();
+            write_file(root + "/index.html", "<html>ok</html>");
+            write_file(root + "/app.js", "1");
+            std::string p, ct;
+            CHECK(io::static_resolve(root, "/", p, ct) && ct.find("text/html") != std::string::npos);
+            CHECK(io::static_resolve(root, "/app.js", p, ct) && ct == "application/javascript");
+            CHECK(!io::static_resolve(root, "/../etc/passwd", p, ct));
+            CHECK(!io::static_resolve(root, "/missing.css", p, ct));
+        }
         CHECK(sch.running_count() == 0);
         CHECK(sch.queued_count() == 0);
         CHECK(sch.n_jobs() == 0);

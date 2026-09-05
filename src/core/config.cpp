@@ -580,6 +580,15 @@ RuntimeConfig runtime_from_env() {
             rt.queue_timeout_s = n;
         }
     }
+    if (const char *v = get("COLI_WEB_DIST") ? get("COLI_WEB_DIST") : get("MVLLM_WEB_DIST")) {
+        if (v[0])
+            rt.web_dist = v;
+    }
+    if (const char *v = get("COLI_ALLOWED_HOSTS") ? get("COLI_ALLOWED_HOSTS")
+                                                  : get("MVLLM_ALLOWED_HOSTS")) {
+        if (v[0])
+            rt.allowed_hosts = v;
+    }
     return rt;
 }
 

@@ -2,6 +2,7 @@
 #include "anthropic.hpp"
 #include "mux_frames.hpp"
 #include "../engine.hpp"
+#include "../io/file_io.hpp"
 #include "../io/image.hpp"
 #include "../tok/glm_tools.hpp"
 #include "../tok/json_schema.hpp"
@@ -26,6 +27,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -196,6 +198,19 @@ void http_reply(int fd, int code, const char *reason, const std::string &body,
        << kExposeHeaders;
     append_request_id(os, request_id);
     os << extra_headers << "Connection: close\r\n"
+       << "\r\n"
+       << body;
+    std::string resp = os.str();
+    send_all(fd, resp.data(), resp.size());
+}
+
+void http_file(int fd, const std::string &ctype, const std::string &body) {
+    std::ostringstream os;
+    os << "HTTP/1.1 200 OK\r\n"
+       << "Content-Type: " << ctype << "\r\n"
+       << "Content-Length: " << body.size() << "\r\n"
+       << "Access-Control-Allow-Origin: *\r\n"
+       << kExposeHeaders << "Connection: close\r\n"
        << "\r\n"
        << body;
     std::string resp = os.str();
@@ -436,10 +451,12 @@ bool is_queue_limit_err(const std::string &err) {
 }
 
 bool read_http(int fd, std::string &method, std::string &path, std::string &body,
-               std::string &authorization, std::string &x_api_key, std::string &request_id) {
+               std::string &authorization, std::string &x_api_key, std::string &request_id,
+               std::string &host) {
     authorization.clear();
     x_api_key.clear();
     request_id.clear();
+    host.clear();
     std::string req;
     char buf[4096];
     size_t hdr_end = std::string::npos;
@@ -509,6 +526,8 @@ bool read_http(int fd, std::string &method, std::string &path, std::string &body
                 request_id = val;
             else if (name == "request-id" && request_id.empty())
                 request_id = val;
+            else if (name == "host")
+                host = val;
         }
         i = nl;
     }
@@ -634,6 +653,53 @@ bool models_id_allowed(const std::string &id, const std::string &model) {
 }
 
 } // namespace
+
+std::string host_header_name(const std::string &host_header) {
+    std::string host = trim(host_header);
+    std::string name;
+    if (host.empty())
+        return {};
+    if (host[0] == '[') {
+        size_t rb = host.find(']');
+        name = (rb == std::string::npos) ? host.substr(1) : host.substr(1, rb - 1);
+    } else {
+        size_t colons = 0;
+        for (char c : host) {
+            if (c == ':')
+                ++colons;
+        }
+        if (colons == 1)
+            name = host.substr(0, host.rfind(':'));
+        else
+            name = host;
+    }
+    return to_lower(trim(name));
+}
+
+bool host_allowed(const std::string &host_header, const std::string &bind_host,
+                  const std::string &extra_csv) {
+    const std::string name = host_header_name(host_header);
+    const std::string bind = host_header_name(bind_host);
+    bool star = false;
+    size_t start = 0;
+    while (true) {
+        const size_t comma = extra_csv.find(',', start);
+        const size_t end = (comma == std::string::npos) ? extra_csv.size() : comma;
+        const std::string raw = extra_csv.substr(start, end - start);
+        if (trim(raw) == "*")
+            star = true;
+        else if (!name.empty() && host_header_name(raw) == name)
+            return true;
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    if (star)
+        return true;
+    if (name.empty() || name == "127.0.0.1" || name == "localhost" || name == "::1")
+        return true;
+    return !bind.empty() && name == bind;
+}
 
 bool api_key_ok(const std::string &authorization, const std::string &x_api_key) {
     const char *key = std::getenv("MVLLM_API_KEY");
@@ -973,9 +1039,21 @@ void HttpServer::handle_client(int cfd) {
             ++stats_.requests;
         }
 
-        std::string method, path, body, authorization, x_api_key, request_id;
-        if (!read_http(cfd, method, path, body, authorization, x_api_key, request_id)) {
+        std::string method, path, body, authorization, x_api_key, request_id, host;
+        if (!read_http(cfd, method, path, body, authorization, x_api_key, request_id, host)) {
             http_reply(cfd, 400, "Bad Request", "{\"error\":\"bad request\"}", request_id);
+            ::close(cfd);
+            return;
+        }
+
+        const bool host_ok =
+            engine_ ? host_allowed(host, engine_->runtime().host, engine_->runtime().allowed_hosts)
+                    : host_allowed(host, "127.0.0.1", "");
+        if (!host_ok) {
+            http_reply(cfd, 403, "Forbidden",
+                       "{\"error\":{\"message\":\"Host header not allowed.\","
+                       "\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+                       request_id);
             ::close(cfd);
             return;
         }
@@ -1428,6 +1506,19 @@ void HttpServer::handle_client(int cfd) {
                     }
                 }
             }
+        } else if (method == "GET" && engine_ && !engine_->runtime().web_dist.empty() && !v1) {
+            std::string fpath, ctype;
+            if (mvllm::io::static_resolve(engine_->runtime().web_dist, path, fpath, ctype)) {
+                std::ifstream in(fpath, std::ios::binary);
+                if (in) {
+                    std::ostringstream os;
+                    os << in.rdbuf();
+                    http_file(cfd, ctype, os.str());
+                    ::close(cfd);
+                    return;
+                }
+            }
+            http_reply(cfd, 404, "Not Found", "{\"error\":\"not found\"}", request_id);
         } else {
             http_reply(cfd, 404, "Not Found", "{\"error\":\"not found\"}", request_id);
         }

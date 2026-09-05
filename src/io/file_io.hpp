@@ -44,5 +44,24 @@ void munmap_file(Map &m);
 
 int64_t file_size(int fd);
 
+// Guess Content-Type from path suffix. Unknown → application/octet-stream.
+std::string mime_type(const std::string &path);
+
+// Percent-decode URL path (%XX). Invalid escapes copied through. + stays +.
+std::string url_unquote(const std::string &s);
+
+// Resolve url_path under root into a regular file path.
+// Official rules:
+//   - reject if root is empty or not a directory
+//   - rel = unquote(url_path) with leading '/' stripped; empty → "index.html"
+//   - join root/rel and realpath both sides; require resolved file is under resolved root
+//     (prefix root+"/" or equal)
+//   - if that is not a regular file:
+//       if url is "/" OR rel has no '.' → SPA fallback root/index.html (must be a file)
+//       else fail
+// Returns true and sets out_path + content_type on success.
+bool static_resolve(const std::string &root, const std::string &url_path, std::string &out_path,
+                    std::string &content_type);
+
 } // namespace io
 } // namespace mvllm

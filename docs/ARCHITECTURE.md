@@ -269,6 +269,9 @@ official `rate_limit_error` JSON plus `Retry-After: 1`. Scheduler records
 wait time, expires queued jobs after `queue_timeout_s`, and exposes
 admitted/rejected/timed_out counters on GET /health. `COLI_MAX_QUEUE` /
 `COLI_QUEUE_TIMEOUT` (or `MVLLM_*`) feed `RuntimeConfig`.
+GET `/*` serves `COLI_WEB_DIST` / `MVLLM_WEB_DIST` (SPA `index.html`,
+path-traversal-safe). Host header is pinned to loopback + bind +
+`COLI_ALLOWED_HOSTS` (`*` opt-out).
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

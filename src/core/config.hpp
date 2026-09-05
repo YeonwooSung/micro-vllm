@@ -156,6 +156,8 @@ struct RuntimeConfig {
     int kv_slots = 1; // 1–16; official mux KV_SLOTS
     int max_queue = 8;          // COLI_MAX_QUEUE / MVLLM_MAX_QUEUE
     int queue_timeout_s = 300;  // COLI_QUEUE_TIMEOUT / MVLLM_QUEUE_TIMEOUT
+    std::string web_dist;       // COLI_WEB_DIST / MVLLM_WEB_DIST; empty = no static
+    std::string allowed_hosts;  // comma-separated COLI_ALLOWED_HOSTS / MVLLM_ALLOWED_HOSTS
     std::string kv_path; // .coli_kv; empty = off. MVLLM_KV / COLI_KV
     int kv_persist_ver = 1; // 1 COLIKV1, 2 COLIKV2, 3 COLIKV3
     int kv_tq_codec = 0;    // COLIKV3: 0 PolarQuant, 1 rotated int4

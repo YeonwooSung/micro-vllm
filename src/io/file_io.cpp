@@ -1,6 +1,7 @@
 #include "file_io.hpp"
 
 #include <cerrno>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 
@@ -8,6 +9,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 namespace mvllm {
 namespace io {
@@ -177,6 +182,154 @@ void munmap_file(Map &m) {
     m.ptr = nullptr;
     m.bytes = 0;
     m.fd = -1;
+}
+
+std::string mime_type(const std::string &path) {
+    const auto dot = path.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= path.size()) {
+        return "application/octet-stream";
+    }
+    std::string ext = path.substr(dot);
+    for (char &c : ext) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    if (ext == ".html" || ext == ".htm")
+        return "text/html; charset=utf-8";
+    if (ext == ".css")
+        return "text/css";
+    if (ext == ".js")
+        return "application/javascript";
+    if (ext == ".json")
+        return "application/json";
+    if (ext == ".svg")
+        return "image/svg+xml";
+    if (ext == ".png")
+        return "image/png";
+    if (ext == ".jpg" || ext == ".jpeg")
+        return "image/jpeg";
+    if (ext == ".gif")
+        return "image/gif";
+    if (ext == ".webp")
+        return "image/webp";
+    if (ext == ".ico")
+        return "image/x-icon";
+    if (ext == ".woff2")
+        return "font/woff2";
+    if (ext == ".txt")
+        return "text/plain; charset=utf-8";
+    if (ext == ".wasm")
+        return "application/wasm";
+    return "application/octet-stream";
+}
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+std::string url_unquote(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size()) {
+            const int hi = hex_nibble(s[i + 1]);
+            const int lo = hex_nibble(s[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_back(static_cast<char>((hi << 4) | lo));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
+static bool realpath_into(const std::string &in, std::string &out) {
+    char buf[PATH_MAX];
+    if (::realpath(in.c_str(), buf) == nullptr) {
+        return false;
+    }
+    out.assign(buf);
+    return true;
+}
+
+static bool is_dir(const std::string &path) {
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static bool is_reg(const std::string &path) {
+    struct stat st {};
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// Resolved path must equal root or sit under root+"/".
+static bool under_root(const std::string &root, const std::string &path) {
+    if (path == root) {
+        return true;
+    }
+    std::string prefix = root;
+    if (prefix.empty() || prefix.back() != '/') {
+        prefix += '/';
+    }
+    return path.size() >= prefix.size() && path.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool static_resolve(const std::string &root, const std::string &url_path, std::string &out_path,
+                    std::string &content_type) {
+    if (root.empty()) {
+        return false;
+    }
+    std::string root_real;
+    if (!realpath_into(root, root_real) || !is_dir(root_real)) {
+        return false;
+    }
+
+    std::string rel = url_unquote(url_path);
+    size_t nslash = 0;
+    while (nslash < rel.size() && rel[nslash] == '/') {
+        ++nslash;
+    }
+    rel.erase(0, nslash);
+    if (rel.empty()) {
+        rel = "index.html";
+    }
+
+    std::string joined = root_real;
+    if (joined.back() != '/') {
+        joined += '/';
+    }
+    joined += rel;
+
+    std::string file_real;
+    const bool hit = realpath_into(joined, file_real) && under_root(root_real, file_real) &&
+                     is_reg(file_real);
+    if (!hit) {
+        // SPA: "/" or extension-less routes fall back to index.html.
+        if (url_path != "/" && rel.find('.') != std::string::npos) {
+            return false;
+        }
+        joined = root_real;
+        if (joined.back() != '/') {
+            joined += '/';
+        }
+        joined += "index.html";
+        if (!realpath_into(joined, file_real) || !under_root(root_real, file_real) ||
+            !is_reg(file_real)) {
+            return false;
+        }
+    }
+    out_path = file_real;
+    content_type = mime_type(file_real);
+    return true;
 }
 
 } // namespace io
