@@ -23,9 +23,12 @@
 #include "model/h3_canvas.hpp"
 #include "model/h3_adaln.hpp"
 #include "model/h3_reuse.hpp"
+#include "model/h3_token_reduce.hpp"
+#include "model/moe_pick.hpp"
 #include "store/block_store.hpp"
 #include "store/expert_store.hpp"
 #include "store/kv_persist.hpp"
+#include "store/kv_persist_v2.hpp"
 #include "store/route_usage.hpp"
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
@@ -3886,6 +3889,98 @@ int main() {
         }
         CHECK(std::sqrt(qn / den) < 0.25f);
         CHECK(kv_tq_quant_row(src, packed, 3, 4) == 0.f);
+    }
+    {
+        using namespace mvllm;
+        H3TokenReduce cfg;
+        std::string err;
+        CHECK(h3_token_reduce_configure(cfg, false, 2, 2, 4, 3, 4, 7, nullptr, nullptr, nullptr,
+                                        err));
+        CHECK(!cfg.enabled);
+        CHECK(h3_token_reduce_configure(cfg, true, 2, 2, 4, 3, 4, 7, nullptr, nullptr, nullptr,
+                                        err));
+        CHECK(cfg.enabled);
+        CHECK(cfg.begin == 4 && cfg.end == 30);
+        CHECK(cfg.early_steps == 10 && cfg.early_end == 40);
+        CHECK(cfg.spatial_h == 1 && cfg.spatial_w == 2 && cfg.reduced_w == 1);
+        CHECK(cfg.reduced_video_rows == 2 && cfg.reduced_sequence == 5 && cfg.baseline_rows == 2);
+        uint32_t a = 0, b = 0;
+        h3_token_pool_sources(cfg, 2, &a, &b);
+        CHECK(a == 2 && b == 2);
+        h3_token_pool_sources(cfg, 3, &a, &b);
+        CHECK(a == 3 && b == 4);
+        h3_token_pool_sources(cfg, 4, &a, &b);
+        CHECK(a == 5 && b == 6);
+        CHECK(h3_token_reduced_parent(cfg, 3) == 3);
+        CHECK(h3_token_reduced_parent(cfg, 4) == 3);
+        CHECK(h3_token_reduced_parent(cfg, 5) == 4);
+        float x[2] = {1.f, 3.f}, y[2] = {3.f, 5.f}, m[2];
+        h3_token_pool_mean(x, y, m, 2);
+        CHECK_NEAR(m[0], 2.f, 1e-6);
+        CHECK_NEAR(m[1], 4.f, 1e-6);
+        CHECK(h3_token_reduce_configure(cfg, true, 2, 2, 4, 3, 4, 8, nullptr, nullptr, nullptr,
+                                        err) == false);
+        CHECK(h3_token_reduce_configure(cfg, true, 2, 2, 4, 3, 4, 7, "4:30", "0", "1.25", err));
+        CHECK(cfg.early_steps == 0 && cfg.scale == 1.25f);
+    }
+    {
+        using namespace mvllm;
+        KvPersistConfig cfg;
+        cfg.n_layers = 2;
+        cfg.kv_lora = 4;
+        cfg.qk_rope = 2;
+        cfg.vocab = 16;
+        KvPersistV2 kp;
+        std::string err;
+        const std::string dir = tmpdir();
+        CHECK(kp.open(dir + "/cache.coli_kv2", cfg, err) == Status::Ok);
+        CHECK(kp.nrec() == 0);
+        CHECK(kp.record_bytes() == 4 + 2 * (4 + 4 + 2 + 4));
+        KvPersistRecord r;
+        r.L = {1.f, -2.f, 0.5f, 0.f, 0.25f, 0.25f, 0.25f, 0.25f};
+        r.R = {0.1f, 0.2f, -0.3f, 0.4f};
+        int hist = 11;
+        CHECK(kp.append(&hist, 1, &r, 1, err) == Status::Ok);
+        CHECK(kp.nrec() == 1);
+        kp.close();
+        KvPersistV2 kp2;
+        CHECK(kp2.open(dir + "/cache.coli_kv2", cfg, err) == Status::Ok);
+        std::vector<int> loaded;
+        std::vector<KvPersistRecord> rows;
+        CHECK(kp2.load(loaded, &rows, err) == 1);
+        CHECK(loaded[0] == 11);
+        CHECK(rows[0].L.size() == 8 && rows[0].R.size() == 4);
+        CHECK(std::fabs(rows[0].L[0] - 1.f) < 0.08f);
+        KvPersistConfig other = cfg;
+        other.kv_lora = 8;
+        KvPersistV2 bad;
+        CHECK(bad.open(dir + "/cache.coli_kv2", other, err) == Status::Ok);
+        CHECK(bad.nrec() == 0);
+    }
+    {
+        using namespace mvllm;
+        CHECK(moe_router_pick(3, 0, 8, 1, nullptr) == 3);
+        std::string warn;
+        CHECK(moe_router_pick(-1, 2, 8, 4, &warn) == 2);
+        CHECK(!warn.empty());
+        CHECK(moe_router_pick(-1, 9, 8, 4, &warn) == 0);
+        float sc[4] = {0.1f, 0.8f, 0.3f, 0.5f};
+        CHECK(moe_argmax(sc, 4) == 1);
+        int idx[2];
+        float w[2];
+        CHECK(moe_topk_pick(sc, 4, 2, idx, w) == 2);
+        CHECK(idx[0] == 1 && idx[1] == 3);
+        CHECK_NEAR(w[0] + w[1], 1.f, 1e-5);
+        CHECK(w[0] > w[1]);
+        float nan[4] = {std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()};
+        CHECK(moe_argmax(nan, 4) == -1);
+        CHECK(moe_topk_pick(nan, 4, 2, idx, w) == 2);
+        CHECK(idx[0] == 0 && idx[1] == 1);
+        CHECK_NEAR(w[0], 0.5f, 1e-6);
+        CHECK_NEAR(w[1], 0.5f, 1e-6);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

@@ -187,7 +187,8 @@ K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R
 rows, optional DSA index). `nrec` is fsynced last. Mismatched geometry is
 ignored (empty reopen). Host F32 only. MLA latent rows can be stored as
 e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale) or PolarQuant /
-rotated int4 (`kv_tq_*` / `kv_q4_*`).
+rotated int4 (`kv_tq_*` / `kv_q4_*`). COLIKV2 stores e4m3 L/R + per-row
+scale (`KvPersistV2`).
 
 Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
@@ -200,7 +201,11 @@ engine id). All-zero history is a zero-byte file. Atomic tmp+rename.
 H3 AdaLN time embed (official two-SiLU MLP): `SiLU(W_out SiLU(W_in x+b)+b)`
 then per-block `W_adaln @ temb + b`. Serving reuse mask keeps step 0, the
 last step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
-`0,3,6,…` list).
+`0,3,6,…` list). Token reduction pair-pools target video along W
+(`h3_token_reduce_*`; default blocks 4:30, early 10:40).
+
+MoE pick: unused-scan top-k; NaN scores never win (`moe_router_pick`
+falls back to slot index).
 
 Host `hw_probe` / `rss_gb` match official HWINFO units (cores, RAM GB, CPU
 brand; GPU fields stay 0).

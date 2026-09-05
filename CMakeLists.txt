@@ -50,6 +50,7 @@ set(MVLLM_HOST_SOURCES
     src/store/expert_store.cpp
     src/store/block_store.cpp
     src/store/kv_persist.cpp
+    src/store/kv_persist_v2.cpp
     src/store/route_usage.cpp
     src/tok/tokenizer.cpp
     src/tok/k3_tools.cpp
@@ -79,6 +80,8 @@ set(MVLLM_HOST_SOURCES
     src/model/h3_canvas.cpp
     src/model/h3_adaln.cpp
     src/model/h3_reuse.cpp
+    src/model/h3_token_reduce.cpp
+    src/model/moe_pick.cpp
     src/model/llama.cpp
     src/serve/http_server.cpp
     src/serve/session.cpp
