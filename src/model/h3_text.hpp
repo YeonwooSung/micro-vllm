@@ -37,8 +37,12 @@ public:
     void encode(const std::vector<int> &ids, std::vector<float> &out) const;
     // Official multimodal path: splice vision rows, 3-axis mRoPE, add deepstack
     // residuals after layers 0, 1, 2. positions is [3, seq] axis-major.
+    // layer_count runs only the first L decoder layers (clamped to cfg_.layers).
     void encode_mm(const std::vector<int> &ids, const H3VisionSpan *spans, int span_count,
                    const uint32_t *positions, const uint8_t *tags, std::vector<float> &out) const;
+    void encode_mm(const std::vector<int> &ids, const H3VisionSpan *spans, int span_count,
+                   const uint32_t *positions, const uint8_t *tags, std::vector<float> &out,
+                   int layer_count) const;
     const H3TextConfig &config() const { return cfg_; }
     bool from_checkpoint() const { return from_checkpoint_; }
     bool ready() const { return ready_; }

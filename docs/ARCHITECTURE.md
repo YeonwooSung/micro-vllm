@@ -211,7 +211,11 @@ the slot cache; Llama packs GQA K/V into L/R. Missing/KDA layers stay zero.
 `import_kv_rows` restores those rows on `persist_open(slot)` so a reopen
 warms that slot without wiping other prefixes. Empty reopen does not
 clear an existing `KvPrefix`. DSA decode uses `dsa_select_range`
-(queries only for `[q_from, q_to)`).
+(queries only for `[q_from, q_to)`). GLM `attn_one` calls the range form
+for the current token. Native FP8 matvec (`fp8_matvec` / `fp8_dual_matvec`)
+is E4M3 W × QDQ-x with UE8M0 128-col tiles; dual shares one x QDQ.
+H3 `encode_mm(..., layer_count)` is the official prefix-layer multimodal
+encode.
 SUBMIT extras, HTTP `apply_sampling_extras`, Anthropic `anthropic_to_chat`,
 and `micro-vllm generate` flags honor `persist`/`kv_path`/`coli_kv`,
 `persist_ver`, `stop_ids`, `eos_only`, and `prefix_bytes`.

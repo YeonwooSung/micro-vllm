@@ -365,6 +365,12 @@ void H3TextEncoder::encode(const std::vector<int> &ids, std::vector<float> &out)
 void H3TextEncoder::encode_mm(const std::vector<int> &ids, const H3VisionSpan *spans, int span_count,
                               const uint32_t *positions, const uint8_t *tags,
                               std::vector<float> &out) const {
+    encode_mm(ids, spans, span_count, positions, tags, out, cfg_.layers);
+}
+
+void H3TextEncoder::encode_mm(const std::vector<int> &ids, const H3VisionSpan *spans, int span_count,
+                              const uint32_t *positions, const uint8_t *tags,
+                              std::vector<float> &out, int layer_count) const {
     (void)tags;
     out.clear();
     if (!ready_ || ids.empty())
@@ -375,6 +381,9 @@ void H3TextEncoder::encode_mm(const std::vector<int> &ids, const H3VisionSpan *s
     const int nq = cfg_.n_q;
     const int nkv = std::max(cfg_.n_kv, 1);
     const int I = cfg_.intermediate;
+    int L = layer_count;
+    if (L <= 0 || L > cfg_.layers)
+        L = cfg_.layers;
     out.assign(static_cast<size_t>(T) * H, 0.f);
     for (int t = 0; t < T; ++t) {
         int id = ids[static_cast<size_t>(t)];
@@ -402,7 +411,7 @@ void H3TextEncoder::encode_mm(const std::vector<int> &ids, const H3VisionSpan *s
         g(static_cast<size_t>(T) * I), u(static_cast<size_t>(T) * I), d(static_cast<size_t>(T) * H);
     const float scale = 1.f / std::sqrt(static_cast<float>(hd));
     const int group = std::max(nq / nkv, 1);
-    for (int l = 0; l < cfg_.layers; ++l) {
+    for (int l = 0; l < L; ++l) {
         for (int t = 0; t < T; ++t)
             quant::rmsnorm(out.data() + t * H, in_n_[static_cast<size_t>(l)].data(),
                            n.data() + t * H, H, cfg_.rms_eps);

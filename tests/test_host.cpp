@@ -2694,6 +2694,17 @@ int main() {
         }
         CHECK(mfin);
         CHECK(md > 1e-8f);
+        std::vector<float> oneL, allL;
+        enc2.encode_mm(seq.ids, seq.spans.data(), static_cast<int>(seq.spans.size()),
+                       seq.positions.data(), seq.tags.data(), oneL, 1);
+        enc2.encode_mm(seq.ids, seq.spans.data(), static_cast<int>(seq.spans.size()),
+                       seq.positions.data(), seq.tags.data(), allL, 0);
+        CHECK(oneL.size() == allL.size());
+        float ld = 0.f;
+        for (size_t i = 0; i < oneL.size(); ++i)
+            ld += (oneL[i] - allL[i]) * (oneL[i] - allL[i]);
+        if (enc2.config().layers > 1)
+            CHECK(ld > 1e-10f);
 
         std::string vdir = tmpdir();
         const int vh = 32, vI = 64, vL = 2, vout = 32;
@@ -4142,6 +4153,17 @@ int main() {
         CHECK(fp8_activation_qdq(pout, &psc, pin, 20, 64) == 0);
         CHECK(psc == 119);
         CHECK(fp8_activation_qdq(pout, &psc, pin, 0, 64) == -1);
+        std::vector<float> x(128, 1.f), y(2, 0.f), ya(2, 0.f), yb(2, 0.f);
+        std::vector<uint8_t> w(2 * 128, e4m3fn_encode(1.f));
+        uint8_t tsc[2] = {0x7f, 0x7f};
+        CHECK(fp8_matvec(y.data(), w.data(), tsc, 2, 128, x.data()) == 0);
+        CHECK(std::isfinite(y[0]) && std::isfinite(y[1]));
+        CHECK(y[0] != 0.f);
+        CHECK(fp8_dual_matvec(ya.data(), yb.data(), w.data(), tsc, w.data(), tsc, 2, 128,
+                              x.data()) == 0);
+        CHECK_NEAR(ya[0], y[0], 1e-5);
+        CHECK_NEAR(yb[1], y[1], 1e-5);
+        CHECK(fp8_matvec(y.data(), w.data(), tsc, 2, 127, x.data()) == -1);
     }
     {
         using namespace mvllm;

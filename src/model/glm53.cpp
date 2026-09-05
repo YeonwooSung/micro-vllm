@@ -761,9 +761,17 @@ private:
                 }
                 nsel = dsa_index_width(cfg_.dsa);
                 selbuf.assign(static_cast<size_t>(std::max(nsel, 1)), -1);
-                dsa_select(selbuf.data(), iq.data(), ikeys.empty() ? nullptr : ikeys.data(),
-                           igates.empty() ? nullptr : igates.data(), hw.data(),
-                           dsa_ape_[l].empty() ? nullptr : dsa_ape_[l].data(), at + 1, cfg_.dsa);
+                // Decode: official range over current token; queries/head_w already [0].
+                if (dsa_select_range(selbuf.data(), iq.data(),
+                                     ikeys.empty() ? nullptr : ikeys.data(),
+                                     igates.empty() ? nullptr : igates.data(), hw.data(),
+                                     dsa_ape_[l].empty() ? nullptr : dsa_ape_[l].data(), nullptr,
+                                     at + 1, cfg_.dsa, at, at + 1) < 0)
+                    dsa_select(selbuf.data(), iq.data(),
+                               ikeys.empty() ? nullptr : ikeys.data(),
+                               igates.empty() ? nullptr : igates.data(), hw.data(),
+                               dsa_ape_[l].empty() ? nullptr : dsa_ape_[l].data(), at + 1,
+                               cfg_.dsa);
                 sel = selbuf.data();
             }
             mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],

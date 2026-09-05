@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace mvllm {
 namespace {
@@ -174,6 +175,67 @@ int fp4_activation_qdq(float *output, uint8_t *scales, const float *input,
                 e2m1_decode(static_cast<uint8_t>(nearest_e2m1_code(q))) * scale;
         }
     }
+    return 0;
+}
+
+namespace {
+
+constexpr int kFp8Tile = 128;
+
+bool bad_fp8_matvec(int O, int I) {
+    return O <= 0 || I <= 0 || (I % kFp8Tile) != 0;
+}
+
+void fp8_matvec_xhat(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+                     const float *xhat) {
+    const int ntiles = I / kFp8Tile;
+    for (int o = 0; o < O; ++o) {
+        float acc = 0.f;
+        const uint8_t *row = w + static_cast<size_t>(o) * static_cast<size_t>(I);
+        const uint8_t *row_sc =
+            scales + static_cast<size_t>(o) * static_cast<size_t>(ntiles);
+        for (int t = 0; t < ntiles; ++t) {
+            float sc = e8m0_decode(row_sc[t]);
+            if (!std::isfinite(sc))
+                sc = 0.f;
+            const int base = t * kFp8Tile;
+            for (int k = 0; k < kFp8Tile; ++k)
+                acc += e4m3fn_decode(row[base + k]) * xhat[base + k] * sc;
+        }
+        y[o] = acc;
+    }
+}
+
+int qdq_xhat(std::vector<float> &xhat, const float *x, int I) {
+    xhat.assign(static_cast<size_t>(I), 0.f);
+    std::vector<uint8_t> act_scales(static_cast<size_t>(I / kFp8Tile));
+    return fp8_activation_qdq(xhat.data(), act_scales.data(), x, I, kFp8Tile);
+}
+
+} // namespace
+
+int fp8_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+               const float *x) {
+    if (!y || !w || !scales || !x || bad_fp8_matvec(O, I))
+        return -1;
+
+    std::vector<float> xhat;
+    if (qdq_xhat(xhat, x, I) != 0)
+        return -1;
+    fp8_matvec_xhat(y, w, scales, O, I, xhat.data());
+    return 0;
+}
+
+int fp8_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
+                    const uint8_t *wb, const uint8_t *sb, int O, int I, const float *x) {
+    if (!ya || !yb || !wa || !sa || !wb || !sb || !x || bad_fp8_matvec(O, I))
+        return -1;
+
+    std::vector<float> xhat;
+    if (qdq_xhat(xhat, x, I) != 0)
+        return -1;
+    fp8_matvec_xhat(ya, wa, sa, O, I, xhat.data());
+    fp8_matvec_xhat(yb, wb, sb, O, I, xhat.data());
     return 0;
 }
 
