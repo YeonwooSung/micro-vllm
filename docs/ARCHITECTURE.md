@@ -155,9 +155,12 @@ and run smoke against those trees. Official GLM FP8 experts need
 `python/convert_glm53.py` first. K3 official MXFP4 loads without `k3_repack.py`.
 
 Not absorbed yet: none from the host-migration plan
-(mux READY HWINFO/TIERS/EMAP, `/health` rss_gb, `uni_to_lower` also in).
+(`/health` failed/free_slots, SessionStore `release_all`, CLI `--function-call` also in).
 
 Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise.
+`uni_is_M` (Mn/Mc/Me) keeps combining marks on pretok letter-runs.
+`uni_is_P` (P*) marks pretok other-runs.
+`uni_to_upper` is the inverse 1:1 fold of `uni_to_lower`.
 A K3 HF dir with only `tiktoken.model` (+ optional `tokenizer_config.json`)
 loads without a synthesized `tokenizer.json`.
 Kimi pretok sniffs `\\p{Han}`. GLM chat is `[gMASK]<sop><|user|>…<|assistant|><think></think>`.
@@ -166,6 +169,14 @@ when those specials exist; otherwise `<|im_start|>role`. HTTP
 `/v1/chat/completions` applies the family template. GLM chat defaults to
 think-on (`<|assistant|><think>` + Reasoning Effort); `--no-think` /
 `enable_thinking=false` closes the block. `generate --prompt` is raw.
+Generate CLI honors repeatable `--logit-bias ID:DELTA`,
+`--max-tokens` / `--n` (`gp.max_new_tokens`), `--logprobs N`,
+`--cache-slot` / `--slot N`, `--reasoning-effort none|low|medium|high`,
+`--tool-choice auto|none|required|NAME`, `--raw` / `--no-chat`
+(clears the chat template), and `--tools PATH`.
+`hwinfo_json` is the compact HWINFO snapshot.
+`GET /v1/models` uses `serve_created()` (process start unix time) as
+OpenAI `created`.
 `eos_token_id` arrays (config + `generation_config.json`) are honored.
 
 Prefill is layer-major: a chunk of tokens walks each layer, then union-MoE loads
@@ -233,7 +244,14 @@ when the recorded ids are a strict prefix.
 Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
 plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters. Buffer reader
+`mux_format_accept` / `mux_format_error` emit `ACCEPT id n` and `ERROR id CODE`
+(mux_stdio writes those lines).
 `mux_parse_command` accepts SUBMIT/STOP/CANCEL/IMAGE (NeedMore vs BadFrame).
+IMAGE payload is official LE f32 patches when `n==h*w*4`, else encoded
+PNG/JPEG/PPM/BMP, else raw RGB24 when `n==h*w*3`.
+Legacy stdin (`legacy_parse_line`) accepts `\x02RESET` / `\x02MORE` /
+`\x02PROMPT <bytes> <max_tokens> <temp> <top_p> [slot]` plus interactive
+lines; replies use `\x01\x01READY|END\x01\x01` and `STAT`.
 SUBMIT extras are `logprobs=` / `ids=` (`mux_submit_ext`); `ids=1` payloads
 are ASCII token ids (`mux_ids_parse`).
 
@@ -266,7 +284,77 @@ JSON responses attach the same object.
 HTTP success sends `x-colibri-queue-wait-ms`; 429 queue-full/timeout use
 official `rate_limit_error` JSON plus `Retry-After: 1`. Scheduler records
 wait time, expires queued jobs after `queue_timeout_s`, and exposes
-admitted/rejected/timed_out counters on GET /health. `COLI_MAX_QUEUE` /
+admitted/rejected/timed_out counters on GET /health, plus `created` /
+`cores` / `ram_gb` / `ngpu`. GET `/ready` /
+`/v1/ready` is `{"ready":true}` when an engine is bound, else 503.
+GET `/ready` / `/v1/ready` includes `created` (`serve_created()`).
+`SessionStore::first_free` is the lowest free KV slot, or -1.
+GET `/version` / `/v1/version` is
+`{"name":"micro-vllm","engine":"host","created":<serve_created()>}`.
+Generate CLI honors `--cache-slot` / `--slot N`.
+`SessionStore::busy_count` is the number of acquired KV slots.
+`SessionStore::history_len` is the token count of a slot without copying ids.
+`SessionStore::has_history` is true when that count is non-zero.
+GET `/profile` and `colibri_json` include `created` (`serve_created()`).
+`mux_format_experts_json` appends `created` when `created >= 0`.
+GET `/experts` passes `serve_created()`.
+`SchedulerSnapshot::jobs` is `jobs_.size()` including terminal jobs.
+`SchedulerSnapshot::live` is non-terminal (`active + queued`).
+`SchedulerSnapshot::idle` is `max(0, capacity - busy_slots)`.
+`SessionStore::valid_slot` is `slot` in `[0, n_)`.
+`SessionStore::history_total` is the sum of per-slot history lengths.
+GET `/health` `scheduler` includes `jobs`, `live`, `idle`, and `failed`.
+GET `/health` includes `hist_tokens` and `free_slots`.
+`SessionStore::release_all` clears busy flags and keeps history.
+Generate CLI `--function-call` is an alias of `--tool-choice`.
+GET `/metrics` includes `hist_tokens`, `free_slots`, `failed`, `idle`,
+`jobs`, `live`, `capacity`, `admitted`, `completed`, `rejected`,
+`timed_out`, `cancelled`, and `queue_timeout` (`SchedulerSnapshot` fields,
+0 if unbound).
+`BatchScheduler::failed_count` is `rejected + timed_out + cancelled`.
+`BatchScheduler::admitted_count` is `admitted_`.
+`BatchScheduler::completed_count` is `completed_`.
+`BatchScheduler::rejected_count` is `rejected_`.
+`BatchScheduler::timed_out_count` is `timed_out_`.
+`BatchScheduler::cancelled_count` is `cancelled_`.
+`StopSet::clear` drops every armed id.
+Generate CLI `--no-json` / `--no-grammar` clear `gp.grammar` (last-wins vs `--json`).
+`KvPrefix::full` is true when recorded length has reached an allocated cap.
+Mux SUBMIT extras honor `tool_choice` / `function_call` (`tool_choice` wins)
+and `reasoning_effort` (`none|low|medium|high`; underscore form wins).
+Generate CLI `--no-tools` clears `gp.tools` (last-wins vs `--tools`).
+`trim_assistant_tail` also strips trailing `<|endofprompt|>` and
+`<|end_of_turn|>`.
+`SessionStore::all_busy` is true when every slot is busy.
+`SessionStore::any_busy` is true when at least one slot is busy.
+`SessionStore::any_free` is true when at least one slot is free.
+`BatchScheduler::live_count` is non-terminal jobs (`active + queued`).
+`BatchScheduler::idle_count` is `max(0, capacity - busy_slots)`.
+`BatchScheduler::capacity` is session slot count, or 1 if unbound.
+`SessionStore::all_free` is true when no slot is busy.
+`SessionStore::last_busy` is the highest busy KV slot, or -1.
+`SessionStore::first_busy` is the lowest busy KV slot, or -1.
+`hwinfo_line(const HwInfo &)` formats HWINFO without probing.
+`SessionStore::last_free` is the highest free KV slot, or -1.
+`SessionStore::try_acquire_last` acquires the highest free slot under one lock.
+`KvPrefix::empty` is true when recorded length is 0.
+Generate CLI `--no-eos-only` clears `gp.eos_only` (last-wins vs `--eos-only`).
+`StopSet::empty` is true when the armed set has size 0.
+`trim_assistant_tail` also strips trailing `<|end_of_text|>` and `<|end|>`.
+`logprob_argmax` is the first-wins max-logit index (`-1` if empty).
+Generate CLI `--no-logprobs` clears `gp.logprobs` (last-wins vs `--logprobs`).
+`anthropic_sse_error` is the mid-stream SSE `event: error` helper
+(null/empty type → `api_error`).
+`SessionStore::try_acquire_any` acquires the lowest free slot under one lock.
+`SchedulerSnapshot::failed` is `rejected + timed_out + cancelled`.
+`SessionStore::free_count` is `n_ - busy_count` (not below 0).
+`SchedulerSnapshot::hist_tokens` is `history_total` (0 if unbound).
+GET `/health` and GET `/metrics` include `busy_slots`.
+`SchedulerSnapshot::busy_slots` is `SessionStore::busy_count` (0 if unbound).
+GET `/metrics` includes `created` (`serve_created()`). Mux READY uses
+`legacy_format_ready()`.
+`SessionStore::reset_all` clears every slot (legacy `\x02RESET`).
+`COLI_MAX_QUEUE` /
 `COLI_QUEUE_TIMEOUT` (or `MVLLM_*`) feed `RuntimeConfig`.
 GET `/*` serves `COLI_WEB_DIST` / `MVLLM_WEB_DIST` (SPA `index.html`,
 path-traversal-safe). Host header is pinned to loopback + bind +

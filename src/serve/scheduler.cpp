@@ -77,7 +77,7 @@ uint64_t BatchScheduler::submit(int slot, const std::vector<int> &ids, const Gen
         err = "scheduler not bound";
         return 0;
     }
-    if (live_count(jobs_) >= max_queue_) {
+    if (::mvllm::live_count(jobs_) >= max_queue_) {
         ++rejected_;
         err = "queue full";
         return 0;
@@ -137,7 +137,7 @@ bool BatchScheduler::cancel(uint64_t id) {
 int BatchScheduler::pump() {
     std::lock_guard<std::mutex> lock(g_batch_mu);
     if (!engine_ || !sessions_)
-        return live_count(jobs_);
+        return ::mvllm::live_count(jobs_);
 
     FamilyEngine *fe = engine_->family_impl();
 
@@ -215,17 +215,17 @@ int BatchScheduler::pump() {
                 finish_err(*queued, st, err);
             else
                 finish_done(*queued);
-            return live_count(jobs_);
+            return ::mvllm::live_count(jobs_);
         }
         queued->reuse = applied;
         if (st != Status::Ok) {
             finish_err(*queued, st, err);
-            return live_count(jobs_);
+            return ::mvllm::live_count(jobs_);
         }
         queued->out.prompt_tokens = static_cast<int>(queued->ids.size());
         if (queued->state == BatchJobState::Stopped)
             finish_done(*queued);
-        return live_count(jobs_);
+        return ::mvllm::live_count(jobs_);
     }
 
     if (fe) {
@@ -318,7 +318,7 @@ int BatchScheduler::pump() {
             finish_done(j);
     }
 
-    return live_count(jobs_);
+    return ::mvllm::live_count(jobs_);
 }
 
 bool BatchScheduler::finished(uint64_t id) const {
@@ -334,7 +334,7 @@ const BatchJob *BatchScheduler::job(uint64_t id) const {
 
 int BatchScheduler::queue_depth() const {
     std::lock_guard<std::mutex> lock(g_batch_mu);
-    return live_count(jobs_);
+    return ::mvllm::live_count(jobs_);
 }
 
 int BatchScheduler::running_count() const {
@@ -365,6 +365,11 @@ int BatchScheduler::n_jobs() const {
     return static_cast<int>(jobs_.size());
 }
 
+int BatchScheduler::live_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return ::mvllm::live_count(jobs_);
+}
+
 double BatchScheduler::job_wait_s(uint64_t id) const {
     std::lock_guard<std::mutex> lock(g_batch_mu);
     const BatchJob *j = find_job(jobs_, id);
@@ -374,6 +379,59 @@ double BatchScheduler::job_wait_s(uint64_t id) const {
 int BatchScheduler::queue_timeout_s() const {
     std::lock_guard<std::mutex> lock(g_batch_mu);
     return queue_timeout_s_;
+}
+
+uint64_t BatchScheduler::failed_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return rejected_ + timed_out_ + cancelled_;
+}
+
+uint64_t BatchScheduler::admitted_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return admitted_;
+}
+
+uint64_t BatchScheduler::completed_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return completed_;
+}
+
+uint64_t BatchScheduler::rejected_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return rejected_;
+}
+
+uint64_t BatchScheduler::timed_out_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return timed_out_;
+}
+
+uint64_t BatchScheduler::cancelled_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return cancelled_;
+}
+
+int BatchScheduler::idle_count() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    int cap = 1;
+    if (sessions_) {
+        cap = sessions_->n_slots();
+        if (cap < 1)
+            cap = 1;
+    }
+    int busy_slots = sessions_ ? sessions_->busy_count() : 0;
+    return cap > busy_slots ? cap - busy_slots : 0;
+}
+
+int BatchScheduler::capacity() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    int cap = 1;
+    if (sessions_) {
+        cap = sessions_->n_slots();
+        if (cap < 1)
+            cap = 1;
+    }
+    return cap;
 }
 
 void BatchScheduler::snapshot(SchedulerSnapshot &out) const {
@@ -394,7 +452,12 @@ void BatchScheduler::snapshot(SchedulerSnapshot &out) const {
     }
     out.active = running;
     out.queued = queued;
+    out.live = out.active + out.queued;
     out.capacity = cap;
+    out.busy_slots = sessions_ ? sessions_->busy_count() : 0;
+    out.hist_tokens = sessions_ ? sessions_->history_total() : 0;
+    out.idle = out.capacity > out.busy_slots ? out.capacity - out.busy_slots : 0;
+    out.jobs = static_cast<int>(jobs_.size());
     out.max_queue = max_queue_;
     out.queue_timeout_seconds = queue_timeout_s_;
     out.admitted = admitted_;
@@ -402,6 +465,7 @@ void BatchScheduler::snapshot(SchedulerSnapshot &out) const {
     out.rejected = rejected_;
     out.timed_out = timed_out_;
     out.cancelled = cancelled_;
+    out.failed = out.rejected + out.timed_out + out.cancelled;
 }
 
 } // namespace mvllm

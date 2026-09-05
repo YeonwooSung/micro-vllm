@@ -648,6 +648,14 @@ std::string anthropic_messages_response(const std::string &id, const std::string
     return format_messages_response(id, model, out, nullptr);
 }
 
+std::string anthropic_count_tokens_response(int input_tokens) {
+    if (input_tokens < 0)
+        input_tokens = 0;
+    std::ostringstream os;
+    os << "{\"type\":\"message_count_tokens_response\",\"input_tokens\":" << input_tokens << '}';
+    return os.str();
+}
+
 std::string anthropic_sse_start(const std::string &id, const std::string &model) {
     json usage = json::object();
     usage["input_tokens"] = 0;
@@ -743,6 +751,18 @@ std::string anthropic_sse_ping() {
     return sse_event("ping", payload);
 }
 
+std::string anthropic_sse_error(const char *type, const std::string &message) {
+    if (!type || !type[0])
+        type = "api_error";
+    json e = json::object();
+    e["type"] = type;
+    e["message"] = message;
+    json payload = json::object();
+    payload["type"] = "error";
+    payload["error"] = std::move(e);
+    return sse_event("error", payload);
+}
+
 void handle_anthropic_messages(int fd, const std::string &body, Engine *engine) {
     if (!engine) {
         write_http(fd, 503, "Service Unavailable", "{\"error\":\"no engine\"}");
@@ -832,13 +852,7 @@ void handle_anthropic_messages(int fd, const std::string &body, Engine *engine) 
         ka.join();
 
     if (st != Status::Ok) {
-        json payload = json::object();
-        payload["type"] = "error";
-        json e = json::object();
-        e["type"] = "api_error";
-        e["message"] = gerr.empty() ? "generate failed" : gerr;
-        payload["error"] = std::move(e);
-        send_ev(sse_event("error", payload));
+        send_ev(anthropic_sse_error("api_error", gerr.empty() ? "generate failed" : gerr));
         return;
     }
 

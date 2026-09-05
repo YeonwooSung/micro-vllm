@@ -227,6 +227,27 @@ constexpr UniRange k_Ll[] = {
     {0x0430, 0x044F}, {0xFF41, 0xFF5A},
 };
 
+// Combining marks (Mn/Mc/Me): dedicated blocks + compact Hebrew/Arabic/Indic.
+constexpr UniRange k_M[] = {
+    {0x0300, 0x036F}, {0x0483, 0x0489}, {0x0591, 0x05BD}, {0x05BF, 0x05BF},
+    {0x05C1, 0x05C2}, {0x05C4, 0x05C5}, {0x05C7, 0x05C7}, {0x0610, 0x061A},
+    {0x064B, 0x065F}, {0x0670, 0x0670}, {0x06D6, 0x06DC}, {0x06DF, 0x06E4},
+    {0x06E7, 0x06E8}, {0x06EA, 0x06ED}, {0x0730, 0x074A}, {0x07A6, 0x07B0},
+    {0x07EB, 0x07F3}, {0x0900, 0x0903}, {0x093A, 0x093C}, {0x093E, 0x094F},
+    {0x0951, 0x0957}, {0x0962, 0x0963}, {0x1AB0, 0x1AFF}, {0x1DC0, 0x1DFF},
+    {0x20D0, 0x20FF}, {0x2DE0, 0x2DFF}, {0x302A, 0x302F}, {0x3099, 0x309A},
+    {0xFE20, 0xFE2F},
+};
+
+// Punctuation (P*): ASCII, a few Latin-1, General Punctuation, CJK (skip U+3000),
+// fullwidth. Compact inclusive ranges — not the full Unicode P set.
+constexpr UniRange k_P[] = {
+    {0x0021, 0x002F}, {0x003A, 0x0040}, {0x005B, 0x0060}, {0x007B, 0x007E},
+    {0x00A1, 0x00A1}, {0x00B7, 0x00B7}, {0x00BF, 0x00BF}, {0x2010, 0x2027},
+    {0x2030, 0x205E}, {0x3001, 0x303F}, {0xFF01, 0xFF0F}, {0xFF1A, 0xFF20},
+    {0xFF3B, 0xFF40}, {0xFF5B, 0xFF65},
+};
+
 } // namespace
 
 bool uni_is_L(uint32_t cp) {
@@ -257,8 +278,28 @@ uint32_t uni_to_lower(uint32_t cp) {
     return cp;
 }
 
+uint32_t uni_to_upper(uint32_t cp) {
+    if (uni_is_Lu(cp))
+        return cp;
+    // Simple 1:1 fold (not full Unicode casefold). Inverse of uni_to_lower.
+    if ((cp >= 'a' && cp <= 'z') || (cp >= 0xFF41u && cp <= 0xFF5Au) ||
+        (cp >= 0x00E0u && cp <= 0x00F6u) || (cp >= 0x00F8u && cp <= 0x00FEu) ||
+        (cp >= 0x03B1u && cp <= 0x03C9u && cp != 0x03C2u) ||
+        (cp >= 0x0430u && cp <= 0x044Fu))
+        return cp - 0x20u;
+    return cp;
+}
+
 bool uni_is_Ll(uint32_t cp) {
     return uni_scalar(cp) && uni_in(cp, k_Ll);
+}
+
+bool uni_is_M(uint32_t cp) {
+    return uni_scalar(cp) && uni_in(cp, k_M);
+}
+
+bool uni_is_P(uint32_t cp) {
+    return uni_scalar(cp) && uni_in(cp, k_P);
 }
 
 } // namespace mvllm

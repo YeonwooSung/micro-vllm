@@ -60,6 +60,7 @@
 #include "serve/mux_frames.hpp"
 #include "serve/mux_codec.hpp"
 #include "serve/mux_submit.hpp"
+#include "serve/legacy_stdio.hpp"
 #include "serve/hwinfo.hpp"
 #include "serve/cli_flags.hpp"
 
@@ -1076,7 +1077,9 @@ static void test_offload_generate() {
         CHECK(ej.find("\"rows\":") != std::string::npos);
         CHECK(ej.find("\"map\":\"") != std::string::npos);
         CHECK(ej.find("\"entropy\":[") != std::string::npos);
-        CHECK(experts_json(&ek, false) == mux_format_experts_json(0, 0, nullptr, nullptr, 0));
+        CHECK(ej.find("\"created\":" + std::to_string(serve_created())) != std::string::npos);
+        CHECK(experts_json(&ek, false) ==
+              mux_format_experts_json(0, 0, nullptr, nullptr, 0, nullptr, 0, serve_created()));
         RouteTelem a, b;
         ek.route_telem(a, true);
         CHECK(ek.hits_seq() == 1);
@@ -1105,11 +1108,25 @@ static void test_offload_generate() {
         CHECK(pj.find("\"seq\":") != std::string::npos);
         CHECK(pj.find("\"turns\":[") != std::string::npos);
         CHECK(pj.find("\"wall_s\":") != std::string::npos);
-        CHECK(profile_json(&ek, false) == "{\"seq\":0,\"turns\":[]}");
-        CHECK(profile_json(nullptr) == "{\"seq\":0,\"turns\":[]}");
-        CHECK(colibri_json(nullptr) ==
-              "{\"stats\":{},\"perf\":{},\"topk\":[],\"entropy\":[],\"gpus\":[],\"repin\":[]}");
+        CHECK(pj.find("\"created\":" + std::to_string(serve_created())) != std::string::npos);
+        const std::string pempty =
+            "{\"seq\":0,\"turns\":[],\"created\":" + std::to_string(serve_created()) + "}";
+        CHECK(profile_json(&ek, false) == pempty);
+        CHECK(profile_json(nullptr) == pempty);
+        std::string hj = health_json(&ek);
+        CHECK(hj.find("\"jobs\":") != std::string::npos);
+        CHECK(hj.find("\"live\":") != std::string::npos);
+        CHECK(hj.find("\"idle\":") != std::string::npos);
+        CHECK(hj.find("\"hist_tokens\":") != std::string::npos);
+        CHECK(hj.find("\"failed\":") != std::string::npos);
+        CHECK(hj.find("\"free_slots\":") != std::string::npos);
+        const std::string cempty =
+            "{\"stats\":{},\"perf\":{},\"topk\":[],\"entropy\":[],\"gpus\":[],\"repin\":[],"
+            "\"created\":" +
+            std::to_string(serve_created()) + "}";
+        CHECK(colibri_json(nullptr) == cempty);
         std::string cj = colibri_json(&ek);
+        CHECK(cj.find("\"created\":" + std::to_string(serve_created())) != std::string::npos);
         CHECK(cj.find("\"stats\":{") != std::string::npos);
         CHECK(cj.find("\"profile_seq\":") != std::string::npos);
         CHECK(cj.find("\"perf\":{") != std::string::npos);
@@ -3055,16 +3072,88 @@ int main() {
         SessionStore ss;
         ss.configure(4);
         CHECK(ss.n_slots() == 4);
+        CHECK(ss.free_count() == 4);
+        CHECK(ss.first_free() == 0);
+        CHECK(ss.last_free() == 3);
+        CHECK(ss.try_acquire_any() == 0);
+        CHECK(ss.busy(0) && ss.first_free() == 1);
+        CHECK(ss.last_free() == 3);
+        ss.release(0);
+        CHECK(ss.valid_slot(0) && ss.valid_slot(3));
+        CHECK(!ss.valid_slot(-1) && !ss.valid_slot(4));
         CHECK(ss.try_acquire(1));
         CHECK(ss.busy(1));
+        CHECK(ss.first_free() == 0);
+        CHECK(ss.free_count() == 3);
         CHECK(!ss.try_acquire(1));
         ss.release(1);
+        CHECK(ss.free_count() == 4);
         CHECK(ss.try_acquire(1));
         ss.commit(1, {10, 11, 12});
+        CHECK(ss.history_len(1) == 3);
+        CHECK(ss.history_total() == 3);
+        CHECK(ss.has_history(1));
+        CHECK(ss.try_acquire(2));
+        ss.release_all();
+        CHECK(!ss.busy(1) && !ss.busy(2));
+        CHECK(ss.has_history(1));
+        CHECK(ss.try_acquire(1));
+        CHECK(!ss.has_history(99));
+        CHECK(ss.history_len(99) == 0);
         CHECK(ss.match(1, {10, 11, 99}) == 2);
         ss.reset(1);
         CHECK(ss.match(1, {10, 11}) == 0);
         CHECK(!ss.busy(1));
+        CHECK(ss.history_total() == 0);
+        ss.commit(0, {1, 2});
+        ss.commit(2, {3});
+        CHECK(ss.history_total() == 3);
+        CHECK(ss.try_acquire(2));
+        ss.reset_all();
+        CHECK(ss.n_slots() == 4);
+        CHECK(ss.match(0, {1, 2}) == 0);
+        CHECK(ss.match(2, {3}) == 0);
+        CHECK(!ss.busy(2));
+        CHECK(ss.try_acquire(2));
+        CHECK(ss.busy_count() == 1);
+        ss.release(2);
+        CHECK(ss.busy_count() == 0);
+        CHECK(ss.last_free() == 3);
+        {
+            SessionStore full;
+            full.configure(2);
+            CHECK(full.last_free() == 1);
+            CHECK(full.try_acquire(0) && full.try_acquire(1));
+            CHECK(full.last_free() == -1);
+            CHECK(full.all_busy());
+            CHECK(!full.any_free());
+            CHECK(full.try_acquire_last() == -1);
+        }
+        {
+            SessionStore hi;
+            hi.configure(4);
+            CHECK(hi.last_busy() == -1);
+            CHECK(hi.first_busy() == -1);
+            CHECK(hi.all_free());
+            CHECK(!hi.all_busy());
+            CHECK(!hi.any_busy());
+            CHECK(hi.any_free());
+            CHECK(hi.try_acquire_last() == 3);
+            CHECK(hi.busy(3) && hi.last_free() == 2);
+            CHECK(hi.last_busy() == 3);
+            CHECK(hi.first_busy() == 3);
+            CHECK(hi.try_acquire_any() == 0);
+            CHECK(hi.try_acquire_last() == 2);
+            CHECK(hi.busy(0) && hi.busy(2) && hi.busy(3));
+            CHECK(hi.first_free() == 1);
+            CHECK(hi.last_busy() == 3);
+            CHECK(hi.first_busy() == 0);
+            CHECK(!hi.all_free());
+            CHECK(hi.any_busy());
+            hi.release_all();
+            CHECK(hi.all_free());
+            CHECK(!hi.any_busy());
+        }
         BatchScheduler sch;
         std::string berr;
         CHECK(sch.submit(0, {1}, {}, berr) == 0);
@@ -3433,6 +3522,11 @@ int main() {
         CHECK(mux_decode_image(raw, 12, 2, 2, rgb, iw, ih, ierr) == Status::Ok);
         CHECK(iw == 2 && ih == 2 && rgb.size() == 12);
         CHECK(rgb[0] > 0.9f && rgb[1] < 0.1f);
+        uint8_t f32le[8] = {0x00, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0xc0};
+        CHECK(mux_decode_image(f32le, 8, 1, 2, rgb, iw, ih, ierr) == Status::Ok);
+        CHECK(iw == 2 && ih == 1 && rgb.size() == 2);
+        CHECK_NEAR(rgb[0], 1.f, 1e-6);
+        CHECK_NEAR(rgb[1], -2.f, 1e-6);
         const char *old_key = std::getenv("MVLLM_API_KEY");
         std::string old_key_s = old_key ? old_key : "";
         unsetenv("MVLLM_API_KEY");
@@ -3511,6 +3605,161 @@ int main() {
             CHECK(cgp.top_k == 8);
             CHECK_NEAR(cgp.min_p, 0.05f, 1e-5);
             CHECK(!cgp.grammar.empty());
+            char nj0[] = "micro-vllm";
+            char nj1[] = "--json";
+            char nj2[] = "--no-json";
+            char *njv[] = {nj0, nj1, nj2};
+            CHECK(apply_cli_gen_flags(3, njv, cgp, cex, cerr));
+            CHECK(cgp.grammar.empty());
+            char ng0[] = "micro-vllm";
+            char ng1[] = "--no-grammar";
+            char ng2[] = "--json";
+            char *ngv[] = {ng0, ng1, ng2};
+            CHECK(apply_cli_gen_flags(3, ngv, cgp, cex, cerr));
+            CHECK(!cgp.grammar.empty());
+        }
+        {
+            char b0[] = "micro-vllm";
+            char b1[] = "--logit-bias";
+            char b2[] = "7:1.5";
+            char b3[] = "--logit-bias";
+            char b4[] = "11:-2";
+            char *bv[] = {b0, b1, b2, b3, b4};
+            GenParams cgp;
+            CliGenExtras cex;
+            std::string cerr;
+            CHECK(apply_cli_gen_flags(5, bv, cgp, cex, cerr));
+            CHECK(cgp.logit_bias.size() == 2);
+            CHECK(cgp.logit_bias[0].first == 7);
+            CHECK_NEAR(cgp.logit_bias[0].second, 1.5f, 1e-5);
+            CHECK(cgp.logit_bias[1].first == 11);
+            CHECK_NEAR(cgp.logit_bias[1].second, -2.f, 1e-5);
+            char c0[] = "micro-vllm";
+            char c1[] = "--logit-bias";
+            char c2[] = "nocolon";
+            char *cv[] = {c0, c1, c2};
+            CHECK(!apply_cli_gen_flags(3, cv, cgp, cex, cerr));
+            char n0[] = "micro-vllm";
+            char n1[] = "--max-tokens";
+            char n2[] = "32";
+            char *nv[] = {n0, n1, n2};
+            CHECK(apply_cli_gen_flags(3, nv, cgp, cex, cerr));
+            CHECK(cgp.max_new_tokens == 32);
+            char z0[] = "micro-vllm";
+            char z1[] = "--n";
+            char z2[] = "0";
+            char *zv[] = {z0, z1, z2};
+            CHECK(!apply_cli_gen_flags(3, zv, cgp, cex, cerr));
+            char l0[] = "micro-vllm";
+            char l1[] = "--logprobs";
+            char l2[] = "5";
+            char *lv[] = {l0, l1, l2};
+            CHECK(apply_cli_gen_flags(3, lv, cgp, cex, cerr));
+            CHECK(cgp.logprobs == 5);
+            char nl0[] = "micro-vllm";
+            char nl1[] = "--no-logprobs";
+            char *nlv[] = {nl0, nl1};
+            CHECK(apply_cli_gen_flags(2, nlv, cgp, cex, cerr));
+            CHECK(cgp.logprobs == 0);
+            char nl2[] = "micro-vllm";
+            char nl3[] = "--no-logprobs";
+            char nl4[] = "--logprobs";
+            char nl5[] = "3";
+            char *nlw[] = {nl2, nl3, nl4, nl5};
+            CHECK(apply_cli_gen_flags(4, nlw, cgp, cex, cerr));
+            CHECK(cgp.logprobs == 3);
+            char p0[] = "micro-vllm";
+            char p1[] = "--top-logprobs";
+            char p2[] = "-1";
+            char *pv[] = {p0, p1, p2};
+            CHECK(!apply_cli_gen_flags(3, pv, cgp, cex, cerr));
+            char s0[] = "micro-vllm";
+            char s1[] = "--cache-slot";
+            char s2[] = "3";
+            char *sv[] = {s0, s1, s2};
+            CHECK(apply_cli_gen_flags(3, sv, cgp, cex, cerr));
+            CHECK(cgp.cache_slot == 3);
+            char t0[] = "micro-vllm";
+            char t1[] = "--slot";
+            char t2[] = "-1";
+            char *tv[] = {t0, t1, t2};
+            CHECK(!apply_cli_gen_flags(3, tv, cgp, cex, cerr));
+            char e0[] = "micro-vllm";
+            char e1[] = "--reasoning-effort";
+            char e2[] = "medium";
+            char *ev[] = {e0, e1, e2};
+            CHECK(apply_cli_gen_flags(3, ev, cgp, cex, cerr));
+            CHECK(cgp.reasoning_effort == "medium" && cgp.think);
+            char u0[] = "micro-vllm";
+            char u1[] = "--reasoning-effort";
+            char u2[] = "none";
+            char *uv[] = {u0, u1, u2};
+            CHECK(apply_cli_gen_flags(3, uv, cgp, cex, cerr));
+            CHECK(cgp.reasoning_effort == "none" && !cgp.think);
+            char w0[] = "micro-vllm";
+            char w1[] = "--reasoning-effort";
+            char w2[] = "max";
+            char *wv[] = {w0, w1, w2};
+            CHECK(!apply_cli_gen_flags(3, wv, cgp, cex, cerr));
+            char x0[] = "micro-vllm";
+            char x1[] = "--tool-choice";
+            char x2[] = "none";
+            char *xv[] = {x0, x1, x2};
+            CHECK(apply_cli_gen_flags(3, xv, cgp, cex, cerr));
+            CHECK(cgp.tool_choice == "none");
+            char y0[] = "micro-vllm";
+            char y1[] = "--tool-choice";
+            char y2[] = "meteo";
+            char *yv[] = {y0, y1, y2};
+            CHECK(apply_cli_gen_flags(3, yv, cgp, cex, cerr));
+            CHECK(cgp.tool_choice == "meteo");
+            char i0[] = "micro-vllm";
+            char i1[] = "--function-call";
+            char i2[] = "none";
+            char *iv[] = {i0, i1, i2};
+            CHECK(apply_cli_gen_flags(3, iv, cgp, cex, cerr));
+            CHECK(cgp.tool_choice == "none");
+            char r0[] = "micro-vllm";
+            char r1[] = "--chat";
+            char r2[] = "--raw";
+            char *rv[] = {r0, r1, r2};
+            CHECK(apply_cli_gen_flags(3, rv, cgp, cex, cerr));
+            CHECK(!cgp.apply_template);
+            char q0[] = "micro-vllm";
+            char q1[] = "--no-chat";
+            char q2[] = "--chat";
+            char *qv[] = {q0, q1, q2};
+            CHECK(apply_cli_gen_flags(3, qv, cgp, cex, cerr));
+            CHECK(cgp.apply_template);
+            std::string tdir = tmpdir();
+            write_file(tdir + "/tools.json",
+                       R"({"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]})");
+            std::string tpath = tdir + "/tools.json";
+            char f0[] = "micro-vllm";
+            char f1[] = "--tools";
+            std::vector<char> f2(tpath.begin(), tpath.end());
+            f2.push_back(0);
+            char *fv[] = {f0, f1, f2.data()};
+            CHECK(apply_cli_gen_flags(3, fv, cgp, cex, cerr));
+            CHECK(cgp.tools.size() == 1 && cgp.tools[0].name == "get_weather");
+            char nt0[] = "micro-vllm";
+            char nt1[] = "--no-tools";
+            char *ntv[] = {nt0, nt1};
+            CHECK(apply_cli_gen_flags(2, ntv, cgp, cex, cerr));
+            CHECK(cgp.tools.empty());
+            char nt2[] = "micro-vllm";
+            char nt3[] = "--no-tools";
+            char nt4[] = "--tools";
+            std::vector<char> nt5(tpath.begin(), tpath.end());
+            nt5.push_back(0);
+            char *ntw[] = {nt2, nt3, nt4, nt5.data()};
+            CHECK(apply_cli_gen_flags(4, ntw, cgp, cex, cerr));
+            CHECK(cgp.tools.size() == 1 && cgp.tools[0].name == "get_weather");
+            char g0[] = "micro-vllm";
+            char g1[] = "--tools";
+            char g2[] = "/no/such/tools.json";
+            char *gv[] = {g0, g1, g2};
+            CHECK(!apply_cli_gen_flags(3, gv, cgp, cex, cerr));
         }
         std::string done = mux_format_done(7, 3, 10, 0, 2);
         CHECK(done.find("DONE 7 STAT 3") != std::string::npos);
@@ -3528,11 +3777,36 @@ int main() {
         CHECK(hz.find("\"ok\":true") != std::string::npos);
         CHECK(hz.find("rss_gb") != std::string::npos);
         CHECK(hz.find("kv_slots") != std::string::npos);
+        CHECK(hz.find("\"jobs\"") == std::string::npos);
+        CHECK(hz.find("\"live\"") == std::string::npos);
         CHECK(hz.find("\"model\"") == std::string::npos);
+        CHECK(hz.find("\"created\":" + std::to_string(serve_created())) != std::string::npos);
+        CHECK(hz.find("\"cores\":") != std::string::npos);
+        CHECK(hz.find("\"ram_gb\":") != std::string::npos);
+        CHECK(hz.find("\"ngpu\":") != std::string::npos);
+        CHECK(hz.find("\"busy_slots\":0") != std::string::npos);
+        CHECK(hz.find("\"hist_tokens\":0") != std::string::npos);
+        CHECK(hz.find("\"free_slots\":0") != std::string::npos);
+        CHECK(hz.find("\"idle\"") == std::string::npos);
+        CHECK(hz.find("\"failed\"") == std::string::npos);
+        HwInfo hjs{};
+        hjs.cores = 8;
+        hjs.ram_total_gb = 16;
+        hjs.ram_avail_gb = 8;
+        hjs.ngpu = 0;
+        hjs.cpu = "test\"cpu";
+        CHECK(hwinfo_json(hjs) ==
+              "{\"cores\":8,\"ram_total_gb\":16.00,\"ram_avail_gb\":8.00,\"ngpu\":0,"
+              "\"vram_total_gb\":0.00,\"cpu\":\"test\\\"cpu\",\"gpu\":\"none\"}");
+        CHECK(hwinfo_line(hjs) == "HWINFO 8 16.00 8.00 0 0.00 test\"cpu|\n");
         std::string mo = openai_model_object("glm53");
-        CHECK(mo.find("\"created\":0") != std::string::npos);
+        CHECK(serve_created() >= 0);
+        CHECK(mo.find("\"created\":" + std::to_string(serve_created())) != std::string::npos);
         CHECK(mo.find("glm53") != std::string::npos);
-        CHECK(openai_models_response("glm53").find("\"created\":0") != std::string::npos);
+        CHECK(openai_model_object("glm53", 0).find("\"created\":0") != std::string::npos);
+        CHECK(openai_models_response("glm53").find("\"created\":" +
+                                                   std::to_string(serve_created())) !=
+              std::string::npos);
         {
             char v0[] = "micro-vllm";
             char v1[] = "video";
@@ -3563,6 +3837,49 @@ int main() {
         CHECK(mj.find("\"tokens_out\":384") != std::string::npos);
         CHECK(mj.find("\"kv_slots\":4") != std::string::npos);
         CHECK(mj.find("\"queue\":0") != std::string::npos);
+        CHECK(mj.find("\"created\":" + std::to_string(serve_created())) != std::string::npos);
+        CHECK(mj.find("\"busy_slots\":0") != std::string::npos);
+        CHECK(mj.find("\"hist_tokens\":0") != std::string::npos);
+        CHECK(mj.find("\"free_slots\":0") != std::string::npos);
+        CHECK(mj.find("\"failed\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 3).find("\"busy_slots\":3") !=
+              std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2).find("\"hist_tokens\":5") !=
+              std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2).find("\"free_slots\":2") !=
+              std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4).find("\"failed\":4") !=
+              std::string::npos);
+        CHECK(mj.find("\"idle\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7).find("\"idle\":7") !=
+              std::string::npos);
+        CHECK(mj.find("\"jobs\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9).find("\"jobs\":9") !=
+              std::string::npos);
+        CHECK(mj.find("\"live\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6).find("\"live\":6") !=
+              std::string::npos);
+        CHECK(mj.find("\"capacity\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8).find("\"capacity\":8") !=
+              std::string::npos);
+        CHECK(mj.find("\"admitted\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8, 11).find(
+                  "\"admitted\":11") != std::string::npos);
+        CHECK(mj.find("\"completed\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8, 11, 13).find(
+                  "\"completed\":13") != std::string::npos);
+        CHECK(mj.find("\"rejected\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8, 11, 13, 2).find(
+                  "\"rejected\":2") != std::string::npos);
+        CHECK(mj.find("\"timed_out\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8, 11, 13, 2, 4).find(
+                  "\"timed_out\":4") != std::string::npos);
+        CHECK(mj.find("\"cancelled\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8, 11, 13, 2, 4, 1).find(
+                  "\"cancelled\":1") != std::string::npos);
+        CHECK(mj.find("\"queue_timeout\":0") != std::string::npos);
+        CHECK(metrics_json(1, 2, 4, 0, 0, 0, 0, 0, 0, 5, 2, 4, 7, 9, 6, 8, 11, 13, 2, 4, 1, 300)
+                  .find("\"queue_timeout\":300") != std::string::npos);
         std::string st = mux_format_stat(2);
         CHECK(st.find("STAT 2 0.00 0.0 0.00") != std::string::npos);
         std::string td = anthropic_sse_thinking_delta("plan");
@@ -3571,6 +3888,14 @@ int main() {
         std::string ping = anthropic_sse_ping();
         CHECK(ping.find("event: ping") != std::string::npos);
         CHECK(ping.find("\"type\":\"ping\"") != std::string::npos);
+        std::string aserr = anthropic_sse_error(nullptr, "generate failed");
+        CHECK(aserr.find("event: error") != std::string::npos);
+        CHECK(aserr.find("\"type\":\"error\"") != std::string::npos);
+        CHECK(aserr.find("\"api_error\"") != std::string::npos);
+        CHECK(aserr.find("generate failed") != std::string::npos);
+        CHECK(anthropic_sse_error("", "x").find("\"api_error\"") != std::string::npos);
+        CHECK(anthropic_sse_error("overloaded_error", "busy").find("overloaded_error") !=
+              std::string::npos);
         std::string ka = openai_sse_keepalive("id1", "kimi", true, false);
         CHECK(ka.find("reasoning_content") != std::string::npos);
         CHECK(openai_sse_keepalive("id1", "kimi", true, true).find("\".\"") != std::string::npos);
@@ -3589,6 +3914,21 @@ int main() {
         std::string tail = "Hello\n<|im_end|>\n<|assistant|> </s>  ";
         trim_assistant_tail(tail);
         CHECK(tail == "Hello");
+        std::string tail2 = "Hi<|endoftext|>\n<|eom_id|>  ";
+        trim_assistant_tail(tail2);
+        CHECK(tail2 == "Hi");
+        std::string tail3 = "Yo <|end_of_text|>\n  ";
+        trim_assistant_tail(tail3);
+        CHECK(tail3 == "Yo");
+        std::string tail4 = "Ok <|end|>\n  ";
+        trim_assistant_tail(tail4);
+        CHECK(tail4 == "Ok");
+        std::string tail5 = "Go <|endofprompt|>\n  ";
+        trim_assistant_tail(tail5);
+        CHECK(tail5 == "Go");
+        std::string tail6 = "Bye <|end_of_turn|>\n  ";
+        trim_assistant_tail(tail6);
+        CHECK(tail6 == "Bye");
         std::string r, c;
         split_assistant_text(Family::Llama, "<think>plan</think>Hello<|eot_id|>\n", r, c);
         CHECK(r == "plan");
@@ -3601,6 +3941,21 @@ int main() {
         sch.snapshot(snap);
         CHECK(snap.max_queue == 4 && snap.queue_timeout_seconds == 10);
         CHECK(snap.admitted == 0 && snap.rejected == 0);
+        CHECK(snap.busy_slots == 0);
+        CHECK(snap.jobs == 0);
+        CHECK(snap.live == 0);
+        CHECK(snap.idle == 1);
+        CHECK(snap.hist_tokens == 0);
+        CHECK(snap.failed == 0);
+        CHECK(sch.failed_count() == 0);
+        CHECK(sch.live_count() == 0);
+        CHECK(sch.idle_count() == 1);
+        CHECK(sch.capacity() == 1);
+        CHECK(sch.admitted_count() == 0);
+        CHECK(sch.completed_count() == 0);
+        CHECK(sch.rejected_count() == 0);
+        CHECK(sch.timed_out_count() == 0);
+        CHECK(sch.cancelled_count() == 0);
         CHECK(queue_error_json("queue_full").find("\"code\":\"queue_full\"") != std::string::npos);
         CHECK(queue_error_json("queue_timeout").find("queue_timeout") != std::string::npos);
         CHECK(queue_wait_header(0.0123).find("x-colibri-queue-wait-ms: 12") != std::string::npos);
@@ -3856,7 +4211,12 @@ int main() {
         float ejent[2] = {1.5f, 2.f};
         CHECK(mux_format_experts_json(1, 2, em, hit, 4, ejent, 2) ==
               "{\"rows\":1,\"cols\":2,\"map\":\"0080\",\"hits\":\"01\",\"seq\":4,\"entropy\":[1.5,2]}");
-        CHECK(experts_json(nullptr) == mux_format_experts_json(0, 0, nullptr, nullptr, 0));
+        CHECK(experts_json(nullptr) ==
+              mux_format_experts_json(0, 0, nullptr, nullptr, 0, nullptr, 0, serve_created()));
+        CHECK(mux_format_experts_json(0, 0, nullptr, nullptr, 0, nullptr, 0, 9) ==
+              "{\"rows\":0,\"cols\":0,\"map\":\"\",\"hits\":\"\",\"seq\":0,\"created\":9}");
+        CHECK(mux_format_experts_json(0, 0, nullptr, nullptr, 0).find("created") ==
+              std::string::npos);
         std::string perf = mux_format_perf(9, 0.5, 0.1, 0, 0, 0, 0, 0);
         CHECK(perf.find("PERF 9 ") == 0);
         CHECK(perf.back() == '\n');
@@ -4474,6 +4834,16 @@ int main() {
         CHECK(s.size() == 1 && s.data()[0] == 1 && s.specials_added() == 0);
         s.arm(nullptr, 0, -1, nullptr, 0, false);
         CHECK(s.size() == 0);
+        CHECK(s.empty());
+        s.arm(stops, 2, 1, specials, 8, false);
+        CHECK(!s.empty());
+        s.arm(stops, 2, -1, specials, 8, true);
+        CHECK(s.empty());
+        s.arm(stops, 2, 1, specials, 8, false);
+        CHECK(!s.empty());
+        s.clear();
+        CHECK(s.empty() && s.size() == 0 && s.specials_added() == 0);
+        CHECK(!s.contains(2) && !s.contains(1));
     }
     {
         using namespace mvllm;
@@ -4505,13 +4875,17 @@ int main() {
     {
         using namespace mvllm;
         KvPrefix p;
+        CHECK(p.empty());
+        CHECK(!p.full());
         CHECK(p.alloc(16));
+        CHECK(!p.full());
         const int turn1[] = {5, 6, 7};
         const int turn2[] = {5, 6, 7, 8, 9};
         const int other[] = {5, 6, 99, 8, 9};
         CHECK(p.reuse(turn2, 5) == 0);
         p.record(turn1, 0, 3);
         CHECK(p.len() == 3);
+        CHECK(!p.empty());
         CHECK(p.reuse(turn2, 5) == 3);
         CHECK(p.reuse(other, 5) == 0);
         CHECK(p.reuse(turn1, 3) == 0);
@@ -4526,11 +4900,18 @@ int main() {
         CHECK(p.reuse(turn3, 6) == 0);
         p.clear();
         CHECK(p.len() == 0 && !p.tainted());
+        CHECK(p.empty());
+        CHECK(!p.full());
         CHECK(p.alloc(4));
         p.record(turn1, 0, 3);
+        CHECK(!p.full());
         const int spill[] = {1, 2, 3};
         p.record(spill, 3, 3);
         CHECK(p.len() == 0);
+        CHECK(!p.full());
+        CHECK(p.alloc(3));
+        p.record(turn1, 0, 3);
+        CHECK(p.full());
     }
     {
         using namespace mvllm;
@@ -4542,6 +4923,11 @@ int main() {
         CHECK(std::fabs(got - want) < 1e-12);
         CHECK(logprob_target(lo, 3, 0, &am) < got);
         CHECK(am == 0);
+        CHECK(logprob_argmax(lo, 3) == 1);
+        const float tie[] = {1.f, 1.f, 0.f};
+        CHECK(logprob_argmax(tie, 3) == 0);
+        CHECK(logprob_argmax(nullptr, 3) == -1);
+        CHECK(logprob_argmax(lo, 0) == -1);
         CHECK(model_type_is_glm("GlmForCausalLM"));
         CHECK(model_type_is_glm("foo_GLM_bar"));
         CHECK(!model_type_is_glm("llama"));
@@ -4610,12 +4996,55 @@ int main() {
         CHECK(uni_is_L('A') && uni_is_L('a'));
         CHECK(uni_to_lower('A') == 'a' && uni_to_lower(0x0410) == 0x0430);
         CHECK(uni_to_lower('a') == 'a' && uni_to_lower('0') == '0');
+        CHECK(uni_to_upper('a') == 'A' && uni_to_upper(0x0430) == 0x0410);
+        CHECK(uni_to_upper('A') == 'A' && uni_to_upper('0') == '0');
+        CHECK(uni_is_M(0x0301) && uni_is_M(0x20D0) && uni_is_M(0xFE20));
+        CHECK(!uni_is_M('A') && !uni_is_M('0') && !uni_is_M(0x4E00));
+        CHECK(uni_is_P('!') && uni_is_P(0x2014) && uni_is_P(0x3001) && uni_is_P(0xFF01));
+        CHECK(!uni_is_P('A') && !uni_is_P('0') && !uni_is_P(' ') && !uni_is_P(0x3000));
         std::string det = detokenize_response("hi\"x");
         CHECK(det.find("\"text\":\"") != std::string::npos);
         CHECK(det.find("hi") != std::string::npos);
         std::string tokj = tokenize_response({1, 2, 3});
         CHECK(tokj.find("\"count\":3") != std::string::npos);
         CHECK(tokj.find("1,2,3") != std::string::npos);
+        std::string cnt = count_response(3);
+        CHECK(cnt == "{\"count\":3}");
+        CHECK(cnt.find("tokens") == std::string::npos);
+        CHECK(count_response(0) == "{\"count\":0}");
+        CHECK(ready_json(true) ==
+              "{\"ready\":true,\"created\":" + std::to_string(serve_created()) + "}");
+        CHECK(ready_json(false) ==
+              "{\"ready\":false,\"created\":" + std::to_string(serve_created()) + "}");
+        CHECK(version_json().find("\"name\":\"micro-vllm\"") != std::string::npos);
+        CHECK(version_json().find("\"engine\":\"host\"") != std::string::npos);
+        CHECK(version_json().find("\"created\":" + std::to_string(serve_created())) !=
+              std::string::npos);
+        CHECK(mux_format_accept(9, 4) == "ACCEPT 9 4\n");
+        CHECK(mux_format_error(3, "EMPTY_PROMPT") == "ERROR 3 EMPTY_PROMPT\n");
+        CHECK(mux_format_error(1, nullptr) == "ERROR 1 BAD_FRAME\n");
+        CHECK(mux_format_error(1, "") == "ERROR 1 BAD_FRAME\n");
+        std::string ctok = anthropic_count_tokens_response(7);
+        CHECK(ctok.find("\"type\":\"message_count_tokens_response\"") != std::string::npos);
+        CHECK(ctok.find("\"input_tokens\":7") != std::string::npos);
+        CHECK(anthropic_count_tokens_response(-3).find("\"input_tokens\":0") != std::string::npos);
+        {
+            LegacyCommand lc;
+            std::string lerr;
+            CHECK(legacy_parse_line("\x02RESET", lc, lerr) && lc.kind == LegacyCmd::Reset);
+            CHECK(legacy_parse_line("\x02MORE", lc, lerr) && lc.kind == LegacyCmd::More);
+            CHECK(legacy_parse_line("\x02PROMPT 4 16 0.7 0.9 2", lc, lerr));
+            CHECK(lc.kind == LegacyCmd::Prompt && lc.payload_bytes == 4 && lc.max_tokens == 16);
+            CHECK_NEAR(lc.temperature, 0.7f, 1e-6);
+            CHECK_NEAR(lc.top_p, 0.9f, 1e-6);
+            CHECK(lc.have_slot && lc.slot == 2);
+            CHECK(legacy_parse_line("hello", lc, lerr) && lc.kind == LegacyCmd::Line);
+            CHECK(!legacy_parse_line("", lc, lerr) && lerr == "empty");
+            CHECK(!legacy_parse_line("\x02PROMPT 4 0 0.7 0.9", lc, lerr) && lerr == "bad prompt");
+            CHECK(legacy_format_ready() == "\x01\x01READY\x01\x01\n");
+            CHECK(legacy_format_end() == "\x01\x01END\x01\x01\n");
+            CHECK(legacy_format_stat(3, 1.5, 50.0, 1.25) == "STAT 3 1.50 50.0 1.25\n");
+        }
         std::string ping = anthropic_sse_ping();
         CHECK(ping.find("event: ping") != std::string::npos);
         CHECK(ping.find("\"type\":\"ping\"") != std::string::npos);
@@ -4654,6 +5083,20 @@ int main() {
         CHECK(!mux_apply_extra_json("{\"stop_ids\":1}", gp, merr));
         CHECK(!mux_apply_extra_json("{\"eos_only\":1}", gp, merr));
         CHECK(mux_apply_extra_json("{\"stop_ids\":[]}", gp, merr) && gp.stop_ids.empty());
+        CHECK(mux_apply_extra_json("{\"tool_choice\":\"none\"}", gp, merr));
+        CHECK(gp.tool_choice == "none");
+        CHECK(mux_apply_extra_json("{\"function_call\":\"auto\",\"tool_choice\":\"required\"}",
+                                  gp, merr));
+        CHECK(gp.tool_choice == "required");
+        CHECK(!mux_apply_extra_json("{\"tool_choice\":\"\"}", gp, merr));
+        CHECK(!mux_apply_extra_json("{\"function_call\":1}", gp, merr));
+        CHECK(mux_apply_extra_json("{\"reasoning_effort\":\"high\"}", gp, merr));
+        CHECK(gp.reasoning_effort == "high" && gp.think);
+        CHECK(mux_apply_extra_json(
+            "{\"reasoning-effort\":\"high\",\"reasoning_effort\":\"none\"}", gp, merr));
+        CHECK(gp.reasoning_effort == "none" && !gp.think);
+        CHECK(!mux_apply_extra_json("{\"reasoning_effort\":\"max\"}", gp, merr));
+        CHECK(!mux_apply_extra_json("{\"reasoning_effort\":1}", gp, merr));
         ModelConfig cfg;
         cfg.eos = 1;
         GenParams sp;
@@ -4866,6 +5309,18 @@ int main() {
         CHECK(cgp.persist_ver == 3);
         CHECK(cgp.stop_ids.size() == 1 && cgp.stop_ids[0] == 9);
         CHECK(cgp.eos_only && cgp.prefix_bytes == 6);
+        char e0[] = "micro-vllm";
+        char e1[] = "--eos-only";
+        char e2[] = "--no-eos-only";
+        char *ev[] = {e0, e1, e2};
+        CHECK(apply_cli_gen_flags(3, ev, cgp, cex, cerr));
+        CHECK(!cgp.eos_only);
+        char e3[] = "micro-vllm";
+        char e4[] = "--no-eos-only";
+        char e5[] = "--eos-only";
+        char *ew[] = {e3, e4, e5};
+        CHECK(apply_cli_gen_flags(3, ew, cgp, cex, cerr));
+        CHECK(cgp.eos_only);
         char b0[] = "x";
         char b1[] = "--persist-ver";
         char b2[] = "9";

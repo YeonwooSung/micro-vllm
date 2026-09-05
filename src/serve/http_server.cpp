@@ -784,6 +784,7 @@ std::string health_json(Engine *engine) {
             kv = 1;
         q = engine->scheduler().queue_depth();
     }
+    const HwInfo hw = hw_probe();
     std::ostringstream os;
     os << "{\"ok\":true,\"kv_slots\":" << kv << ",\"queue\":" << q;
     if (engine) {
@@ -802,26 +803,43 @@ std::string health_json(Engine *engine) {
            << static_cast<unsigned long long>(snap.completed) << ",\"rejected\":"
            << static_cast<unsigned long long>(snap.rejected) << ",\"timed_out\":"
            << static_cast<unsigned long long>(snap.timed_out) << ",\"cancelled\":"
-           << static_cast<unsigned long long>(snap.cancelled) << '}';
+           << static_cast<unsigned long long>(snap.cancelled) << ",\"jobs\":" << snap.jobs
+           << ",\"live\":" << snap.live << ",\"idle\":" << snap.idle << ",\"failed\":"
+           << static_cast<unsigned long long>(snap.failed) << '}';
     }
-    os << ",\"rss_gb\":" << rss_gb() << "}";
+    os << ",\"busy_slots\":" << (engine ? engine->sessions().busy_count() : 0)
+       << ",\"hist_tokens\":" << (engine ? engine->sessions().history_total() : 0)
+       << ",\"free_slots\":" << (engine ? engine->sessions().free_count() : 0)
+       << ",\"rss_gb\":" << rss_gb() << ",\"created\":" << serve_created()
+       << ",\"cores\":" << hw.cores << ",\"ram_gb\":" << hw.ram_total_gb
+       << ",\"ngpu\":" << hw.ngpu << "}";
     return os.str();
+}
+
+std::string ready_json(bool ready) {
+    return ready ? "{\"ready\":true,\"created\":" + std::to_string(serve_created()) + "}"
+                 : "{\"ready\":false,\"created\":" + std::to_string(serve_created()) + "}";
+}
+
+std::string version_json() {
+    return "{\"name\":\"micro-vllm\",\"engine\":\"host\",\"created\":" +
+           std::to_string(serve_created()) + "}";
 }
 
 std::string experts_json(Engine *engine, bool authed) {
     if (!engine || !authed)
-        return mux_format_experts_json(0, 0, nullptr, nullptr, 0);
+        return mux_format_experts_json(0, 0, nullptr, nullptr, 0, nullptr, 0, serve_created());
     RouteTelem rt;
     engine->route_telem(rt, false);
     return mux_format_experts_json(rt.rows, rt.cols, rt.emap.empty() ? nullptr : rt.emap.data(),
                                   rt.hits.empty() ? nullptr : rt.hits.data(), engine->hits_seq(),
                                   rt.entropy.empty() ? nullptr : rt.entropy.data(),
-                                  static_cast<int>(rt.entropy.size()));
+                                  static_cast<int>(rt.entropy.size()), serve_created());
 }
 
 std::string profile_json(Engine *engine, bool authed) {
     if (!engine || !authed)
-        return "{\"seq\":0,\"turns\":[]}";
+        return "{\"seq\":0,\"turns\":[],\"created\":" + std::to_string(serve_created()) + "}";
     std::vector<ProfileTurn> turns;
     engine->profile_turns(turns);
     std::ostringstream os;
@@ -850,13 +868,14 @@ std::string profile_json(Engine *engine, bool authed) {
         append_f(t.lm_head_s);
         os << ",\"forwards\":" << static_cast<unsigned long long>(t.forwards) << '}';
     }
-    os << "]}";
+    os << "],\"created\":" << serve_created() << '}';
     return os.str();
 }
 
 std::string colibri_json(Engine *engine) {
     if (!engine)
-        return "{\"stats\":{},\"perf\":{},\"topk\":[],\"entropy\":[],\"gpus\":[],\"repin\":[]}";
+        return "{\"stats\":{},\"perf\":{},\"topk\":[],\"entropy\":[],\"gpus\":[],\"repin\":[],\"created\":" +
+               std::to_string(serve_created()) + "}";
     std::ostringstream os;
     os << "{\"stats\":{\"hits_seq\":" << engine->hits_seq()
        << ",\"profile_seq\":" << engine->profile_seq() << "},\"perf\":";
@@ -905,7 +924,7 @@ std::string colibri_json(Engine *engine) {
         os << "{\"layer\":" << ev[i].layer << ",\"eid\":" << ev[i].eid
            << ",\"old_tier\":" << ev[i].old_tier << ",\"gpu\":" << ev[i].gpu << '}';
     }
-    os << "]}";
+    os << "],\"created\":" << serve_created() << '}';
     return os.str();
 }
 
@@ -919,18 +938,38 @@ std::string with_colibri(const std::string &body, Engine *engine) {
     return body.substr(0, body.size() - 1) + ",\"colibri\":" + colibri_json(engine) + "}";
 }
 
-std::string openai_model_object(const std::string &id) {
-    return "{\"id\":\"" + json_escape(id) +
-           "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"micro-vllm\"}";
+int64_t serve_created() {
+    static const int64_t t = [] {
+        const std::time_t now = std::time(nullptr);
+        return now < 0 ? int64_t{0} : static_cast<int64_t>(now);
+    }();
+    return t;
+}
+
+std::string openai_model_object(const std::string &id, int64_t created) {
+    if (created < 0)
+        created = serve_created();
+    return "{\"id\":\"" + json_escape(id) + "\",\"object\":\"model\",\"created\":" +
+           std::to_string(created) + ",\"owned_by\":\"micro-vllm\"}";
 }
 
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
-                         int running, int queued, int max_queue, double rss_gb) {
+                         int running, int queued, int max_queue, double rss_gb, int busy_slots,
+                         int hist_tokens, int free_slots, uint64_t failed, int idle, int jobs,
+                         int live, int capacity, uint64_t admitted, uint64_t completed,
+                         uint64_t rejected, uint64_t timed_out, uint64_t cancelled,
+                         int queue_timeout) {
     std::ostringstream os;
     os << "{\"requests\":" << requests << ",\"tokens_out\":" << tokens_out
        << ",\"kv_slots\":" << kv_slots << ",\"queue\":" << queue << ",\"running\":" << running
        << ",\"queued\":" << queued << ",\"max_queue\":" << max_queue << ",\"rss_gb\":" << rss_gb
-       << "}";
+       << ",\"created\":" << serve_created() << ",\"busy_slots\":" << busy_slots
+       << ",\"hist_tokens\":" << hist_tokens << ",\"free_slots\":" << free_slots
+       << ",\"failed\":" << failed << ",\"idle\":" << idle << ",\"jobs\":" << jobs
+       << ",\"live\":" << live << ",\"capacity\":" << capacity << ",\"admitted\":" << admitted
+       << ",\"completed\":" << completed << ",\"rejected\":" << rejected
+       << ",\"timed_out\":" << timed_out << ",\"cancelled\":" << cancelled
+       << ",\"queue_timeout\":" << queue_timeout << "}";
     return os.str();
 }
 
@@ -948,6 +987,12 @@ std::string tokenize_response(const std::vector<int> &ids) {
 
 std::string detokenize_response(const std::string &text) {
     return std::string("{\"text\":\"") + json_escape(text) + "\"}";
+}
+
+std::string count_response(size_t n) {
+    std::ostringstream os;
+    os << "{\"count\":" << n << "}";
+    return os.str();
 }
 
 HttpServer::HttpServer() = default;
@@ -1122,8 +1167,9 @@ void HttpServer::handle_client(int cfd) {
 
         const bool v1 = path.size() >= 4 && path.compare(0, 4, "/v1/") == 0;
         if (method == "OPTIONS" &&
-            (path == "/health" || path == "/experts" || path == "/profile" || path == "/metrics" ||
-             path == "/tokenize" || path == "/detokenize" || v1)) {
+            (path == "/health" || path == "/ready" || path == "/version" || path == "/experts" ||
+             path == "/profile" || path == "/metrics" || path == "/tokenize" ||
+             path == "/detokenize" || path == "/count" || v1)) {
             http_options(cfd);
             ::close(cfd);
             return;
@@ -1137,6 +1183,13 @@ void HttpServer::handle_client(int cfd) {
 
         if (method == "GET" && path == "/health") {
             http_reply(cfd, 200, "OK", health_json(engine_), request_id);
+        } else if (method == "GET" && (path == "/ready" || path == "/v1/ready")) {
+            if (engine_)
+                http_reply(cfd, 200, "OK", ready_json(true), request_id);
+            else
+                http_reply(cfd, 503, "Service Unavailable", ready_json(false), request_id);
+        } else if (method == "GET" && (path == "/version" || path == "/v1/version")) {
+            http_reply(cfd, 200, "OK", version_json(), request_id);
         } else if (method == "GET" && path == "/experts") {
             http_reply(cfd, 200, "OK", experts_json(engine_, api_key_ok(authorization, x_api_key)),
                        request_id);
@@ -1156,6 +1209,17 @@ void HttpServer::handle_client(int cfd) {
             int running = 0;
             int queued = 0;
             int max_queue = 0;
+            uint64_t failed = 0;
+            int idle = 0;
+            int jobs = 0;
+            int live = 0;
+            int capacity = 0;
+            uint64_t admitted = 0;
+            uint64_t completed = 0;
+            uint64_t rejected = 0;
+            uint64_t timed_out = 0;
+            uint64_t cancelled = 0;
+            int queue_timeout = 0;
             if (engine_) {
                 kv = engine_->runtime().kv_slots;
                 if (kv < 1)
@@ -1164,10 +1228,27 @@ void HttpServer::handle_client(int cfd) {
                 running = engine_->scheduler().running_count();
                 queued = engine_->scheduler().queued_count();
                 max_queue = engine_->scheduler().max_queue();
+                SchedulerSnapshot snap{};
+                engine_->scheduler().snapshot(snap);
+                failed = snap.failed;
+                idle = snap.idle;
+                jobs = snap.jobs;
+                live = snap.live;
+                capacity = snap.capacity;
+                admitted = snap.admitted;
+                completed = snap.completed;
+                rejected = snap.rejected;
+                timed_out = snap.timed_out;
+                cancelled = snap.cancelled;
+                queue_timeout = snap.queue_timeout_seconds;
             }
             http_reply(cfd, 200, "OK",
                        metrics_json(requests, tokens_out, kv, q, running, queued, max_queue,
-                                    rss_gb()),
+                                    rss_gb(), engine_ ? engine_->sessions().busy_count() : 0,
+                                    engine_ ? engine_->sessions().history_total() : 0,
+                                    engine_ ? engine_->sessions().free_count() : 0, failed, idle,
+                                    jobs, live, capacity, admitted, completed, rejected, timed_out,
+                                    cancelled, queue_timeout),
                        request_id);
         } else if (method == "GET" && path == "/v1/models") {
             http_reply(cfd, 200, "OK", openai_models_response(model_name(engine_)), request_id);
@@ -1221,6 +1302,49 @@ void HttpServer::handle_client(int cfd) {
                 return;
             }
             http_reply(cfd, 200, "OK", tokenize_response(ids), request_id);
+        } else if (method == "POST" && (path == "/count" || path == "/v1/count")) {
+            if (!engine_) {
+                http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",
+                           request_id);
+                ::close(cfd);
+                return;
+            }
+            std::string prompt;
+            std::vector<ChatMessage> msgs;
+            extract_json_string(body, "prompt", prompt);
+            extract_chat_messages(body, msgs);
+            if (prompt.empty() && msgs.empty()) {
+                http_reply(cfd, 400, "Bad Request",
+                           "{\"error\":\"prompt or messages required\"}", request_id);
+                ::close(cfd);
+                return;
+            }
+            GenParams gp;
+            extract_json_string(body, "reasoning_effort", gp.reasoning_effort);
+            bool enable_thinking = false;
+            if (!msgs.empty() && engine_->family() == Family::Glm53)
+                enable_thinking = true;
+            bool parsed_think = false;
+            if (extract_json_bool(body, "enable_thinking", enable_thinking))
+                parsed_think = true;
+            if (gp.reasoning_effort == "none")
+                enable_thinking = false;
+            else if (!parsed_think && !gp.reasoning_effort.empty() &&
+                     gp.reasoning_effort != "none")
+                enable_thinking = true;
+            gp.think = enable_thinking;
+            if (gp.tools.empty())
+                k3_extract_tools_json(body, gp.tools);
+            std::vector<int> ids;
+            std::string gerr;
+            const bool chat = !msgs.empty();
+            if (!tokenize_request(engine_, msgs, prompt, chat, gp, ids, gerr)) {
+                http_reply(cfd, 400, "Bad Request",
+                           "{\"error\":\"" + json_escape(gerr) + "\"}", request_id);
+                ::close(cfd);
+                return;
+            }
+            http_reply(cfd, 200, "OK", count_response(ids.size()), request_id);
         } else if (method == "POST" && (path == "/detokenize" || path == "/v1/detokenize")) {
             if (!engine_) {
                 http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",
@@ -1236,6 +1360,33 @@ void HttpServer::handle_client(int cfd) {
                 return;
             }
             http_reply(cfd, 200, "OK", detokenize_response(detokenize_ids(engine_, ids)),
+                       request_id);
+        } else if (method == "POST" && path == "/v1/messages/count_tokens") {
+            if (!engine_) {
+                http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",
+                           request_id);
+                ::close(cfd);
+                return;
+            }
+            std::vector<ChatMessage> msgs;
+            GenParams gp;
+            std::string err;
+            if (!anthropic_to_chat(body, msgs, gp, err)) {
+                http_reply(cfd, 400, "Bad Request",
+                           "{\"error\":\"" + json_escape(err) + "\"}", request_id);
+                ::close(cfd);
+                return;
+            }
+            std::vector<int> ids;
+            std::string gerr;
+            if (!tokenize_request(engine_, msgs, /*prompt*/ "", /*chat*/ !msgs.empty(), gp, ids,
+                                  gerr)) {
+                http_reply(cfd, 400, "Bad Request",
+                           "{\"error\":\"" + json_escape(gerr) + "\"}", request_id);
+                ::close(cfd);
+                return;
+            }
+            http_reply(cfd, 200, "OK", anthropic_count_tokens_response((int)ids.size()),
                        request_id);
         } else if (method == "POST" && path == "/v1/messages") {
             if (!engine_) {

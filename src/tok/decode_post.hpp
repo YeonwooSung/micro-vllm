@@ -22,7 +22,7 @@ bool trim_stop(std::string &text, const std::vector<std::string> &stops);
 void split_assistant_text(Family family, const std::string &text, std::string &reasoning,
                           std::string &content);
 
-// Strip trailing whitespace and leftover chat/eom tags from generated text.
+// Strip trailing whitespace and leftover chat/eom tags (incl. <|endoftext|>, <|end_of_text|>, <|end|>, <|endofprompt|>, <|end_of_turn|>, <|eom_id|>).
 void trim_assistant_tail(std::string &text);
 
 } // namespace mvllm

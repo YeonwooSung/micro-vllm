@@ -172,10 +172,43 @@ double rss_gb() {
 #endif
 }
 
+std::string hwinfo_line(const HwInfo &info) {
+    return mux_format_hwinfo(info.cores, info.ram_total_gb, info.ram_avail_gb, info.ngpu,
+                             info.vram_total_gb, info.cpu, info.gpu);
+}
+
 std::string hwinfo_line() {
     HwInfo h = hw_probe();
-    return mux_format_hwinfo(h.cores, h.ram_total_gb, h.ram_avail_gb, h.ngpu,
-                             h.vram_total_gb, h.cpu, h.gpu);
+    return hwinfo_line(h);
+}
+
+std::string hwinfo_json() { return hwinfo_json(hw_probe()); }
+
+std::string hwinfo_json(const HwInfo &info) {
+    auto esc = [](const std::string &s) {
+        std::string o;
+        o.reserve(s.size() + 4);
+        for (char c : s) {
+            if (c == '"' || c == '\\')
+                o.push_back('\\');
+            o.push_back(c);
+        }
+        return o;
+    };
+    char head[160];
+    std::snprintf(head, sizeof(head),
+                  "{\"cores\":%d,\"ram_total_gb\":%.2f,\"ram_avail_gb\":%.2f,\"ngpu\":%d,"
+                  "\"vram_total_gb\":%.2f,\"cpu\":\"",
+                  info.cores, info.ram_total_gb, info.ram_avail_gb, info.ngpu, info.vram_total_gb);
+    std::string out = head;
+    out.append(esc(info.cpu));
+    out.append("\",\"gpu\":\"");
+    if (info.gpu.empty())
+        out.append("none");
+    else
+        out.append(esc(info.gpu));
+    out.append("\"}");
+    return out;
 }
 
 } // namespace mvllm

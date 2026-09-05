@@ -20,6 +20,10 @@ bool anthropic_to_chat(const std::string &body, std::vector<ChatMessage> &msgs, 
 std::string anthropic_messages_response(const std::string &id, const std::string &model,
                                         const GenResult &out);
 
+// POST /v1/messages/count_tokens body. Compact JSON
+// {"type":"message_count_tokens_response","input_tokens":N}
+std::string anthropic_count_tokens_response(int input_tokens);
+
 // SSE event stream for Anthropic messages.
 std::string anthropic_sse_start(const std::string &id, const std::string &model);
 std::string anthropic_sse_delta(const std::string &text, int index = 0);
@@ -29,6 +33,8 @@ std::string anthropic_sse_block_start(int index = 0, const char *block_type = "t
 std::string anthropic_sse_block_stop(int index = 0);
 std::string anthropic_sse_thinking_delta(const std::string &text);
 std::string anthropic_sse_ping();
+// SSE error event. type null/empty → "api_error". message is JSON-escaped via existing json helpers.
+std::string anthropic_sse_error(const char *type, const std::string &message);
 
 // Full POST /v1/messages handler (writes HTTP response on fd).
 void handle_anthropic_messages(int fd, const std::string &body, Engine *engine);

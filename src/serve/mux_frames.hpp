@@ -16,6 +16,11 @@ std::string mux_hex_encode(const void *data, size_t n);
 std::string mux_format_tool(uint64_t id, const void *data, size_t n);
 // DATA <id> <nbytes>\n<payload>\n
 std::string mux_format_data(uint64_t id, const void *data, size_t n);
+// ACCEPT <id> <prompt_tokens>\n
+std::string mux_format_accept(uint64_t id, int prompt_tokens);
+// ERROR <id> <code>\n   — official codes: BAD_FRAME BAD_REQUEST SLOT_BUSY
+// DUPLICATE_ID EMPTY_PROMPT NOT_FOUND CANCELLED
+std::string mux_format_error(uint64_t id, const char *code);
 // TOPK <id> <k> <logprob> <hextext> ... ×k\n  (hextext = lowercase UTF-8 hex)
 std::string mux_format_topk(uint64_t id, const float *logprobs, const std::string *texts, int k);
 
@@ -41,8 +46,10 @@ void mux_hits_pack(int rows, int cols, const uint8_t *hit, std::vector<uint8_t> 
 std::string mux_hits_hex(int rows, int cols, const uint8_t *hit);
 // Compact JSON. No spaces. entropy uses %.6g via snprintf (same as mux_format_entropy).
 // rows/cols <0 → 0. emap==null → map "". hits==null → hits "".
+// created >= 0 appends ,"created":N; created < 0 omits the field.
 std::string mux_format_experts_json(int rows, int cols, const uint8_t *emap, const uint8_t *hits,
-                                    int seq, const float *entropy = nullptr, int n_entropy = 0);
+                                    int seq, const float *entropy = nullptr, int n_entropy = 0,
+                                    int64_t created = -1);
 
 // PERF id dt t_edisk t_ewait t_emm t_attn t_kvb t_head  (seconds)
 std::string mux_format_perf(uint64_t id, double dt, double t_edisk, double t_ewait, double t_emm,

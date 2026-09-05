@@ -96,6 +96,11 @@ void SessionStore::configure(int n_slots) {
     busy_.assign(static_cast<size_t>(n_), 0);
 }
 
+bool SessionStore::valid_slot(int slot) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return slot >= 0 && slot < n_;
+}
+
 int SessionStore::assign(const std::vector<ChatMessage> &msgs, int explicit_slot) const {
     int n = 0;
     {
@@ -120,6 +125,33 @@ const std::vector<int> &SessionStore::history(int slot) const {
     return hist_[static_cast<size_t>(slot)];
 }
 
+int SessionStore::history_len(int slot) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (slot < 0 || slot >= n_ || static_cast<size_t>(slot) >= hist_.size())
+        return 0;
+    return static_cast<int>(hist_[static_cast<size_t>(slot)].size());
+}
+
+int SessionStore::history_total() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return 0;
+    int total = 0;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < hist_.size())
+            total += static_cast<int>(hist_[idx].size());
+    }
+    return total;
+}
+
+bool SessionStore::has_history(int slot) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (slot < 0 || slot >= n_ || static_cast<size_t>(slot) >= hist_.size())
+        return false;
+    return !hist_[static_cast<size_t>(slot)].empty();
+}
+
 void SessionStore::commit(int slot, const std::vector<int> &ids) {
     std::lock_guard<std::mutex> lock(mu_);
     if (slot < 0 || slot >= n_ || static_cast<size_t>(slot) >= hist_.size())
@@ -137,11 +169,179 @@ void SessionStore::reset(int slot) {
         busy_[static_cast<size_t>(slot)] = 0;
 }
 
+void SessionStore::reset_all() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < hist_.size())
+            hist_[idx].clear();
+        if (idx < busy_.size())
+            busy_[idx] = 0;
+    }
+}
+
 bool SessionStore::busy(int slot) const {
     std::lock_guard<std::mutex> lock(mu_);
     if (slot < 0 || slot >= n_ || static_cast<size_t>(slot) >= busy_.size())
         return true;
     return busy_[static_cast<size_t>(slot)] != 0;
+}
+
+int SessionStore::busy_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return 0;
+    int count = 0;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size() && busy_[idx] != 0)
+            ++count;
+    }
+    return count;
+}
+
+bool SessionStore::all_free() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return true;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size() && busy_[idx] != 0)
+            return false;
+    }
+    return true;
+}
+
+bool SessionStore::all_busy() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return false;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx >= busy_.size() || busy_[idx] == 0)
+            return false;
+    }
+    return true;
+}
+
+bool SessionStore::any_busy() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return false;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size() && busy_[idx] != 0)
+            return true;
+    }
+    return false;
+}
+
+bool SessionStore::any_free() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return false;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx >= busy_.size() || busy_[idx] == 0)
+            return true;
+    }
+    return false;
+}
+
+int SessionStore::free_count() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return 0;
+    int busy = 0;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size() && busy_[idx] != 0)
+            ++busy;
+    }
+    const int free = n_ - busy;
+    return free < 0 ? 0 : free;
+}
+
+int SessionStore::first_free() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return -1;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx >= busy_.size() || busy_[idx] == 0)
+            return i;
+    }
+    return -1;
+}
+
+int SessionStore::last_free() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return -1;
+    for (int i = n_ - 1; i >= 0; --i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx >= busy_.size() || busy_[idx] == 0)
+            return i;
+    }
+    return -1;
+}
+
+int SessionStore::first_busy() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return -1;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size() && busy_[idx] != 0)
+            return i;
+    }
+    return -1;
+}
+
+int SessionStore::last_busy() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return -1;
+    for (int i = n_ - 1; i >= 0; --i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size() && busy_[idx] != 0)
+            return i;
+    }
+    return -1;
+}
+
+int SessionStore::try_acquire_any() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return -1;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx >= busy_.size())
+            continue;
+        if (busy_[idx] == 0) {
+            busy_[idx] = 1;
+            return i;
+        }
+    }
+    return -1;
+}
+
+int SessionStore::try_acquire_last() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return -1;
+    for (int i = n_ - 1; i >= 0; --i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx >= busy_.size())
+            continue;
+        if (busy_[idx] == 0) {
+            busy_[idx] = 1;
+            return i;
+        }
+    }
+    return -1;
 }
 
 bool SessionStore::try_acquire(int slot) {
@@ -159,6 +359,17 @@ void SessionStore::release(int slot) {
     if (slot < 0 || slot >= n_ || static_cast<size_t>(slot) >= busy_.size())
         return;
     busy_[static_cast<size_t>(slot)] = 0;
+}
+
+void SessionStore::release_all() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (n_ == 0)
+        return;
+    for (int i = 0; i < n_; ++i) {
+        const size_t idx = static_cast<size_t>(i);
+        if (idx < busy_.size())
+            busy_[idx] = 0;
+    }
 }
 
 } // namespace mvllm

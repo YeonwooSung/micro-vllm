@@ -78,6 +78,7 @@ set(MVLLM_HOST_SOURCES
     src/serve/mux_frames.cpp
     src/serve/mux_codec.cpp
     src/serve/mux_submit.cpp
+    src/serve/legacy_stdio.cpp
     src/serve/hwinfo.cpp
     src/serve/cli_flags.cpp
     src/serve/anthropic.cpp

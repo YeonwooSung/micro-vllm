@@ -41,13 +41,17 @@ Live dump smoke is header walk + one expert/`rope.inv_freq` pread; it does not
 OpenAI-compatible:
 
 - `GET  /health`
+- `GET  /ready` / `/v1/ready`
+- `GET  /version` / `/v1/version`
 - `GET  /metrics`
 - `POST /tokenize` / `/v1/tokenize`
 - `POST /detokenize` / `/v1/detokenize`
+- `POST /count` / `/v1/count`
 - `GET  /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`         (echo)
 - `POST /v1/messages`            (Anthropic; `x-api-key` or Bearer)
+- `POST /v1/messages/count_tokens`
 - `POST /v1/videos/generations`  (H3)
 
 ## Families

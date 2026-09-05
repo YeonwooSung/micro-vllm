@@ -32,9 +32,15 @@ struct SchedulerSnapshot {
     int active = 0;      // running_count
     int queued = 0;      // queued_count
     int capacity = 1;    // 1 if no sessions else sessions n_slots
+    int busy_slots = 0;  // SessionStore::busy_count; 0 if unbound
+    int idle = 0;        // max(0, capacity - busy_slots)
+    int hist_tokens = 0; // SessionStore::history_total; 0 if unbound
+    int jobs = 0;        // jobs_.size(), including terminal
+    int live = 0;        // non-terminal jobs (active + queued)
     int max_queue = 8;
     int queue_timeout_seconds = 300;
     uint64_t admitted = 0, completed = 0, rejected = 0, timed_out = 0, cancelled = 0;
+    uint64_t failed = 0; // rejected + timed_out + cancelled
 };
 
 // Prefill is serial; decode is round-robin across active slots (official mux:
@@ -59,8 +65,17 @@ public:
     int queued_count() const;  // Queued only
     int max_queue() const;
     int n_jobs() const;        // jobs_.size(), including terminal
+    int live_count() const; // non-terminal jobs (active + queued)
     double job_wait_s(uint64_t id) const; // 0 if unknown
     int queue_timeout_s() const;
+    uint64_t failed_count() const; // rejected + timed_out + cancelled
+    uint64_t admitted_count() const; // snapshot.admitted
+    uint64_t completed_count() const; // snapshot.completed
+    uint64_t rejected_count() const; // snapshot.rejected
+    uint64_t timed_out_count() const; // snapshot.timed_out
+    uint64_t cancelled_count() const; // snapshot.cancelled
+    int idle_count() const; // max(0, capacity - busy_slots)
+    int capacity() const; // sessions n_slots, or 1 if unbound / n_slots < 1
     void snapshot(SchedulerSnapshot &out) const;
 
 private:

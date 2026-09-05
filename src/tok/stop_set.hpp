@@ -13,6 +13,8 @@ public:
              bool eos_only);
     bool contains(int token) const;
     int size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    void clear() { n_ = 0; nsp_ = 0; }
     const int *data() const { return ids_; } // first size() ids
     int specials_added() const { return nsp_; } // how many came from the special set
 

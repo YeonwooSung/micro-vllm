@@ -2,6 +2,7 @@
 
 #include "../io/image.hpp"
 #include "../tok/json_schema.hpp"
+#include "../tok/k3_tools.hpp"
 
 #include <cerrno>
 #include <cmath>
@@ -170,6 +171,27 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
                 gp.grammar = json_object_gbnf();
             continue;
         }
+        if (eq(a, "--no-json") || eq(a, "--no-grammar")) {
+            gp.grammar.clear();
+            continue;
+        }
+        if (eq(a, "--max-tokens") || eq(a, "--max-new-tokens") || eq(a, "--n") || eq(a, "-n")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = std::string("bad ") + a;
+                return false;
+            }
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, a, err))
+                return false;
+            if (n <= 0) {
+                err = std::string("bad ") + a + ": " + v;
+                return false;
+            }
+            gp.max_new_tokens = n;
+            continue;
+        }
         if (eq(a, "--top-k")) {
             const char *v = next_val(argc, argv, i);
             if (!v)
@@ -179,6 +201,27 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
             if (!parse_int(v, n, "--top-k", err))
                 return false;
             gp.top_k = n < 0 ? 0 : n;
+            continue;
+        }
+        if (eq(a, "--logprobs") || eq(a, "--top-logprobs")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = std::string("bad ") + a;
+                return false;
+            }
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, a, err))
+                return false;
+            if (n < 0) {
+                err = std::string("bad ") + a + ": " + v;
+                return false;
+            }
+            gp.logprobs = n;
+            continue;
+        }
+        if (eq(a, "--no-logprobs")) {
+            gp.logprobs = 0;
             continue;
         }
         if (eq(a, "--min-p")) {
@@ -253,6 +296,26 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
                 return false;
             continue;
         }
+        if (eq(a, "--logit-bias") || eq(a, "--logit_bias")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = std::string("bad ") + a;
+                return false;
+            }
+            ++i;
+            const char *colon = std::strchr(v, ':');
+            if (!colon || colon == v || colon[1] == '\0') {
+                err = std::string("bad ") + a + ": " + v;
+                return false;
+            }
+            const std::string id_s(v, static_cast<size_t>(colon - v));
+            int id = 0;
+            float delta = 0.f;
+            if (!parse_int(id_s.c_str(), id, a, err) || !parse_float(colon + 1, delta, a, err))
+                return false;
+            gp.logit_bias.push_back({id, delta});
+            continue;
+        }
         if (eq(a, "--think")) {
             gp.think = true;
             continue;
@@ -261,8 +324,65 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
             gp.think = false;
             continue;
         }
+        if (eq(a, "--reasoning-effort") || eq(a, "--reasoning_effort")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = std::string("bad ") + a;
+                return false;
+            }
+            ++i;
+            if (!eq(v, "none") && !eq(v, "low") && !eq(v, "medium") && !eq(v, "high")) {
+                err = std::string("bad ") + a + ": " + v;
+                return false;
+            }
+            gp.reasoning_effort = v;
+            gp.think = !eq(v, "none");
+            continue;
+        }
+        if (eq(a, "--tool-choice") || eq(a, "--tool_choice") || eq(a, "--function-call") ||
+            eq(a, "--function_call")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = std::string("bad ") + a;
+                return false;
+            }
+            ++i;
+            if (!*v) {
+                err = std::string("bad ") + a + ": ";
+                return false;
+            }
+            gp.tool_choice = v;
+            continue;
+        }
+        if (eq(a, "--tools")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = "bad --tools";
+                return false;
+            }
+            ++i;
+            std::string text;
+            if (!read_whole_file(v, text, err, "tools"))
+                return false;
+            if (!k3_extract_tools_json(text, gp.tools) || gp.tools.empty()) {
+                const std::string wrapped = std::string("{\"tools\":") + text + "}";
+                if (!k3_extract_tools_json(wrapped, gp.tools) || gp.tools.empty()) {
+                    err = std::string("bad --tools: ") + v;
+                    return false;
+                }
+            }
+            continue;
+        }
+        if (eq(a, "--no-tools")) {
+            gp.tools.clear();
+            continue;
+        }
         if (eq(a, "--chat")) {
             gp.apply_template = true;
+            continue;
+        }
+        if (eq(a, "--raw") || eq(a, "--no-chat")) {
+            gp.apply_template = false;
             continue;
         }
         if (eq(a, "--persist") || eq(a, "--kv")) {
@@ -306,6 +426,23 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
                 gp.prefix_reuse = n;
             continue;
         }
+        if (eq(a, "--cache-slot") || eq(a, "--slot")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v) {
+                err = std::string("bad ") + a;
+                return false;
+            }
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, a, err))
+                return false;
+            if (n < 0) {
+                err = std::string("bad ") + a + ": " + v;
+                return false;
+            }
+            gp.cache_slot = n;
+            continue;
+        }
         if (eq(a, "--stop-id")) {
             const char *v = next_val(argc, argv, i);
             if (!v)
@@ -319,6 +456,10 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
         }
         if (eq(a, "--eos-only")) {
             gp.eos_only = true;
+            continue;
+        }
+        if (eq(a, "--no-eos-only")) {
+            gp.eos_only = false;
             continue;
         }
     }

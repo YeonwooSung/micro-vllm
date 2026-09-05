@@ -24,6 +24,9 @@ bool uni_is_N(uint32_t cp);
 bool uni_is_S(uint32_t cp);
 bool uni_is_Lu(uint32_t cp); // uppercase letter
 bool uni_is_Ll(uint32_t cp); // lowercase letter
+bool uni_is_M(uint32_t cp);  // Unicode Mark (Mn/Mc/Me)
+bool uni_is_P(uint32_t cp); // Unicode Punctuation (P*)
 uint32_t uni_to_lower(uint32_t cp); // simple case fold; identity if none
+uint32_t uni_to_upper(uint32_t cp); // simple case fold; identity if none
 
 } // namespace mvllm

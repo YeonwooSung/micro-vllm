@@ -19,13 +19,15 @@ Status mux_stdio_run(Engine &engine, std::string &err);
 // Honored: stop, grammar, seed, frequency/presence/repetition_penalty, min_p,
 // temperature, top_p, top_k, logprobs, max_tokens/max_new_tokens (>0),
 // logit_bias, cache_slot, think/enable_thinking, persist/kv_path/coli_kv,
-// persist_ver/kv_ver (1..3), prefix_bytes, prefix_reuse, stop_ids, eos_only.
+// persist_ver/kv_ver (1..3), prefix_bytes, prefix_reuse, stop_ids, eos_only,
+// tool_choice/function_call, reasoning_effort.
 // prefix_bytes on raw SUBMIT is converted to prefix_reuse token count (capped by
 // prompt length).
 // Unknown keys ignored. Invalid typed values for persist/prefix/stop extras fail.
 bool mux_apply_extra_json(const std::string &extra, GenParams &gp, std::string &err);
 
-// IMAGE payload: encoded PNG/JPEG/PPM/BMP, or raw RGB24 when n==h*w*3.
+// IMAGE payload: official LE f32 patches when n==h*w*4, then encoded
+// PNG/JPEG/PPM/BMP, or raw RGB24 when n==h*w*3.
 // Wire: IMAGE id nbytes h w [slot] + payload + newline → ACCEPT id 0.
 // Stashed by id for the next SUBMIT with that id (consumed on SUBMIT).
 // In-flight id → ERROR DUPLICATE_ID (pending for a later SUBMIT is replaced).

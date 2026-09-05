@@ -4,6 +4,7 @@
 #include "../model/family.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -75,27 +76,44 @@ bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &ou
 bool extract_image_url_from_part(const std::string &part, std::string &url);
 bool api_key_ok(const std::string &authorization, const std::string &x_api_key = {});
 std::string health_json(Engine *engine);
+// GET /ready and /v1/ready body helper. Compact JSON
+// {"ready":true|false,"created":<serve_created()>}
+std::string ready_json(bool ready);
+// GET /version and /v1/version body helper. Compact JSON
+// {"name":"micro-vllm","engine":"host","created":<serve_created()>}
+std::string version_json();
 std::string queue_error_json(const char *code); // queue_full | queue_timeout
 std::string queue_wait_header(double wait_s);   // "x-colibri-queue-wait-ms: N\r\n"
 std::string retry_after_header();               // "Retry-After: 1\r\n"
 // Official GET /experts body. engine==null or !authed → empty rows/cols/map/hits, seq 0.
-// consume_hits is always false.
+// consume_hits is always false. Both paths pass created=<serve_created()>.
 std::string experts_json(Engine *engine, bool authed = true);
-// Official GET /profile body. engine==null or !authed → {"seq":0,"turns":[]}.
+// Official GET /profile body. engine==null or !authed →
+// {"seq":0,"turns":[],"created":<serve_created()>}.
 std::string profile_json(Engine *engine, bool authed = true);
 // Compact no-space JSON object (no wrapping {"colibri":...}).
-// engine==null → {"stats":{},"perf":{},"topk":[],"entropy":[],"gpus":[],"repin":[]}
+// engine==null → {"stats":{},"perf":{},"topk":[],"entropy":[],"gpus":[],"repin":[],"created":<serve_created()>}
 std::string colibri_json(Engine *engine);
 std::string openai_sse_colibri(Engine *engine); // data: {"colibri":<colibri_json>}\n\n
 // Insert ,"colibri":<obj> before the final '}' of a JSON object body.
 std::string with_colibri(const std::string &body, Engine *engine);
-std::string openai_model_object(const std::string &id);
+// Process start unix seconds (computed once). Official model_object `created`.
+int64_t serve_created();
+// created < 0 → serve_created(). Compact JSON id/object/created/owned_by.
+std::string openai_model_object(const std::string &id, int64_t created = -1);
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
-                         int running = 0, int queued = 0, int max_queue = 0, double rss_gb = 0);
+                         int running = 0, int queued = 0, int max_queue = 0, double rss_gb = 0,
+                         int busy_slots = 0, int hist_tokens = 0, int free_slots = 0,
+                         uint64_t failed = 0, int idle = 0, int jobs = 0, int live = 0,
+                         int capacity = 0, uint64_t admitted = 0, uint64_t completed = 0,
+                         uint64_t rejected = 0, uint64_t timed_out = 0, uint64_t cancelled = 0,
+                         int queue_timeout = 0);
 // POST /tokenize and /v1/tokenize body helper. Compact JSON {"count":N,"tokens":[...]}
 std::string tokenize_response(const std::vector<int> &ids);
 // POST /detokenize and /v1/detokenize body helper. Compact JSON {"text":"..."}
 std::string detokenize_response(const std::string &text);
+// POST /count and /v1/count body helper. Compact JSON {"count":N}
+std::string count_response(size_t n);
 
 // Strip :port / [ipv6]:port, lowercase. Empty Host → empty name.
 std::string host_header_name(const std::string &host_header);

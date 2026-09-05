@@ -20,6 +20,8 @@ public:
     int len() const { return len_; }
     int cap() const { return cap_; }
     bool tainted() const { return tainted_; }
+    bool empty() const { return len_ == 0; }
+    bool full() const { return cap_ > 0 && len_ >= cap_; }
     const int *fed() const;
 
 private:

@@ -161,6 +161,10 @@ bool is_letter(uint32_t c, bool exclude_han) {
     return uni_is_L(c);
 }
 
+bool is_mark(uint32_t c) { return uni_is_M(c); }
+
+bool is_punct(uint32_t c) { return uni_is_P(c); }
+
 bool is_upper(uint32_t c) {
     return uni_is_Lu(c);
 }
@@ -172,6 +176,8 @@ bool is_lower(uint32_t c) {
 uint32_t low_ascii(uint32_t c) {
     return uni_to_lower(c);
 }
+
+uint32_t high_ascii(uint32_t c) { return uni_to_upper(c); }
 
 int contraction_len(const uint32_t *cp, int i, int n) {
     if (i >= n || cp[i] != '\'')
@@ -283,14 +289,14 @@ void Tokenizer::pretok_cl100k(const uint32_t *cp, const int *off, int n, const u
         }
         {
             int j = i;
-            if (!is_letter(c, false) && !is_nl(c) && !is_num(c)) {
-                if (j + 1 < n && is_letter(cp[j + 1], false))
+            if (!is_letter(c, false) && !is_mark(c) && !is_nl(c) && !is_num(c)) {
+                if (j + 1 < n && (is_letter(cp[j + 1], false) || is_mark(cp[j + 1])))
                     ++j;
                 else
                     j = -1;
             }
-            if (j >= 0 && is_letter(cp[j], false)) {
-                while (j < n && is_letter(cp[j], false))
+            if (j >= 0 && (is_letter(cp[j], false) || is_mark(cp[j]))) {
+                while (j < n && (is_letter(cp[j], false) || is_mark(cp[j])))
                     ++j;
                 i = j;
                 bpe_piece(p, off[start], off[i], ids);
@@ -307,9 +313,11 @@ void Tokenizer::pretok_cl100k(const uint32_t *cp, const int *off, int n, const u
             bpe_piece(p, off[start], off[i], ids);
             continue;
         }
-        if (!is_space(c) && !is_letter(c, false) && !is_num(c)) {
+        if (is_punct(c) ||
+            (!is_space(c) && !is_letter(c, false) && !is_num(c) && !is_mark(c))) {
             int j = i;
-            while (j < n && !is_space(cp[j]) && !is_letter(cp[j], false) && !is_num(cp[j]))
+            while (j < n && (is_punct(cp[j]) || (!is_space(cp[j]) && !is_letter(cp[j], false) &&
+                                                 !is_num(cp[j]) && !is_mark(cp[j]))))
                 ++j;
             while (j < n && is_nl(cp[j]))
                 ++j;
@@ -358,9 +366,10 @@ void Tokenizer::pretok_kimi(const uint32_t *cp, const int *off, int n, const uns
         // o200k letter word: optional leading non-L/N, Lu*/Ll+ or Lu+/Ll*, then contraction.
         {
             int j = i;
-            if (j < n && is_word_prefix(cp[j]) && j + 1 < n && is_letter(cp[j + 1], true))
+            if (j < n && is_word_prefix(cp[j]) && j + 1 < n &&
+                (is_letter(cp[j + 1], true) || is_mark(cp[j + 1])))
                 ++j;
-            if (j < n && is_letter(cp[j], true)) {
+            if (j < n && (is_letter(cp[j], true) || is_mark(cp[j]))) {
                 const int word0 = j;
                 if (is_lower(cp[j]) || (is_upper(cp[j]) && j + 1 < n && is_lower(cp[j + 1]))) {
                     while (j < n && is_upper(cp[j]))
@@ -381,6 +390,8 @@ void Tokenizer::pretok_kimi(const uint32_t *cp, const int *off, int n, const uns
                     while (j < n && is_letter(cp[j], true))
                         ++j;
                 }
+                while (j < n && is_mark(cp[j]))
+                    ++j;
                 j += contraction_len(cp, j, n);
                 i = j;
                 bpe_piece(p, off[start], off[i], ids);
@@ -407,13 +418,17 @@ void Tokenizer::pretok_kimi(const uint32_t *cp, const int *off, int n, const uns
         }
         {
             int j = i;
-            if (c == ' ' && j + 1 < n && !is_space(cp[j + 1]) && !is_letter(cp[j + 1], true) &&
-                !is_num(cp[j + 1]) && !is_han(cp[j + 1]))
+            if (c == ' ' && j + 1 < n &&
+                (is_punct(cp[j + 1]) ||
+                 (!is_space(cp[j + 1]) && !is_letter(cp[j + 1], true) && !is_num(cp[j + 1]) &&
+                  !is_han(cp[j + 1]) && !is_mark(cp[j + 1]))))
                 ++j;
-            if (j < n && !is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]) &&
-                !is_han(cp[j])) {
-                while (j < n && !is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]) &&
-                       !is_han(cp[j]))
+            if (j < n && (is_punct(cp[j]) ||
+                          (!is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]) &&
+                           !is_han(cp[j]) && !is_mark(cp[j])))) {
+                while (j < n && (is_punct(cp[j]) ||
+                                 (!is_space(cp[j]) && !is_letter(cp[j], true) && !is_num(cp[j]) &&
+                                  !is_han(cp[j]) && !is_mark(cp[j]))))
                     ++j;
                 while (j < n && is_nl(cp[j]))
                     ++j;

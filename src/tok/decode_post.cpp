@@ -102,6 +102,12 @@ void trim_assistant_tail(std::string &text) {
     static const char kAssistant[] = "<|assistant|>";
     static const char kEotId[] = "<|eot_id|>";
     static const char kEos[] = "</s>";
+    static const char kEndOfText[] = "<|endoftext|>";
+    static const char kEndOfTextHf[] = "<|end_of_text|>";
+    static const char kEnd[] = "<|end|>";
+    static const char kEndOfPrompt[] = "<|endofprompt|>";
+    static const char kEndOfTurn[] = "<|end_of_turn|>";
+    static const char kEomId[] = "<|eom_id|>";
     for (;;) {
         bool stripped = false;
         while (!text.empty() && is_tail_ws(text.back())) {
@@ -122,6 +128,24 @@ void trim_assistant_tail(std::string &text) {
             stripped = true;
         } else if (ends_with(text, kEos, sizeof(kEos) - 1)) {
             text.resize(text.size() - (sizeof(kEos) - 1));
+            stripped = true;
+        } else if (ends_with(text, kEndOfText, sizeof(kEndOfText) - 1)) {
+            text.resize(text.size() - (sizeof(kEndOfText) - 1));
+            stripped = true;
+        } else if (ends_with(text, kEndOfTextHf, sizeof(kEndOfTextHf) - 1)) {
+            text.resize(text.size() - (sizeof(kEndOfTextHf) - 1));
+            stripped = true;
+        } else if (ends_with(text, kEnd, sizeof(kEnd) - 1)) {
+            text.resize(text.size() - (sizeof(kEnd) - 1));
+            stripped = true;
+        } else if (ends_with(text, kEndOfPrompt, sizeof(kEndOfPrompt) - 1)) {
+            text.resize(text.size() - (sizeof(kEndOfPrompt) - 1));
+            stripped = true;
+        } else if (ends_with(text, kEndOfTurn, sizeof(kEndOfTurn) - 1)) {
+            text.resize(text.size() - (sizeof(kEndOfTurn) - 1));
+            stripped = true;
+        } else if (ends_with(text, kEomId, sizeof(kEomId) - 1)) {
+            text.resize(text.size() - (sizeof(kEomId) - 1));
             stripped = true;
         }
         if (!stripped)

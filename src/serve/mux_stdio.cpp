@@ -1,5 +1,6 @@
 #include "mux_stdio.hpp"
 #include "mux_frames.hpp"
+#include "legacy_stdio.hpp"
 #include "hwinfo.hpp"
 
 #include "../core/config.hpp"
@@ -69,11 +70,15 @@ static void emit_stat_n(int n_live) {
 }
 
 static void emit_error(uint64_t id, const char *code) {
-    emit_line("ERROR %llu %s\n", static_cast<unsigned long long>(id), code);
+    const std::string line = mux_format_error(id, code);
+    fwrite(line.data(), 1, line.size(), stdout);
+    fflush(stdout);
 }
 
 static void emit_accept(uint64_t id, int prompt_tokens) {
-    emit_line("ACCEPT %llu %d\n", static_cast<unsigned long long>(id), prompt_tokens);
+    const std::string line = mux_format_accept(id, prompt_tokens);
+    fwrite(line.data(), 1, line.size(), stdout);
+    fflush(stdout);
 }
 
 // Official: zero-byte TOOL after ACCEPT declares the K3 tool sideband.
@@ -369,7 +374,8 @@ struct Mux {
 
     // Official: READY, STAT 0, HWINFO, TIERS, EMAP (if route_telem has rows).
     void emit_ready() {
-        fputs("\x01\x01READY\x01\x01\n", stdout);
+        const std::string line = legacy_format_ready();
+        fwrite(line.data(), 1, line.size(), stdout);
         fflush(stdout);
         emit_stat_n(0);
         const std::string hw = hwinfo_line();
@@ -1044,6 +1050,44 @@ bool mux_apply_extra_json(const std::string &extra, GenParams &gp, std::string &
         gp.eos_only = j["eos_only"].get<bool>();
     }
 
+    auto apply_tool_choice = [&](const char *key) -> bool {
+        if (!j.contains(key))
+            return true;
+        if (!j[key].is_string()) {
+            err = "invalid extra json";
+            return false;
+        }
+        const std::string v = j[key].get<std::string>();
+        if (v.empty()) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.tool_choice = v;
+        return true;
+    };
+    if (!apply_tool_choice("function_call") || !apply_tool_choice("tool_choice"))
+        return false;
+
+    auto apply_reasoning_effort = [&](const char *key) -> bool {
+        if (!j.contains(key))
+            return true;
+        if (!j[key].is_string()) {
+            err = "invalid extra json";
+            return false;
+        }
+        const std::string v = j[key].get<std::string>();
+        if (v != "none" && v != "low" && v != "medium" && v != "high") {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.reasoning_effort = v;
+        gp.think = (v != "none");
+        return true;
+    };
+    if (!apply_reasoning_effort("reasoning-effort") ||
+        !apply_reasoning_effort("reasoning_effort"))
+        return false;
+
     return true;
 }
 
@@ -1053,6 +1097,26 @@ Status mux_decode_image(const uint8_t *data, size_t n, int hint_h, int hint_w,
     width = 0;
     height = 0;
     err.clear();
+
+    if (data && hint_h > 0 && hint_w > 0) {
+        const uint64_t hw = static_cast<uint64_t>(hint_h) * static_cast<uint64_t>(hint_w);
+        if (hw <= UINT64_MAX / 4ull && hw * 4ull == static_cast<uint64_t>(n)) {
+            rgb.resize(static_cast<size_t>(hw));
+            for (size_t i = 0; i < static_cast<size_t>(hw); ++i) {
+                const uint8_t *p = data + i * 4u;
+                const uint32_t u = static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+                                   (static_cast<uint32_t>(p[2]) << 16) |
+                                   (static_cast<uint32_t>(p[3]) << 24);
+                float f;
+                std::memcpy(&f, &u, 4);
+                rgb[i] = f;
+            }
+            width = hint_w;
+            height = hint_h;
+            err.clear();
+            return Status::Ok;
+        }
+    }
 
     if (data && n > 0) {
         const Status st = decode_image_bytes(data, n, rgb, width, height, err);

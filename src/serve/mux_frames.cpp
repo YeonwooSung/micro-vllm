@@ -67,6 +67,21 @@ std::string mux_format_data(uint64_t id, const void *data, size_t n) {
     return format_counted("DATA", id, data, n);
 }
 
+std::string mux_format_accept(uint64_t id, int prompt_tokens) {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "ACCEPT %llu %d\n", static_cast<unsigned long long>(id),
+                  prompt_tokens);
+    return buf;
+}
+
+std::string mux_format_error(uint64_t id, const char *code) {
+    if (!code || !code[0])
+        code = "BAD_FRAME";
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "ERROR %llu %s\n", static_cast<unsigned long long>(id), code);
+    return buf;
+}
+
 std::string mux_format_topk(uint64_t id, const float *logprobs, const std::string *texts, int k) {
     if (k < 0)
         k = 0;
@@ -193,7 +208,7 @@ std::string mux_format_hits(int rows, int cols, const uint8_t *hit) {
 }
 
 std::string mux_format_experts_json(int rows, int cols, const uint8_t *emap, const uint8_t *hits,
-                                    int seq, const float *entropy, int n_entropy) {
+                                    int seq, const float *entropy, int n_entropy, int64_t created) {
     if (rows < 0)
         rows = 0;
     if (cols < 0)
@@ -223,6 +238,10 @@ std::string mux_format_experts_json(int rows, int cols, const uint8_t *emap, con
             append_f(out, static_cast<double>(entropy[i]));
         }
         out.push_back(']');
+    }
+    if (created >= 0) {
+        out.append(",\"created\":");
+        out.append(std::to_string(created));
     }
     out.push_back('}');
     return out;

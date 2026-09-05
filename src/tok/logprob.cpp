@@ -30,6 +30,21 @@ double logprob_target(const float *logits, int vocab, int target, int *am) {
     return (static_cast<double>(logits[target]) - mx) - std::log(se);
 }
 
+int logprob_argmax(const float *logits, int vocab) {
+    if (!logits || vocab < 1)
+        return -1;
+
+    float mx = logits[0];
+    int best = 0;
+    for (int i = 1; i < vocab; ++i) {
+        if (logits[i] > mx) {
+            mx = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
 bool model_type_is_glm(const char *s) {
     if (!s)
         return false;
