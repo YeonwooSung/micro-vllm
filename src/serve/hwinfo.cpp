@@ -1,4 +1,5 @@
 #include "hwinfo.hpp"
+#include "mux_frames.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -112,6 +113,12 @@ double rss_gb() {
 #else
     return static_cast<double>(ru.ru_maxrss) / (1024.0 * 1024.0); // kilobytes
 #endif
+}
+
+std::string hwinfo_line() {
+    HwInfo h = hw_probe();
+    return mux_format_hwinfo(h.cores, h.ram_total_gb, h.ram_avail_gb, h.ngpu,
+                             h.vram_total_gb, h.cpu, h.gpu);
 }
 
 } // namespace mvllm

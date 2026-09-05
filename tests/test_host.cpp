@@ -3677,6 +3677,18 @@ int main() {
         CHECK(perf.back() == '\n');
         float ent[2] = {1.5f, 2.f};
         CHECK(mux_format_entropy(ent, 2) == "ENTROPY 1.5 2\n");
+        std::string turn = mux_format_turn_telem("HWINFO 1 1.00 1.00 0 0.00 cpu|none", 3, 0.1, 0,
+                                                 0, 0, 0, 0, 0, ent, 2, 0, 0, 4, 0.0, 1.0, 1, 2,
+                                                 em, 1, 3, hit);
+        CHECK(turn.find("HWINFO 1") == 0);
+        CHECK(turn.find("PERF 3 ") != std::string::npos);
+        CHECK(turn.find("ENTROPY 1.5 2\n") != std::string::npos);
+        CHECK(turn.find("TIERS 0 0 4 ") != std::string::npos);
+        CHECK(turn.find("EMAP 1 2 0080\n") != std::string::npos);
+        CHECK(turn.find("HITS 1 3 05\n") != std::string::npos);
+        std::string hline = hwinfo_line();
+        CHECK(hline.find("HWINFO ") == 0);
+        CHECK(hline.back() == '\n');
     }
     {
         using namespace mvllm;

@@ -248,6 +248,8 @@ K3/GLM `generate` counts routed ids and saves `model_dir/.coli_usage`.
 `ROUTE_TRACE` lines are `<call> <row> <layer> <id>:<gate.4f> …` when
 `MVLLM_ROUTE_TRACE` / `COLI_ROUTE_TRACE` is set. Mux emits a zero-byte
 `TOOL` after ACCEPT for Kimi K3 and `TOPK` rows when `logprobs>0`.
+Immediately before DONE: HWINFO, PERF, ENTROPY (if any), TIERS, EMAP, HITS
+(`mux_format_turn_telem`).
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

@@ -201,4 +201,27 @@ std::string mux_format_entropy(const float *h, int n) {
     return out;
 }
 
+std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, double dt,
+                                  double t_edisk, double t_ewait, double t_emm, double t_attn,
+                                  double t_kvb, double t_head, const float *entropy, int n_entropy,
+                                  int vram, int ram, int disk, double vram_gb, double ram_gb,
+                                  int emap_rows, int emap_cols, const uint8_t *emap,
+                                  int hits_rows, int hits_cols, const uint8_t *hits) {
+    std::string out;
+    if (!hwinfo_line.empty()) {
+        out.append(hwinfo_line);
+        if (hwinfo_line.back() != '\n')
+            out.push_back('\n');
+    }
+    out.append(mux_format_perf(id, dt, t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head));
+    if (n_entropy > 0)
+        out.append(mux_format_entropy(entropy, n_entropy));
+    out.append(mux_format_tiers(vram, ram, disk, vram_gb, ram_gb));
+    if (emap_rows > 0 && emap)
+        out.append(mux_format_emap(emap_rows, emap_cols, emap));
+    if (hits_rows > 0 && hits)
+        out.append(mux_format_hits(hits_rows, hits_cols, hits));
+    return out;
+}
+
 } // namespace mvllm

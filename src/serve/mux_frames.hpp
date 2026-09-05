@@ -40,4 +40,15 @@ std::string mux_format_perf(uint64_t id, double dt, double t_edisk, double t_ewa
 // ENTROPY h0 h1 …  — per-sparse-layer routing entropy (bits)
 std::string mux_format_entropy(const float *h, int n);
 
+// Concatenate official turn telemetry lines (each formatter already has \n).
+// hwinfo may be empty (skip). entropy n<=0 skips ENTROPY.
+// emap/hits: rows<=0 or null bytes skips that line.
+// PERF always emitted (zeros ok). TIERS always emitted.
+std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, double dt,
+                                  double t_edisk, double t_ewait, double t_emm, double t_attn,
+                                  double t_kvb, double t_head, const float *entropy, int n_entropy,
+                                  int vram, int ram, int disk, double vram_gb, double ram_gb,
+                                  int emap_rows, int emap_cols, const uint8_t *emap,
+                                  int hits_rows, int hits_cols, const uint8_t *hits);
+
 } // namespace mvllm

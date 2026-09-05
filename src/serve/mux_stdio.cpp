@@ -1,5 +1,6 @@
 #include "mux_stdio.hpp"
 #include "mux_frames.hpp"
+#include "hwinfo.hpp"
 
 #include "../core/config.hpp"
 #include "../engine.hpp"
@@ -126,6 +127,21 @@ static void emit_done(uint64_t id, int emitted, int prompt_tokens, int length_li
                       int stop_kind) {
     const std::string line = mux_format_done(id, emitted, prompt_tokens, length_limited, stop_kind);
     fwrite(line.data(), 1, line.size(), stdout);
+    fflush(stdout);
+}
+
+static void emit_turn_telem(Engine &engine, uint64_t id) {
+    const HwInfo hw = hw_probe();
+    std::string hwline = mux_format_hwinfo(hw.cores, hw.ram_total_gb, hw.ram_avail_gb, hw.ngpu,
+                                           hw.vram_total_gb, hw.cpu, hw.gpu);
+    ExpertStoreStats st{};
+    engine.expert_stats(st);
+    (void)st;
+    const int disk = engine.config().moe.n_experts > 0 ? engine.config().moe.n_experts : 0;
+    const std::string block =
+        mux_format_turn_telem(hwline, id, 0, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, disk, 0.0,
+                              rss_gb(), 0, 0, nullptr, 0, 0, nullptr);
+    fwrite(block.data(), 1, block.size(), stdout);
     fflush(stdout);
 }
 
@@ -693,6 +709,7 @@ struct Mux {
             emit_topk_rows(engine, id, out);
         const int emitted = live ? live->emitted : static_cast<int>(out.tokens.size());
         const int limited = length_limited_of(out.tokens, max_tokens, engine.config(), gp.eos);
+        emit_turn_telem(engine, id);
         emit_done(id, emitted, prompt_tokens, limited, stop_kind_of(out.stopped_by_stop, limited));
         forget(id);
     }
@@ -722,6 +739,7 @@ struct Mux {
                 const int emitted = static_cast<int>(job->out.tokens.size());
                 const int limited = length_limited_of(job->out.tokens, fl->max_tokens,
                                                       engine.config(), job->gp.eos);
+                emit_turn_telem(engine, fl->id);
                 emit_done(fl->id, emitted, fl->prompt_tokens, limited,
                           stop_kind_of(job->out.stopped_by_stop, limited));
             }

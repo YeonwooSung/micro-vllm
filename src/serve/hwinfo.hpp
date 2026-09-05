@@ -16,5 +16,7 @@ struct HwInfo {
 
 HwInfo hw_probe();
 double rss_gb(); // peak RSS of this process
+// Probe + mux_format_hwinfo. rss is not part of HWINFO (STAT uses it).
+std::string hwinfo_line();
 
 } // namespace mvllm
