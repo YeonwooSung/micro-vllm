@@ -46,6 +46,7 @@ set(MVLLM_HOST_SOURCES
     src/quant/quant.cpp
     src/quant/weight.cpp
     src/quant/kv_fp8.cpp
+    src/quant/kv_tq.cpp
     src/store/expert_store.cpp
     src/store/block_store.cpp
     src/store/kv_persist.cpp
@@ -60,6 +61,7 @@ set(MVLLM_HOST_SOURCES
     src/serve/mux_stdio.cpp
     src/serve/mux_frames.cpp
     src/serve/mux_codec.cpp
+    src/serve/hwinfo.cpp
     src/serve/cli_flags.cpp
     src/serve/anthropic.cpp
     src/model/ops.cpp
@@ -76,6 +78,7 @@ set(MVLLM_HOST_SOURCES
     src/model/h3_dit_schedule.cpp
     src/model/h3_canvas.cpp
     src/model/h3_adaln.cpp
+    src/model/h3_reuse.cpp
     src/model/llama.cpp
     src/serve/http_server.cpp
     src/serve/session.cpp

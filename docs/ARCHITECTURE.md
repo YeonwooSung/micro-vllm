@@ -186,7 +186,8 @@ features, AdaLN `row_map` by segment kind, and official RES multistep
 K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R
 rows, optional DSA index). `nrec` is fsynced last. Mismatched geometry is
 ignored (empty reopen). Host F32 only. MLA latent rows can be stored as
-e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale).
+e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale) or PolarQuant /
+rotated int4 (`kv_tq_*` / `kv_q4_*`).
 
 Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
@@ -197,7 +198,12 @@ plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters. Buffer reader
 engine id). All-zero history is a zero-byte file. Atomic tmp+rename.
 
 H3 AdaLN time embed (official two-SiLU MLP): `SiLU(W_out SiLU(W_in x+b)+b)`
-then per-block `W_adaln @ temb + b`.
+then per-block `W_adaln @ temb + b`. Serving reuse mask keeps step 0, the
+last step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
+`0,3,6,…` list).
+
+Host `hw_probe` / `rss_gb` match official HWINFO units (cores, RAM GB, CPU
+brand; GPU fields stay 0).
 
 H3 RGB resize: portable bilinear + edge-extend (official vImage HQ path
 without Accelerate). Identity geometry still copies.

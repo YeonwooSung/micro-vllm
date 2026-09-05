@@ -13,6 +13,7 @@
 #include "io/av_mux.hpp"
 #include "io/h3_resize.hpp"
 #include "quant/kv_fp8.hpp"
+#include "quant/kv_tq.hpp"
 #include "model/h3_text.hpp"
 #include "model/h3_audio_vae.hpp"
 #include "model/h3_layout.hpp"
@@ -21,6 +22,7 @@
 #include "model/h3_dit_schedule.hpp"
 #include "model/h3_canvas.hpp"
 #include "model/h3_adaln.hpp"
+#include "model/h3_reuse.hpp"
 #include "store/block_store.hpp"
 #include "store/expert_store.hpp"
 #include "store/kv_persist.hpp"
@@ -38,6 +40,7 @@
 #include "serve/mux_stdio.hpp"
 #include "serve/mux_frames.hpp"
 #include "serve/mux_codec.hpp"
+#include "serve/hwinfo.hpp"
 #include "serve/cli_flags.hpp"
 
 #include <algorithm>
@@ -3804,6 +3807,85 @@ int main() {
         const float s2 = s1 / (1.f + std::exp(-s1));
         CHECK_NEAR(t2[0], s2, 1e-5);
         CHECK_NEAR(t2[1], 0.f, 1e-6);
+    }
+    {
+        using namespace mvllm;
+        uint8_t sel[50];
+        CHECK(h3_dit_reuse_schedule(20, 3, sel, 50) == 8);
+        const int agg[] = {0, 3, 6, 9, 12, 15, 18, 19};
+        for (int s = 0; s < 20; ++s) {
+            int exp = 0;
+            for (int a : agg)
+                exp |= (s == a);
+            CHECK(sel[s] == exp);
+        }
+        CHECK(h3_dit_reuse_schedule(20, 2, sel, 50) == 11);
+        for (int s = 0; s < 20; ++s)
+            CHECK(sel[s] == ((s % 2 == 0) || s == 19));
+        CHECK(h3_dit_reuse_schedule(50, 3, sel, 50) == 18);
+        CHECK(h3_dit_reuse_schedule(20, 1, sel, 50) == 20);
+        CHECK(h3_dit_reuse_schedule(20, 3, sel, 19) == -1);
+        CHECK(h3_parse_reuse_steps(20, nullptr, sel) == 0);
+        CHECK(h3_parse_reuse_steps(20, "0,3,6,19", sel) == 4);
+        CHECK(sel[0] && sel[3] && sel[6] && sel[19] && !sel[1]);
+        CHECK(h3_parse_reuse_steps(20, "0,3,6", sel) == -1);
+        CHECK(h3_parse_reuse_steps(20, "0,3,3,19", sel) == -1);
+    }
+    {
+        using namespace mvllm;
+        HwInfo hi = hw_probe();
+        CHECK(hi.cores > 0);
+        CHECK(hi.ram_total_gb > 0.0);
+        CHECK(hi.ngpu == 0);
+        CHECK(hi.vram_total_gb == 0.0);
+        CHECK(!hi.cpu.empty());
+        CHECK(rss_gb() >= 0.0);
+        std::string line = mux_format_hwinfo(hi.cores, hi.ram_total_gb, hi.ram_avail_gb, hi.ngpu,
+                                             hi.vram_total_gb, hi.cpu, hi.gpu.empty() ? "none" : hi.gpu);
+        CHECK(line.find("HWINFO ") == 0);
+        CHECK(line.back() == '\n');
+    }
+    {
+        using namespace mvllm;
+        CHECK(kv_tq_row_bytes(512, 4) == 224);
+        CHECK(kv_tq_row_bytes(64, 4) == 28);
+        CHECK(kv_q4_row_bytes(512) == 256);
+        float a[4] = {1.f, 2.f, 3.f, 4.f};
+        kv_tq_fwht(a, 4);
+        kv_tq_fwht(a, 4);
+        CHECK_NEAR(a[0], 1.f, 1e-5);
+        CHECK_NEAR(a[3], 4.f, 1e-5);
+        float src[4] = {0.7f, -1.2f, 0.3f, 2.1f};
+        uint8_t packed[16] = {};
+        float back[4] = {};
+        float rad = kv_tq_quant_row(src, packed, 4, 4);
+        CHECK_NEAR(rad, 2.53574443f, 1e-5);
+        kv_tq_dequant_row(packed, rad, back, 4, 4);
+        float num = 0.f, den = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            float d = back[i] - src[i];
+            num += d * d;
+            den += src[i] * src[i];
+        }
+        CHECK(std::sqrt(num / den) < 0.2f);
+        float z[4] = {};
+        uint8_t zp[16];
+        CHECK(kv_tq_quant_row(z, zp, 4, 4) == 0.f);
+        float zb[4] = {9, 9, 9, 9};
+        kv_tq_dequant_row(zp, 0.f, zb, 4, 4);
+        CHECK(zb[0] == 0.f && zb[3] == 0.f);
+        uint8_t q4[2] = {};
+        float qrad = kv_q4_quant_row(src, q4, 4);
+        CHECK(qrad > 0.f);
+        float qb[4] = {};
+        kv_q4_dequant_row(q4, qrad, qb, 4);
+        float qn = 0.f;
+        for (int i = 0; i < 4; ++i) {
+            float d = qb[i] - src[i];
+            qn += d * d;
+        }
+        CHECK(std::sqrt(qn / den) < 0.25f);
+        CHECK(kv_tq_quant_row(src, packed, 3, 4) == 0.f);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
