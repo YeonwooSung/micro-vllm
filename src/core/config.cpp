@@ -580,6 +580,17 @@ RuntimeConfig runtime_from_env() {
             rt.queue_timeout_s = n;
         }
     }
+    if (const char *v = get("COLI_KA_GAP") ? get("COLI_KA_GAP") : get("MVLLM_KA_GAP")) {
+        double n = std::atof(v);
+        if (n > 0) {
+            if (n > 3600)
+                n = 3600;
+            rt.ka_gap_s = n;
+        }
+    }
+    if (const char *v = get("COLI_VISIBLE_KEEPALIVE") ? get("COLI_VISIBLE_KEEPALIVE")
+                                                      : get("MVLLM_VISIBLE_KEEPALIVE"))
+        rt.visible_keepalive = std::atoi(v) != 0;
     if (const char *v = get("COLI_WEB_DIST") ? get("COLI_WEB_DIST") : get("MVLLM_WEB_DIST")) {
         if (v[0])
             rt.web_dist = v;

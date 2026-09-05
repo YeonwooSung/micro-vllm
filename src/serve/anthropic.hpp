@@ -28,6 +28,7 @@ std::string anthropic_sse_stop(const char *stop_reason, const char *stop_sequenc
 std::string anthropic_sse_block_start(int index = 0, const char *block_type = "text");
 std::string anthropic_sse_block_stop(int index = 0);
 std::string anthropic_sse_thinking_delta(const std::string &text);
+std::string anthropic_sse_ping();
 
 // Full POST /v1/messages handler (writes HTTP response on fd).
 void handle_anthropic_messages(int fd, const std::string &body, Engine *engine);

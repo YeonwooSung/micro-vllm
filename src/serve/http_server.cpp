@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -223,6 +224,7 @@ void http_sse_headers(int fd, const std::string &request_id = {},
     os << "HTTP/1.1 200 OK\r\n"
        << "Content-Type: text/event-stream\r\n"
        << "Cache-Control: no-cache\r\n"
+       << "X-Accel-Buffering: no\r\n"
        << "Access-Control-Allow-Origin: *\r\n"
        << kExposeHeaders;
     append_request_id(os, request_id);
@@ -1285,11 +1287,18 @@ void HttpServer::handle_client(int cfd) {
                 std::string id = (chat ? "chatcmpl-" : "cmpl-") + std::to_string(reqn);
                 std::string model = model_name(engine_);
                 const int kv_slots = engine_->runtime().kv_slots;
+                std::mutex sse_mu;
+                auto last_write = std::chrono::steady_clock::now();
+                auto write_sse = [&](const std::string &ev) {
+                    std::lock_guard<std::mutex> lock(sse_mu);
+                    send_all(cfd, ev.data(), ev.size());
+                    last_write = std::chrono::steady_clock::now();
+                };
                 if (stream) {
                     Engine *eng = engine_;
                     gp.token_text = [eng](int tid) { return eng->decode_token(tid); };
                     auto decode = gp.token_text;
-                    gp.on_token = [cfd, id, model, chat, decode](int tok) {
+                    gp.on_token = [id, model, chat, decode, &write_sse](int tok) {
                         std::string piece = decode ? decode(tok) : std::string();
                         std::string ev;
                         if (chat)
@@ -1298,7 +1307,7 @@ void HttpServer::handle_client(int cfd) {
                                                   nullptr);
                         else
                             ev = openai_sse_text_chunk(id, model, piece, nullptr);
-                        send_all(cfd, ev.data(), ev.size());
+                        write_sse(ev);
                     };
                 }
                 GenResult out;
@@ -1306,17 +1315,48 @@ void HttpServer::handle_client(int cfd) {
                 Status st = Status::Ok;
                 double wait_s = 0;
                 bool sse_open = false;
+                std::atomic<bool> ka_stop{false};
+                std::thread ka_thr;
                 auto open_sse = [&]() {
                     http_sse_headers(cfd, request_id, queue_wait_header(wait_s));
                     sse_open = true;
                     if (chat) {
                         std::string role = openai_sse_chunk(id, model, "{\"role\":\"assistant\"}",
                                                             nullptr);
-                        send_all(cfd, role.data(), role.size());
+                        write_sse(role);
                     } else if (echo && !prompt.empty()) {
                         std::string ev = openai_sse_text_chunk(id, model, prompt, nullptr);
-                        send_all(cfd, ev.data(), ev.size());
+                        write_sse(ev);
                     }
+                };
+                auto start_ka = [&]() {
+                    if (!stream || ka_thr.joinable())
+                        return;
+                    double gap = engine_->runtime().ka_gap_s;
+                    if (gap <= 0)
+                        gap = 10;
+                    const bool visible = engine_->runtime().visible_keepalive;
+                    last_write = std::chrono::steady_clock::now();
+                    ka_thr = std::thread([&, gap, visible]() {
+                        while (!ka_stop.load()) {
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            if (ka_stop.load())
+                                break;
+                            const auto now = std::chrono::steady_clock::now();
+                            std::lock_guard<std::mutex> lock(sse_mu);
+                            if (std::chrono::duration<double>(now - last_write).count() >= gap) {
+                                std::string ev = openai_sse_keepalive(id, model, chat, visible);
+                                send_all(cfd, ev.data(), ev.size());
+                                last_write = now;
+                            }
+                        }
+                    });
+                };
+                auto stop_ka = [&]() {
+                    if (!ka_thr.joinable())
+                        return;
+                    ka_stop.store(true);
+                    ka_thr.join();
                 };
                 if (kv_slots > 1) {
                     std::vector<int> ids;
@@ -1347,6 +1387,7 @@ void HttpServer::handle_client(int cfd) {
                         }
                         if (stream)
                             open_sse();
+                        start_ka();
                         bool hungup = false;
                         auto sched_finished = [&]() {
                             std::lock_guard<std::mutex> lock(engine_mu_);
@@ -1389,9 +1430,10 @@ void HttpServer::handle_client(int cfd) {
                                 gerr = "job lost";
                         }
                         if (hungup) {
+                            stop_ka();
                             if (stream) {
                                 std::string done = openai_sse_done();
-                                send_all(cfd, done.data(), done.size());
+                                write_sse(done);
                             }
                             ::close(cfd);
                             return;
@@ -1400,18 +1442,20 @@ void HttpServer::handle_client(int cfd) {
                 } else {
                     if (stream)
                         open_sse();
+                    start_ka();
                     std::lock_guard<std::mutex> lock(engine_mu_);
                     if (!msgs.empty())
                         st = engine_->generate_chat(msgs, gp, out, gerr);
                     else
                         st = engine_->generate(prompt, gp, out, gerr);
                 }
+                stop_ka();
                 if (st != Status::Ok) {
                     if (sse_open) {
                         std::string ev = "data: {\"error\":\"" + json_escape(gerr) + "\"}\n\n";
-                        send_all(cfd, ev.data(), ev.size());
+                        write_sse(ev);
                         std::string done = openai_sse_done();
-                        send_all(cfd, done.data(), done.size());
+                        write_sse(done);
                     } else if (is_queue_limit_err(gerr)) {
                         http_reply(cfd, 429, "Too Many Requests", busy_error_body(gerr), request_id,
                                    retry_after_header());
@@ -1430,7 +1474,7 @@ void HttpServer::handle_client(int cfd) {
                                 id, model,
                                 "{\"reasoning_content\":\"" + json_escape(out.reasoning) + "\"}",
                                 nullptr);
-                            send_all(cfd, rev.data(), rev.size());
+                            write_sse(rev);
                         }
                         const char *fr = sse_finish_reason(out, gp, engine_->config());
                         bool tools_delta = false;
@@ -1442,7 +1486,7 @@ void HttpServer::handle_client(int cfd) {
                                 std::string delta =
                                     "{\"tool_calls\":" + openai_tool_calls_array(calls, true) + "}";
                                 std::string ev = openai_sse_chunk(id, model, delta, "tool_calls");
-                                send_all(cfd, ev.data(), ev.size());
+                                write_sse(ev);
                                 tools_delta = true;
                             }
                         }
@@ -1452,18 +1496,18 @@ void HttpServer::handle_client(int cfd) {
                                 ev = openai_sse_chunk(id, model, "{}", fr);
                             else
                                 ev = openai_sse_text_chunk(id, model, "", fr);
-                            send_all(cfd, ev.data(), ev.size());
+                            write_sse(ev);
                         }
                         if (include_usage) {
                             std::string uev = openai_sse_usage_chunk(
                                 id, model, out.prompt_tokens, out.completion_tokens, chat,
                                 out.reasoning_tokens);
-                            send_all(cfd, uev.data(), uev.size());
+                            write_sse(uev);
                         }
                         std::string coli = openai_sse_colibri(engine_);
-                        send_all(cfd, coli.data(), coli.size());
+                        write_sse(coli);
                         std::string done = openai_sse_done();
-                        send_all(cfd, done.data(), done.size());
+                        write_sse(done);
                     } else if (chat) {
                         const std::string wait_hdr = queue_wait_header(wait_s);
                         const std::string lp = openai_logprobs_content(engine_, out);
@@ -1673,6 +1717,16 @@ bool extract_tool_choice(const std::string &body, std::string &out) {
     if (extract_json_string(body, "function_call", out) && !out.empty())
         return true;
     return extract_choice_object(body, "function_call", out);
+}
+
+std::string openai_sse_keepalive(const std::string &id, const std::string &model, bool chat,
+                                 bool visible) {
+    if (chat)
+        return openai_sse_chunk(id, model,
+                                visible ? "{\"reasoning_content\":\".\"}"
+                                        : "{\"reasoning_content\":\"\"}",
+                                nullptr);
+    return openai_sse_text_chunk(id, model, "", nullptr);
 }
 
 std::string openai_sse_chunk(const std::string &id, const std::string &model,

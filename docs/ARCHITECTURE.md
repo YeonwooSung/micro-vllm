@@ -272,6 +272,9 @@ admitted/rejected/timed_out counters on GET /health. `COLI_MAX_QUEUE` /
 GET `/*` serves `COLI_WEB_DIST` / `MVLLM_WEB_DIST` (SPA `index.html`,
 path-traversal-safe). Host header is pinned to loopback + bind +
 `COLI_ALLOWED_HOSTS` (`*` opt-out).
+Streaming SSE adds `X-Accel-Buffering: no`. During silent generate/prefill,
+Anthropic emits `event: ping` and OpenAI empty `reasoning_content`/`content`
+deltas every `COLI_KA_GAP` seconds (`COLI_VISIBLE_KEEPALIVE=1` paints `"."`).
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

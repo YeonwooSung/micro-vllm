@@ -58,6 +58,10 @@ bool extract_json_string_array(const std::string &body, const char *key,
 bool extract_tool_choice(const std::string &body, std::string &out);
 std::string openai_sse_chunk(const std::string &id, const std::string &model,
                              const std::string &delta_json, const char *finish_reason);
+// Official idle keepalive chunk. chat+visible → reasoning_content "." ; chat → reasoning_content "";
+// completions → content "".
+std::string openai_sse_keepalive(const std::string &id, const std::string &model, bool chat,
+                                 bool visible);
 std::string openai_sse_done();
 std::string openai_models_response(const std::string &id);
 bool extract_json_string(const std::string &body, const char *key, std::string &out);

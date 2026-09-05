@@ -8,11 +8,15 @@
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include "json.hpp"
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -56,6 +60,7 @@ void write_sse_headers(int fd) {
                     "Content-Type: text/event-stream\r\n"
                     "Cache-Control: no-cache\r\n"
                     "Connection: close\r\n"
+                    "X-Accel-Buffering: no\r\n"
                     "\r\n";
     send_all(fd, h, std::strlen(h));
 }
@@ -732,6 +737,12 @@ std::string anthropic_sse_block_stop(int index) {
     return sse_event("content_block_stop", payload);
 }
 
+std::string anthropic_sse_ping() {
+    json payload = json::object();
+    payload["type"] = "ping";
+    return sse_event("ping", payload);
+}
+
 void handle_anthropic_messages(int fd, const std::string &body, Engine *engine) {
     if (!engine) {
         write_http(fd, 503, "Service Unavailable", "{\"error\":\"no engine\"}");
@@ -749,51 +760,115 @@ void handle_anthropic_messages(int fd, const std::string &body, Engine *engine) 
     bool stream = false;
     extract_json_bool(body, "stream", stream);
 
+    const std::string id = make_msg_id();
+    const std::string model = engine->model_id().empty() ? "micro-vllm" : engine->model_id();
+
+    if (!stream) {
+        GenResult out;
+        std::string gerr;
+        Status st = msgs.empty() ? engine->generate(std::string(), gp, out, gerr)
+                                 : engine->generate_chat(msgs, gp, out, gerr);
+        if (st != Status::Ok) {
+            write_http(fd, 500, "Internal Server Error",
+                       error_body(gerr.empty() ? "generate failed" : gerr));
+            return;
+        }
+        std::string stripped;
+        std::vector<K3ParsedCall> calls;
+        parse_output_tools(out.text, stripped, calls);
+        const char *reason = infer_stop_reason(out, calls, &gp, engine);
+        const char *seq = echo_stop_sequence(out, gp);
+        write_http(fd, 200, "OK", format_messages_response(id, model, out, reason, seq));
+        return;
+    }
+
+    write_sse_headers(fd);
+
+    std::mutex write_mu;
+    auto last_write = std::chrono::steady_clock::now();
+    auto send_ev = [&](const std::string &s) {
+        std::lock_guard<std::mutex> lock(write_mu);
+        send_all(fd, s.data(), s.size());
+        last_write = std::chrono::steady_clock::now();
+    };
+
+    send_ev(anthropic_sse_start(id, model));
+
+    // Pings during generate silence (prefill can take minutes).
+    double gap = engine->runtime().ka_gap_s;
+    if (gap <= 0)
+        gap = 10;
+    std::atomic<bool> ka_stop{false};
+    std::thread ka([&, gap] {
+        while (!ka_stop.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (ka_stop.load())
+                break;
+            std::lock_guard<std::mutex> lock(write_mu);
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_write >= std::chrono::duration<double>(gap)) {
+                const std::string ping = anthropic_sse_ping();
+                if (send_all(fd, ping.data(), ping.size()))
+                    last_write = now;
+            }
+        }
+    });
+    struct KaJoin {
+        std::atomic<bool> &stop;
+        std::thread &th;
+        ~KaJoin() {
+            stop.store(true);
+            if (th.joinable())
+                th.join();
+        }
+    } ka_join{ka_stop, ka};
+
     GenResult out;
     std::string gerr;
     Status st = msgs.empty() ? engine->generate(std::string(), gp, out, gerr)
                              : engine->generate_chat(msgs, gp, out, gerr);
+    ka_stop.store(true);
+    if (ka.joinable())
+        ka.join();
+
     if (st != Status::Ok) {
-        write_http(fd, 500, "Internal Server Error", error_body(gerr.empty() ? "generate failed" : gerr));
+        json payload = json::object();
+        payload["type"] = "error";
+        json e = json::object();
+        e["type"] = "api_error";
+        e["message"] = gerr.empty() ? "generate failed" : gerr;
+        payload["error"] = std::move(e);
+        send_ev(sse_event("error", payload));
         return;
     }
 
-    const std::string id = make_msg_id();
-    const std::string model = engine->model_id().empty() ? "micro-vllm" : engine->model_id();
     std::string stripped;
     std::vector<K3ParsedCall> calls;
     parse_output_tools(out.text, stripped, calls);
     const char *reason = infer_stop_reason(out, calls, &gp, engine);
     const char *seq = echo_stop_sequence(out, gp);
 
-    if (!stream) {
-        write_http(fd, 200, "OK", format_messages_response(id, model, out, reason, seq));
-        return;
-    }
-
-    write_sse_headers(fd);
-    std::string ev = anthropic_sse_start(id, model);
-    send_all(fd, ev.data(), ev.size());
+    std::string ev;
     int text_index = 0;
     int index = 1;
     if (!out.reasoning.empty()) {
         ev = anthropic_sse_block_start(0, "thinking");
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
         ev = anthropic_sse_thinking_delta(out.reasoning);
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
         ev = anthropic_sse_block_stop(0);
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
         text_index = 1;
         index = 2;
     }
     ev = anthropic_sse_block_start(text_index);
-    send_all(fd, ev.data(), ev.size());
+    send_ev(ev);
     if (!stripped.empty() || calls.empty()) {
         ev = anthropic_sse_delta(stripped, text_index);
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
     }
     ev = anthropic_sse_block_stop(text_index);
-    send_all(fd, ev.data(), ev.size());
+    send_ev(ev);
     for (size_t i = 0; i < calls.size(); ++i) {
         const int blk = index + static_cast<int>(i);
         const std::string cid =
@@ -808,7 +883,7 @@ void handle_anthropic_messages(int fd, const std::string &body, Engine *engine) 
         start["index"] = blk;
         start["content_block"] = std::move(start_block);
         ev = sse_event("content_block_start", start);
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
 
         json dlt = json::object();
         dlt["type"] = "input_json_delta";
@@ -818,16 +893,16 @@ void handle_anthropic_messages(int fd, const std::string &body, Engine *engine) 
         delta["index"] = blk;
         delta["delta"] = std::move(dlt);
         ev = sse_event("content_block_delta", delta);
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
 
         json stop = json::object();
         stop["type"] = "content_block_stop";
         stop["index"] = blk;
         ev = sse_event("content_block_stop", stop);
-        send_all(fd, ev.data(), ev.size());
+        send_ev(ev);
     }
     ev = anthropic_sse_stop(reason, seq, out.completion_tokens, out.prompt_tokens);
-    send_all(fd, ev.data(), ev.size());
+    send_ev(ev);
 }
 
 } // namespace mvllm

@@ -3552,6 +3552,14 @@ int main() {
         std::string td = anthropic_sse_thinking_delta("plan");
         CHECK(td.find("event: content_block_delta") != std::string::npos);
         CHECK(td.find("thinking_delta") != std::string::npos);
+        std::string ping = anthropic_sse_ping();
+        CHECK(ping.find("event: ping") != std::string::npos);
+        CHECK(ping.find("\"type\":\"ping\"") != std::string::npos);
+        std::string ka = openai_sse_keepalive("id1", "kimi", true, false);
+        CHECK(ka.find("reasoning_content") != std::string::npos);
+        CHECK(openai_sse_keepalive("id1", "kimi", true, true).find("\".\"") != std::string::npos);
+        CHECK(openai_sse_keepalive("id1", "kimi", false, false).find("text_completion") !=
+              std::string::npos);
         CHECK(td.find("plan") != std::string::npos);
         std::string th = anthropic_sse_block_start(0, "thinking");
         CHECK(th.find("event: content_block_start") != std::string::npos);
