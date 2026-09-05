@@ -256,7 +256,7 @@ public:
                 gbnf.accept_bytes(gp.token_text(next));
             if (gp.on_token)
                 gp.on_token(next);
-            if (is_stop_token(next, cfg_, gp.eos))
+            if (gen_stop_id(next, cfg_, gp))
                 break;
             if (!gp.stop.empty() && gp.token_text) {
                 acc += gp.token_text(next);
@@ -362,7 +362,7 @@ public:
             if (stop_cut(st.acc, st.gp.stop) != std::string::npos)
                 hit_stop = true;
         }
-        if (is_stop_token(token, cfg_, st.gp.eos) || st.emitted >= st.gp.max_new_tokens ||
+        if (gen_stop_id(token, cfg_, st.gp) || st.emitted >= st.gp.max_new_tokens ||
             hit_stop) {
             done = true;
         } else {
@@ -424,7 +424,7 @@ public:
                 if (stop_cut(st.acc, st.gp.stop) != std::string::npos)
                     hit_stop = true;
             }
-            if (is_stop_token(tokens[i], cfg_, st.gp.eos) || st.emitted >= st.gp.max_new_tokens ||
+            if (gen_stop_id(tokens[i], cfg_, st.gp) || st.emitted >= st.gp.max_new_tokens ||
                 hit_stop)
                 done[i] = 1;
             else {
@@ -496,7 +496,7 @@ private:
                 gbnf.accept_bytes(gp.token_text(next));
             if (gp.on_token)
                 gp.on_token(next);
-            if (is_stop_token(next, cfg_, gp.eos))
+            if (gen_stop_id(next, cfg_, gp))
                 break;
             if (!gp.stop.empty() && gp.token_text) {
                 acc += gp.token_text(next);

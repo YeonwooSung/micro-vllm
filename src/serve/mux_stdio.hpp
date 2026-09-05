@@ -18,7 +18,9 @@ Status mux_stdio_run(Engine &engine, std::string &err);
 // SUBMIT extra bytes: JSON object overlay onto GenParams when a key is present.
 // Honored: stop, grammar, seed, frequency/presence/repetition_penalty, min_p,
 // temperature, top_p, top_k, logprobs, max_tokens/max_new_tokens (>0),
-// logit_bias, cache_slot, think/enable_thinking. Unknown keys ignored.
+// logit_bias, cache_slot, think/enable_thinking, persist/kv_path/coli_kv,
+// persist_ver/kv_ver (1..3), prefix_bytes, prefix_reuse, stop_ids, eos_only.
+// Unknown keys ignored. Invalid typed values for persist/prefix/stop extras fail.
 bool mux_apply_extra_json(const std::string &extra, GenParams &gp, std::string &err);
 
 // IMAGE payload: encoded PNG/JPEG/PPM/BMP, or raw RGB24 when n==h*w*3.

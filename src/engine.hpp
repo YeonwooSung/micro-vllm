@@ -4,6 +4,10 @@
 #include "model/family.hpp"
 #include "serve/scheduler.hpp"
 #include "serve/session.hpp"
+#include "store/kv_persist.hpp"
+#include "store/kv_persist_v2.hpp"
+#include "store/kv_persist_v3.hpp"
+#include "store/kv_prefix.hpp"
 #include "tok/tokenizer.hpp"
 
 #include <memory>
@@ -46,7 +50,15 @@ public:
     BatchScheduler &scheduler() { return sched_; }
     FamilyEngine *family_impl() { return impl_.get(); }
 
+    Status persist_open(const std::string &path, int ver, std::string &err);
+    void persist_close();
+    int persist_nrec() const;
+    const std::vector<int> &persist_hist() const;
+    int prefix_reuse_len(int slot) const; // KvPrefix::len for slot
+
 private:
+    KvPersistConfig make_persist_cfg() const;
+    Status persist_append_tail(const std::vector<int> &hist, std::string &err);
     Family family_ = Family::Unknown;
     ModelConfig cfg_{};
     RuntimeConfig rt_{};
@@ -56,6 +68,14 @@ private:
     std::string model_dir_;
     SessionStore sessions_;
     BatchScheduler sched_;
+    KvPersist persist_v1_;
+    KvPersistV2 persist_v2_;
+    KvPersistV3 persist_v3_;
+    KvPrefix prefixes_[kMaxKvSlots];
+    std::vector<int> persist_hist_;
+    int persist_ver_ = 0;
+    std::string persist_path_;
+    bool persist_open_ = false;
 };
 
 } // namespace mvllm

@@ -221,7 +221,7 @@ public:
                 g.accept_bytes(gp.token_text(next));
             if (gp.on_token)
                 gp.on_token(next);
-            bool stop = is_stop_token(next, cfg_, gp.eos);
+            bool stop = gen_stop_id(next, cfg_, gp);
             if (!stop && gp.token_text) {
                 decoded += gp.token_text(next);
                 if (stop_cut(decoded, gp.stop) != std::string::npos) {
@@ -355,7 +355,7 @@ public:
         st.history.push_back(token);
         if (st.g.ready() && st.gp.token_text)
             st.g.accept_bytes(st.gp.token_text(token));
-        bool stop = is_stop_token(token, cfg_, st.gp.eos) || st.emitted >= st.gp.max_new_tokens;
+        bool stop = gen_stop_id(token, cfg_, st.gp) || st.emitted >= st.gp.max_new_tokens;
         if (!stop && st.gp.token_text) {
             st.decoded += st.gp.token_text(token);
             if (stop_cut(st.decoded, st.gp.stop) != std::string::npos)
@@ -418,7 +418,7 @@ public:
             st.history.push_back(tokens[i]);
             if (st.g.ready() && st.gp.token_text)
                 st.g.accept_bytes(st.gp.token_text(tokens[i]));
-            bool stop = is_stop_token(tokens[i], cfg_, st.gp.eos) ||
+            bool stop = gen_stop_id(tokens[i], cfg_, st.gp) ||
                         st.emitted >= st.gp.max_new_tokens;
             if (!stop && st.gp.token_text) {
                 st.decoded += st.gp.token_text(tokens[i]);

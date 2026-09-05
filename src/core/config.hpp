@@ -154,6 +154,10 @@ struct RuntimeConfig {
     std::string host = "127.0.0.1";
     std::string model_dir;
     int kv_slots = 1; // 1–16; official mux KV_SLOTS
+    std::string kv_path; // .coli_kv; empty = off. MVLLM_KV / COLI_KV
+    int kv_persist_ver = 1; // 1 COLIKV1, 2 COLIKV2, 3 COLIKV3
+    int kv_tq_codec = 0;    // COLIKV3: 0 PolarQuant, 1 rotated int4
+    int kv_tq_bits = 4;
 };
 
 inline bool is_stop_token(int id, const ModelConfig &cfg, int extra_eos = -1) {

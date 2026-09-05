@@ -41,7 +41,21 @@ struct GenParams {
     int top_k = 0;                 // 0 = off
     float min_p = 0.f;             // 0 = off
     float repetition_penalty = 1.f; // 1 = off
+    std::vector<int> stop_ids;     // extra token-id stops (StopSet); empty = config/eos
+    bool eos_only = false;         // official SERVE_BATCH: keep only eos
+    std::string persist_path;      // optional per-request .coli_kv overlay
+    int persist_ver = 0;           // 0 = runtime default; 1/2/3 = COLIKV1/2/3
+    int prefix_bytes = 0;          // mux SUBMIT prefix hint; 0 = unused
 };
+
+inline bool gen_stop_id(int id, const ModelConfig &cfg, const GenParams &gp) {
+    if (is_stop_token(id, cfg, gp.eos))
+        return true;
+    for (int s : gp.stop_ids)
+        if (s == id)
+            return true;
+    return false;
+}
 
 struct GenLogprob {
     int token = 0;

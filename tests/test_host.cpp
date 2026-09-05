@@ -4332,6 +4332,100 @@ int main() {
         CHECK(gap.find("LOGITGAP pos=0 top1=1:3.000000 top2=3:2.000000 gap=1.") == 0);
         CHECK(logit_dump_line(nullptr, 0) == "[LOGITS]\n");
     }
+    {
+        using namespace mvllm;
+        GenParams gp;
+        std::string merr;
+        CHECK(mux_apply_extra_json(
+            "{\"persist\":\"/tmp/a.coli_kv\",\"persist_ver\":2,\"prefix_bytes\":4,"
+            "\"prefix_reuse\":3,\"stop_ids\":[7,9],\"eos_only\":true}",
+            gp, merr));
+        CHECK(gp.persist_path == "/tmp/a.coli_kv");
+        CHECK(gp.persist_ver == 2);
+        CHECK(gp.prefix_bytes == 4 && gp.prefix_reuse == 3);
+        CHECK(gp.stop_ids.size() == 2 && gp.stop_ids[0] == 7 && gp.stop_ids[1] == 9);
+        CHECK(gp.eos_only);
+        CHECK(mux_apply_extra_json("{\"coli_kv\":\"/tmp/b.coli_kv\",\"kv_ver\":3}", gp, merr));
+        CHECK(gp.persist_path == "/tmp/b.coli_kv" && gp.persist_ver == 3);
+        CHECK(!mux_apply_extra_json("{\"persist_ver\":9}", gp, merr));
+        CHECK(!mux_apply_extra_json("{\"stop_ids\":1}", gp, merr));
+        CHECK(!mux_apply_extra_json("{\"eos_only\":1}", gp, merr));
+        CHECK(mux_apply_extra_json("{\"stop_ids\":[]}", gp, merr) && gp.stop_ids.empty());
+        ModelConfig cfg;
+        cfg.eos = 1;
+        GenParams sp;
+        sp.stop_ids = {5};
+        CHECK(gen_stop_id(5, cfg, sp) && gen_stop_id(1, cfg, sp) && !gen_stop_id(2, cfg, sp));
+        float lo[] = {0.f, 3.f, 1.f, 2.f};
+        uint8_t allow[4] = {1, 0, 1, 1};
+        uint64_t rng = 1;
+        CHECK(sample_token(lo, 4, 0.f, 1.f, &rng, allow) == 3);
+        const char *old_kv = std::getenv("MVLLM_KV");
+        std::string old_kv_s = old_kv ? old_kv : "";
+        setenv("MVLLM_KV", "/tmp/wired.coli_kv", 1);
+        RuntimeConfig rtenv = runtime_from_env();
+        CHECK(rtenv.kv_path == "/tmp/wired.coli_kv");
+        if (!old_kv_s.empty())
+            setenv("MVLLM_KV", old_kv_s.c_str(), 1);
+        else
+            unsetenv("MVLLM_KV");
+        const std::string kdir = tmpdir();
+        write_file(kdir + "/config.json", R"({
+          "model_type": "kimi_linear",
+          "architectures": ["KimiLinearForCausalLM"],
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "vocab_size": 32,
+          "first_k_dense_replace": 1,
+          "intermediate_size": 32,
+          "num_attention_heads": 4,
+          "q_lora_rank": 8,
+          "kv_lora_rank": 8,
+          "qk_nope_head_dim": 8,
+          "v_head_dim": 8,
+          "num_experts": 2,
+          "num_experts_per_token": 1,
+          "moe_intermediate_size": 16,
+          "routed_expert_hidden_size": 16,
+          "num_shared_experts": 1,
+          "linear_attn_config": {
+            "num_heads": 2,
+            "head_dim": 8,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1],
+            "full_attn_layers": [2],
+            "use_full_rank_gate": true
+          },
+          "bos_token_id": 0,
+          "eos_token_id": 1
+        })");
+        Engine ek;
+        RuntimeConfig rt;
+        rt.expert_gb = 0.001;
+        std::string err;
+        CHECK(ek.load(kdir, rt, err) == Status::Ok);
+        const std::string kvpath = kdir + "/sess.coli_kv";
+        CHECK(ek.persist_open(kvpath, 1, err) == Status::Ok);
+        CHECK(ek.persist_nrec() == 0);
+        GenParams gp2;
+        gp2.max_new_tokens = 2;
+        gp2.eos = 1;
+        gp2.stop_ids = {31};
+        gp2.persist_path = kvpath;
+        gp2.persist_ver = 1;
+        GenResult gr;
+        CHECK(ek.generate("hi", gp2, gr, err) == Status::Ok);
+        CHECK(ek.persist_nrec() > 0);
+        CHECK(ek.prefix_reuse_len(0) == ek.persist_nrec());
+        CHECK(!ek.persist_hist().empty());
+        const std::vector<int> hist1 = ek.persist_hist();
+        ek.persist_close();
+        CHECK(ek.persist_nrec() == 0);
+        CHECK(ek.persist_open(kvpath, 1, err) == Status::Ok);
+        CHECK(ek.persist_nrec() == static_cast<int>(hist1.size()));
+        CHECK(ek.persist_hist() == hist1);
+        CHECK(ek.prefix_reuse_len(0) == static_cast<int>(hist1.size()));
+    }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
 }

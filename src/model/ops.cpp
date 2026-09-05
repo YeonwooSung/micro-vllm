@@ -1,10 +1,12 @@
 #include "family.hpp"
 #include "../quant/quant.hpp"
+#include "../tok/sample_nuc.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace mvllm {
@@ -569,94 +571,21 @@ void top_logprobs(const float *logits, int vocab, int k, GenLogprob *out, int *n
 
 int sample_token(const float *logits, int vocab, float temperature, float top_p, uint64_t *rng,
                  const uint8_t *allow, float *out_logprob) {
-    int chosen = 0;
     if (!logits || vocab <= 0) {
         if (out_logprob)
             *out_logprob = -1e30f;
         return 0;
     }
-    auto ok = [&](int i) { return !allow || allow[i]; };
-    if (temperature <= 0.f) {
-        int best = -1;
+    const float *lo = logits;
+    std::vector<float> work;
+    if (allow) {
+        work.assign(logits, logits + vocab);
         for (int i = 0; i < vocab; ++i)
-            if (ok(i) && (best < 0 || logits[i] > logits[best]))
-                best = i;
-        chosen = best < 0 ? 0 : best;
-    } else {
-        std::vector<float> p(static_cast<size_t>(vocab));
-        float m = 0.f;
-        bool have = false;
-        for (int i = 0; i < vocab; ++i) {
-            if (!ok(i))
-                continue;
-            if (!have || logits[i] > m) {
-                m = logits[i];
-                have = true;
-            }
-        }
-        if (!have) {
-            if (out_logprob)
-                *out_logprob = token_logprob(logits, vocab, 0, allow);
-            return 0;
-        }
-        float sum = 0.f;
-        for (int i = 0; i < vocab; ++i) {
-            if (!ok(i)) {
-                p[static_cast<size_t>(i)] = 0.f;
-                continue;
-            }
-            p[static_cast<size_t>(i)] = std::exp((logits[i] - m) / temperature);
-            sum += p[static_cast<size_t>(i)];
-        }
-        if (!(sum > 0.f)) {
-            if (out_logprob)
-                *out_logprob = token_logprob(logits, vocab, 0, allow);
-            return 0;
-        }
-        for (int i = 0; i < vocab; ++i)
-            p[static_cast<size_t>(i)] /= sum;
-        if (top_p > 0.f && top_p < 1.f) {
-            std::vector<int> ord(static_cast<size_t>(vocab));
-            for (int i = 0; i < vocab; ++i)
-                ord[static_cast<size_t>(i)] = i;
-            std::sort(ord.begin(), ord.end(), [&](int a, int b) {
-                return p[static_cast<size_t>(a)] > p[static_cast<size_t>(b)];
-            });
-            float acc = 0.f;
-            for (int i = 0; i < vocab; ++i) {
-                acc += p[static_cast<size_t>(ord[static_cast<size_t>(i)])];
-                if (acc >= top_p) {
-                    for (int j = i + 1; j < vocab; ++j)
-                        p[static_cast<size_t>(ord[static_cast<size_t>(j)])] = 0.f;
-                    break;
-                }
-            }
-            float s2 = 0.f;
-            for (int i = 0; i < vocab; ++i)
-                s2 += p[static_cast<size_t>(i)];
-            if (s2 > 0.f) {
-                for (int i = 0; i < vocab; ++i)
-                    p[static_cast<size_t>(i)] /= s2;
-            }
-        }
-        uint64_t s = rng ? *rng : 1ull;
-        s += 0x9E3779B97F4A7C15ull;
-        s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ull;
-        s = (s ^ (s >> 27)) * 0x94D049BB133111EBull;
-        s ^= s >> 31;
-        if (rng)
-            *rng = s;
-        float u = static_cast<float>((s >> 11) * (1.0 / 9007199254740992.0));
-        float c = 0.f;
-        chosen = vocab - 1;
-        for (int i = 0; i < vocab; ++i) {
-            c += p[static_cast<size_t>(i)];
-            if (u <= c) {
-                chosen = i;
-                break;
-            }
-        }
+            if (!allow[i])
+                work[static_cast<size_t>(i)] = std::numeric_limits<float>::quiet_NaN();
+        lo = work.data();
     }
+    int chosen = nuc_pick(lo, vocab, temperature, top_p, /*ban=*/-1, rng);
     if (out_logprob)
         *out_logprob = token_logprob(logits, vocab, chosen, allow);
     return chosen;

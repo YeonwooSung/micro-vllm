@@ -539,6 +539,30 @@ RuntimeConfig runtime_from_env() {
         if (rt.kv_slots > 16)
             rt.kv_slots = 16;
     }
+    if (const char *v = get("MVLLM_KV") ? get("MVLLM_KV")
+                                        : (get("MVLLM_KV_PATH") ? get("MVLLM_KV_PATH")
+                                                                : get("COLI_KV")))
+        rt.kv_path = v;
+    if (const char *v = get("MVLLM_KV_VER") ? get("MVLLM_KV_VER") : get("COLI_KV_VER")) {
+        rt.kv_persist_ver = std::atoi(v);
+        if (rt.kv_persist_ver < 1 || rt.kv_persist_ver > 3)
+            rt.kv_persist_ver = 1;
+    }
+    if (const char *v = get("COLI_KV8")) {
+        if (std::atoi(v) != 0)
+            rt.kv_persist_ver = 2;
+    }
+    if (const char *v = get("COLI_TQ")) {
+        if (std::atoi(v) != 0)
+            rt.kv_persist_ver = 3;
+    }
+    if (const char *v = get("COLI_TQ_CODEC") ? get("COLI_TQ_CODEC") : get("MVLLM_KV_TQ_CODEC"))
+        rt.kv_tq_codec = std::atoi(v) != 0 ? 1 : 0;
+    if (const char *v = get("COLI_TQ_BITS") ? get("COLI_TQ_BITS") : get("MVLLM_KV_TQ_BITS")) {
+        rt.kv_tq_bits = std::atoi(v);
+        if (rt.kv_tq_bits != 3)
+            rt.kv_tq_bits = 4;
+    }
     return rt;
 }
 

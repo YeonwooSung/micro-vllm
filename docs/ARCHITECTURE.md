@@ -175,6 +175,8 @@ each routed expert once for the chunk (`prefill=layer`). Decode stays C=1.
 KV prefix reuse (`KvPrefix`) is all-or-nothing: the next prompt must strictly
 extend the recorded fed ids, else prefill from scratch. Tainted state (ids
 cannot describe the input) never reuses. Equal or shorter prompts cannot rewind.
+`Engine::generate_ids` arms `KvPrefix` per slot and sets `prefix_reuse` from
+`reuse()` (no LCP fallback). Mux extras may pass `prefix_bytes` / `prefix_reuse`.
 
 `logprob_target` is official double softmax log p(token). Ragged decode
 rows are `kv_row(base, pos, width)` per sequence. UTF-8 is official
@@ -202,6 +204,10 @@ e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale) or PolarQuant /
 rotated int4 (`kv_tq_*` / `kv_q4_*`). COLIKV2 stores e4m3 L/R + per-row
 scale (`KvPersistV2`). COLIKV3 stores PolarQuant or rotated-int4 L/R +
 radius (`KvPersistV3`; `format_tag = codec<<8 | bits`).
+`Engine` opens `RuntimeConfig.kv_path` (`MVLLM_KV` / `COLI_KV`) at load,
+warms slot 0 from hist, and appends new tokens after generate (zero L/R/I
+until family KV export). SUBMIT extras `persist`/`kv_path`/`coli_kv` plus
+`persist_ver` overlay the path for that request.
 
 Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
 declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
@@ -229,9 +235,12 @@ last step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
 
 MoE pick: unused-scan top-k; NaN scores never win (`moe_router_pick`
 falls back to slot index). Nucleus sampling uses the official max-heap
-partial top-p (`nuc_dist_build`); greedy ignores ban. Stop set: config
+partial top-p (`nuc_dist_build`); greedy ignores ban. `sample_token`
+delegates to `nuc_pick` (allow mask → NaN). Stop set: config
 ids + eos + tokenizer specials, cap 64; `eos_only` keeps just eos
-(batched-serve tool-call safety). GBNF forced draft walks while exactly
+(batched-serve tool-call safety). `Engine::generate_ids` arms `StopSet`
+into `GenParams.stop_ids`; families stop via `gen_stop_id`. Mux extras
+accept `stop_ids` / `eos_only`. GBNF forced draft walks while exactly
 one next token/byte is legal (`gbnf_forced_*`).
 
 Host `hw_probe` / `rss_gb` match official HWINFO units (cores, RAM GB, CPU

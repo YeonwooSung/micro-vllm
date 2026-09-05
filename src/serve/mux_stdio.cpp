@@ -551,6 +551,8 @@ struct Mux {
             emit_error(id, "BAD_REQUEST");
             return;
         }
+        // persist_path / stop_ids / eos_only stay on gp for generate_ids.
+        // prefix_bytes is an engine hint; do not convert it to prefix_reuse.
         slot = clamp_slot(gp.cache_slot, engine.sessions().n_slots());
         gp.cache_slot = slot;
         if (gp.max_new_tokens > 0)
@@ -830,6 +832,68 @@ bool mux_apply_extra_json(const std::string &extra, GenParams &gp, std::string &
         gp.think = j["think"].get<bool>();
     if (j.contains("enable_thinking") && j["enable_thinking"].is_boolean())
         gp.think = j["enable_thinking"].get<bool>();
+
+    auto apply_persist_path = [&](const char *key) -> bool {
+        if (!j.contains(key))
+            return true;
+        if (!j[key].is_string()) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.persist_path = j[key].get<std::string>();
+        return true;
+    };
+    if (!apply_persist_path("persist") || !apply_persist_path("kv_path") ||
+        !apply_persist_path("coli_kv"))
+        return false;
+
+    auto apply_persist_ver = [&](const char *key) -> bool {
+        if (!j.contains(key))
+            return true;
+        if (!as_int(j[key], iv) || iv < 1 || iv > 3) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.persist_ver = iv;
+        return true;
+    };
+    if (!apply_persist_ver("persist_ver") || !apply_persist_ver("kv_ver"))
+        return false;
+
+    if (j.contains("prefix_bytes")) {
+        if (!as_int(j["prefix_bytes"], iv) || iv < 0) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.prefix_bytes = iv;
+    }
+    if (j.contains("prefix_reuse")) {
+        if (!as_int(j["prefix_reuse"], iv) || iv < 0) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.prefix_reuse = iv;
+    }
+
+    if (j.contains("stop_ids")) {
+        const json &arr = j["stop_ids"];
+        if (!arr.is_array()) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.stop_ids.clear();
+        for (const auto &x : arr) {
+            if (as_int(x, iv))
+                gp.stop_ids.push_back(iv);
+        }
+    }
+    if (j.contains("eos_only")) {
+        if (!j["eos_only"].is_boolean()) {
+            err = "invalid extra json";
+            return false;
+        }
+        gp.eos_only = j["eos_only"].get<bool>();
+    }
 
     return true;
 }
