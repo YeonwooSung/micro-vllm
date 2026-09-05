@@ -1002,6 +1002,10 @@ static void test_offload_generate() {
     gp.eos = 1;
     GenResult gr;
     CHECK(ek.generate("hi", gp, gr, err) == Status::Ok);
+    {
+        std::ifstream uf(kdir + "/.coli_usage", std::ios::binary);
+        CHECK(uf.good());
+    }
     ExpertStoreStats st{};
     ek.expert_stats(st);
     CHECK(st.requests > 0);
@@ -1034,6 +1038,10 @@ static void test_offload_generate() {
     Engine eg;
     CHECK(eg.load(gdir, rt, err) == Status::Ok);
     CHECK(eg.generate("ok", gp, gr, err) == Status::Ok);
+    {
+        std::ifstream uf(gdir + "/.coli_usage", std::ios::binary);
+        CHECK(uf.good());
+    }
     ExpertStoreStats gst{};
     eg.expert_stats(gst);
     CHECK(gst.requests > 0);

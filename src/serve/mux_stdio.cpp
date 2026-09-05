@@ -1,4 +1,5 @@
 #include "mux_stdio.hpp"
+#include "mux_frames.hpp"
 
 #include "../core/config.hpp"
 #include "../engine.hpp"
@@ -76,6 +77,33 @@ static void emit_error(uint64_t id, const char *code) {
 
 static void emit_accept(uint64_t id, int prompt_tokens) {
     emit_line("ACCEPT %llu %d\n", static_cast<unsigned long long>(id), prompt_tokens);
+}
+
+// Official: zero-byte TOOL after ACCEPT declares the K3 tool sideband.
+static void emit_tool_sideband(uint64_t id) {
+    const std::string line = mux_format_tool(id, nullptr, 0);
+    fwrite(line.data(), 1, line.size(), stdout);
+    fflush(stdout);
+}
+
+static void emit_topk_rows(Engine &engine, uint64_t id, const GenResult &out) {
+    for (size_t i = 0; i < out.top_logprobs.size(); ++i) {
+        const std::vector<GenLogprob> &row = out.top_logprobs[i];
+        int k = static_cast<int>(row.size());
+        if (k > 5)
+            k = 5;
+        if (k <= 0)
+            continue;
+        float lps[5];
+        std::string texts[5];
+        for (int j = 0; j < k; ++j) {
+            lps[j] = row[static_cast<size_t>(j)].logprob;
+            texts[j] = engine.decode_token(row[static_cast<size_t>(j)].token);
+        }
+        const std::string line = mux_format_topk(id, lps, texts, k);
+        fwrite(line.data(), 1, line.size(), stdout);
+        fflush(stdout);
+    }
 }
 
 static void emit_data(uint64_t id, const std::string &piece) {
@@ -599,6 +627,8 @@ struct Mux {
                 return;
             }
             emit_accept(id, prompt_tokens);
+            if (k3 || engine.family() == Family::KimiK3)
+                emit_tool_sideband(id);
             fl.sched_id = sid;
             flights[id] = std::move(fl);
             sched_to_client[sid] = id;
@@ -612,6 +642,8 @@ struct Mux {
         }
         take_pending_image(id, fl, gp);
         emit_accept(id, prompt_tokens);
+        if (k3 || engine.family() == Family::KimiK3)
+            emit_tool_sideband(id);
         flights[id] = std::move(fl);
         emit_stat();
         if (Flight *stored = find(id)) {
@@ -657,6 +689,8 @@ struct Mux {
             forget(id);
             return;
         }
+        if (gp.logprobs > 0 && !out.top_logprobs.empty())
+            emit_topk_rows(engine, id, out);
         const int emitted = live ? live->emitted : static_cast<int>(out.tokens.size());
         const int limited = length_limited_of(out.tokens, max_tokens, engine.config(), gp.eos);
         emit_done(id, emitted, prompt_tokens, limited, stop_kind_of(out.stopped_by_stop, limited));
@@ -683,6 +717,8 @@ struct Mux {
             } else if (job->status != Status::Ok) {
                 emit_error(fl->id, "BAD_REQUEST");
             } else {
+                if (job->gp.logprobs > 0 && !job->out.top_logprobs.empty())
+                    emit_topk_rows(engine, fl->id, job->out);
                 const int emitted = static_cast<int>(job->out.tokens.size());
                 const int limited = length_limited_of(job->out.tokens, fl->max_tokens,
                                                       engine.config(), job->gp.eos);

@@ -4,11 +4,14 @@
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
 #include "../serve/session.hpp"
+#include "../store/route_trace.hpp"
+#include "../store/route_usage.hpp"
 #include "../tok/decode_post.hpp"
 #include "../tok/gbnf.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -148,6 +151,20 @@ public:
             return st;
         experts_.clear();
         loaded_ = true;
+        Status ust = usage_.init("glm53", cfg_.n_layers, std::max(cfg_.moe.n_experts, 1), err);
+        if (ust != Status::Ok)
+            return ust;
+        for (int l = 0; l < cfg_.first_dense; ++l)
+            usage_.drop_row(l);
+        std::string uerr;
+        usage_.load(rt_.model_dir + "/.coli_usage", false, uerr);
+        const char *tpath = std::getenv("MVLLM_ROUTE_TRACE");
+        if (!tpath || !tpath[0])
+            tpath = std::getenv("COLI_ROUTE_TRACE");
+        if (tpath && tpath[0]) {
+            std::string terr;
+            trace_.open(tpath, terr);
+        }
         return Status::Ok;
     }
 
@@ -249,6 +266,8 @@ public:
             sl.have = true;
             sl.live = false;
         }
+        std::string serr;
+        usage_.save(rt_.model_dir + "/.coli_usage", serr);
         return Status::Ok;
     }
 
@@ -1599,6 +1618,7 @@ private:
         const int K = std::max(cfg_.moe.topk, 0);
         std::vector<int> idx(static_cast<size_t>(C) * std::max(K, 1), -1);
         std::vector<float> wt(static_cast<size_t>(C) * std::max(K, 1), 0.f);
+        std::string terr;
         for (int c = 0; c < C; ++c) {
             std::vector<float> scores(cfg_.moe.n_experts), choice(cfg_.moe.n_experts);
             quant::matmul_f32(scores.data(), xs + static_cast<size_t>(c) * H, router_[layer].data(),
@@ -1611,7 +1631,11 @@ private:
             }
             moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
                      wt.data() + static_cast<size_t>(c) * K, scores.data());
+            usage_.count(layer, idx.data() + static_cast<size_t>(c) * K, K);
+            trace_.emit(c, layer, idx.data() + static_cast<size_t>(c) * K,
+                        wt.data() + static_cast<size_t>(c) * K, K, terr);
         }
+        trace_.end();
         std::vector<int> uniq(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1)));
         int nu = moe_union_ids(idx.data(), C, K, uniq.data(), static_cast<int>(uniq.size()));
         std::vector<ExpertKey> keys(static_cast<size_t>(nu));
@@ -1819,6 +1843,8 @@ private:
     ModelConfig cfg_{};
     RuntimeConfig rt_{};
     ExpertStore store_;
+    RouteUsage usage_;
+    RouteTrace trace_;
     bool loaded_ = false;
     bool from_checkpoint_ = false;
     std::string prefix_;

@@ -4,11 +4,14 @@
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
 #include "../serve/session.hpp"
+#include "../store/route_trace.hpp"
+#include "../store/route_usage.hpp"
 #include "../tok/decode_post.hpp"
 #include "../tok/gbnf.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -174,6 +177,24 @@ public:
         if (st != Status::Ok)
             return st;
         experts_.clear();
+        Status ust = usage_.init("kimi_k3", cfg_.n_layers, std::max(cfg_.moe.n_experts, 1), err);
+        if (ust != Status::Ok)
+            return ust;
+        for (int l = 0; l < cfg_.first_dense; ++l)
+            usage_.drop_row(l);
+        {
+            std::string uerr;
+            (void)usage_.load(rt_.model_dir + "/.coli_usage", false, uerr);
+        }
+        {
+            const char *tp = std::getenv("MVLLM_ROUTE_TRACE");
+            if (!tp || !tp[0])
+                tp = std::getenv("COLI_ROUTE_TRACE");
+            if (tp && tp[0]) {
+                std::string terr;
+                (void)trace_.open(tp, terr);
+            }
+        }
         loaded_ = true;
         return Status::Ok;
     }
@@ -552,6 +573,10 @@ public:
             sl.history.insert(sl.history.end(), out.tokens.begin(), out.tokens.end());
             sl.have = true;
             sl.live = false;
+        }
+        {
+            std::string serr;
+            (void)usage_.save(rt_.model_dir + "/.coli_usage", serr);
         }
         return Status::Ok;
     }
@@ -1647,11 +1672,18 @@ private:
             }
             moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
                      wt.data() + static_cast<size_t>(c) * K, scores.data());
+            usage_.count(layer, idx.data() + static_cast<size_t>(c) * K, K);
+            {
+                std::string terr;
+                (void)trace_.emit(c, layer, idx.data() + static_cast<size_t>(c) * K,
+                                  wt.data() + static_cast<size_t>(c) * K, K, terr);
+            }
             if (cfg_.moe.latent > 0)
                 d_.lat_down[layer].gemm(zs.data() + static_cast<size_t>(c) * I, x, 1);
             else
                 std::memcpy(zs.data() + static_cast<size_t>(c) * I, x, H * sizeof(float));
         }
+        trace_.end();
         std::vector<int> uniq(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1)));
         int nu = moe_union_ids(idx.data(), C, K, uniq.data(), static_cast<int>(uniq.size()));
         std::vector<ExpertKey> keys(static_cast<size_t>(nu));
@@ -1869,6 +1901,8 @@ private:
     bool from_checkpoint_ = false;
     std::string prefix_;
     K3Slot slots_[kMaxKvSlots];
+    RouteUsage usage_;
+    RouteTrace trace_;
 };
 
 std::unique_ptr<FamilyEngine> make_kimi_k3() { return std::make_unique<KimiK3Engine>(); }

@@ -244,7 +244,10 @@ BF16 is high-16 nearest-even; Hadamard-BF16 is unnormalized FWHT then
 
 `.coli_usage`: sparse `layer expert count` with `-1`/`-2` headers (FNV-1a
 engine id). All-zero history is a zero-byte file. Atomic tmp+rename.
-`ROUTE_TRACE` lines are `<call> <row> <layer> <id>:<gate.4f> …`.
+K3/GLM `generate` counts routed ids and saves `model_dir/.coli_usage`.
+`ROUTE_TRACE` lines are `<call> <row> <layer> <id>:<gate.4f> …` when
+`MVLLM_ROUTE_TRACE` / `COLI_ROUTE_TRACE` is set. Mux emits a zero-byte
+`TOOL` after ACCEPT for Kimi K3 and `TOPK` rows when `logprobs>0`.
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

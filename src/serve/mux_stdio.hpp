@@ -12,7 +12,7 @@ namespace mvllm {
 class Engine;
 
 // Official mux wire (docs/serve_protocol.md): stdin SUBMIT/STOP/CANCEL,
-// stdout READY/ACCEPT/DATA/DONE/ERROR/STAT. Prefill serial via Engine scheduler.
+// stdout READY/ACCEPT/TOOL/DATA/TOPK/DONE/ERROR/STAT. Prefill serial via Engine scheduler.
 Status mux_stdio_run(Engine &engine, std::string &err);
 
 // SUBMIT extra bytes: JSON object overlay onto GenParams when a key is present.
