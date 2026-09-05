@@ -215,6 +215,18 @@ constexpr UniRange k_L[] = {
     {0x30000, 0x3134A},
 };
 
+// Uppercase letters used by pretok case runs: ASCII, Latin-1, Greek, Cyrillic, fullwidth.
+constexpr UniRange k_Lu[] = {
+    {0x0041, 0x005A}, {0x00C0, 0x00D6}, {0x00D8, 0x00DE}, {0x0391, 0x03A1},
+    {0x03A3, 0x03A9}, {0x0410, 0x042F}, {0xFF21, 0xFF3A},
+};
+
+// Lowercase letters used by pretok case runs: ASCII, Latin-1, Greek, Cyrillic, fullwidth.
+constexpr UniRange k_Ll[] = {
+    {0x0061, 0x007A}, {0x00DF, 0x00F6}, {0x00F8, 0x00FF}, {0x03B1, 0x03C9},
+    {0x0430, 0x044F}, {0xFF41, 0xFF5A},
+};
+
 } // namespace
 
 bool uni_is_L(uint32_t cp) {
@@ -227,6 +239,26 @@ bool uni_is_N(uint32_t cp) {
 
 bool uni_is_S(uint32_t cp) {
     return uni_scalar(cp) && uni_in(cp, k_S);
+}
+
+bool uni_is_Lu(uint32_t cp) {
+    return uni_scalar(cp) && uni_in(cp, k_Lu);
+}
+
+uint32_t uni_to_lower(uint32_t cp) {
+    if (uni_is_Ll(cp))
+        return cp;
+    // Simple 1:1 fold (not full Unicode casefold).
+    if ((cp >= 'A' && cp <= 'Z') || (cp >= 0xFF21u && cp <= 0xFF3Au) ||
+        (cp >= 0x00C0u && cp <= 0x00D6u) || (cp >= 0x00D8u && cp <= 0x00DEu) ||
+        (cp >= 0x0391u && cp <= 0x03A9u && cp != 0x03A2u) ||
+        (cp >= 0x0410u && cp <= 0x042Fu))
+        return cp + 0x20u;
+    return cp;
+}
+
+bool uni_is_Ll(uint32_t cp) {
+    return uni_scalar(cp) && uni_in(cp, k_Ll);
 }
 
 } // namespace mvllm

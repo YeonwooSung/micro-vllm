@@ -3526,6 +3526,7 @@ int main() {
         CHECK(nor.find("reasoning_tokens") == std::string::npos);
         std::string hz = health_json(nullptr);
         CHECK(hz.find("\"ok\":true") != std::string::npos);
+        CHECK(hz.find("rss_gb") != std::string::npos);
         CHECK(hz.find("kv_slots") != std::string::npos);
         CHECK(hz.find("\"model\"") == std::string::npos);
         std::string mo = openai_model_object("glm53");
@@ -4604,6 +4605,14 @@ int main() {
         CHECK(!uni_is_L('0') && !uni_is_L(' ') && !uni_is_L(0x3000));
         CHECK(uni_is_N('0') && uni_is_N(0xFF10) && !uni_is_N('A'));
         CHECK(uni_is_S(' ') && uni_is_S(0x3000) && !uni_is_S('A'));
+        CHECK(uni_is_Lu('A') && uni_is_Lu(0x0410) && !uni_is_Lu('a'));
+        CHECK(uni_is_Ll('a') && uni_is_Ll(0x0430) && !uni_is_Ll('A'));
+        CHECK(uni_is_L('A') && uni_is_L('a'));
+        CHECK(uni_to_lower('A') == 'a' && uni_to_lower(0x0410) == 0x0430);
+        CHECK(uni_to_lower('a') == 'a' && uni_to_lower('0') == '0');
+        std::string det = detokenize_response("hi\"x");
+        CHECK(det.find("\"text\":\"") != std::string::npos);
+        CHECK(det.find("hi") != std::string::npos);
         std::string tokj = tokenize_response({1, 2, 3});
         CHECK(tokj.find("\"count\":3") != std::string::npos);
         CHECK(tokj.find("1,2,3") != std::string::npos);

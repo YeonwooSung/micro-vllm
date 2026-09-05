@@ -43,6 +43,7 @@ OpenAI-compatible:
 - `GET  /health`
 - `GET  /metrics`
 - `POST /tokenize` / `/v1/tokenize`
+- `POST /detokenize` / `/v1/detokenize`
 - `GET  /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/completions`         (echo)

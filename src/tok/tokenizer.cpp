@@ -162,33 +162,15 @@ bool is_letter(uint32_t c, bool exclude_han) {
 }
 
 bool is_upper(uint32_t c) {
-    if (c >= 'A' && c <= 'Z')
-        return true;
-    if (c >= 0xff21 && c <= 0xff3a)
-        return true;
-    if (c >= 0xc0 && c <= 0xd6)
-        return true;
-    if (c >= 0xd8 && c <= 0xde)
-        return true;
-    return false;
+    return uni_is_Lu(c);
 }
 
 bool is_lower(uint32_t c) {
-    if (c >= 'a' && c <= 'z')
-        return true;
-    if (c >= 0xff41 && c <= 0xff5a)
-        return true;
-    if (c >= 0xdf && c <= 0xf6)
-        return true;
-    if (c >= 0xf8 && c <= 0xff)
-        return true;
-    return false;
+    return uni_is_Ll(c);
 }
 
 uint32_t low_ascii(uint32_t c) {
-    if (c >= 'A' && c <= 'Z')
-        return c + 32;
-    return c;
+    return uni_to_lower(c);
 }
 
 int contraction_len(const uint32_t *cp, int i, int n) {

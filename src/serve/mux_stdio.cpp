@@ -63,15 +63,9 @@ static void emit_line(const char *fmt, ...) {
 }
 
 static void emit_stat_n(int n_live) {
-    const std::string line = mux_format_stat(n_live);
+    const std::string line = mux_format_stat(n_live, 0, 0, rss_gb());
     fwrite(line.data(), 1, line.size(), stdout);
     fflush(stdout);
-}
-
-static void emit_ready() {
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    fflush(stdout);
-    emit_stat_n(0);
 }
 
 static void emit_error(uint64_t id, const char *code) {
@@ -372,6 +366,29 @@ struct Mux {
     }
 
     void emit_stat() { emit_stat_n(static_cast<int>(flights.size())); }
+
+    // Official: READY, STAT 0, HWINFO, TIERS, EMAP (if route_telem has rows).
+    void emit_ready() {
+        fputs("\x01\x01READY\x01\x01\n", stdout);
+        fflush(stdout);
+        emit_stat_n(0);
+        const std::string hw = hwinfo_line();
+        fwrite(hw.data(), 1, hw.size(), stdout);
+        RouteTelem rt;
+        engine.route_telem(rt, false);
+        ExpertStoreStats st{};
+        engine.expert_stats(st);
+        const double ram_gb =
+            rt.ram_gb > 0.0 ? rt.ram_gb : static_cast<double>(st.resident_bytes) / 1e9;
+        const std::string tiers =
+            mux_format_tiers(rt.vram, rt.ram, rt.disk, rt.vram_gb, ram_gb);
+        fwrite(tiers.data(), 1, tiers.size(), stdout);
+        if (rt.rows > 0 && !rt.emap.empty()) {
+            const std::string em = mux_format_emap(rt.rows, rt.cols, rt.emap.data());
+            fwrite(em.data(), 1, em.size(), stdout);
+        }
+        fflush(stdout);
+    }
 
     void forget(uint64_t id) {
         auto it = flights.find(id);

@@ -1,5 +1,6 @@
 #include "http_server.hpp"
 #include "anthropic.hpp"
+#include "hwinfo.hpp"
 #include "mux_frames.hpp"
 #include "../engine.hpp"
 #include "../io/file_io.hpp"
@@ -431,6 +432,48 @@ bool tokenize_request(Engine *engine, const std::vector<ChatMessage> &msgs,
     return true;
 }
 
+bool parse_detokenize_ids(const std::string &body, std::vector<int> &ids) {
+    try {
+        const nlohmann::json root = nlohmann::json::parse(body);
+        if (!root.is_object())
+            return false;
+        const char *key = nullptr;
+        if (root.contains("tokens"))
+            key = "tokens";
+        else if (root.contains("ids"))
+            key = "ids";
+        else
+            return false;
+        const nlohmann::json &arr = root.at(key);
+        if (!arr.is_array())
+            return false;
+        ids.clear();
+        ids.reserve(arr.size());
+        for (const auto &el : arr) {
+            if (!el.is_number_integer())
+                return false;
+            ids.push_back(el.get<int>());
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string detokenize_ids(Engine *engine, const std::vector<int> &ids) {
+    Tokenizer tok;
+    std::string terr;
+    if (tok.load(engine->runtime().model_dir, terr) == Status::Ok) {
+        std::string text;
+        tok.decode(ids, text);
+        return text;
+    }
+    std::string text;
+    for (int id : ids)
+        text += engine->decode_token(id);
+    return text;
+}
+
 int resolve_http_slot(Engine *engine, const std::vector<ChatMessage> &msgs, int cache_slot) {
     if (!msgs.empty() && engine->sessions().n_slots() > 1)
         return engine->sessions().assign(msgs, cache_slot);
@@ -761,7 +804,7 @@ std::string health_json(Engine *engine) {
            << static_cast<unsigned long long>(snap.timed_out) << ",\"cancelled\":"
            << static_cast<unsigned long long>(snap.cancelled) << '}';
     }
-    os << "}";
+    os << ",\"rss_gb\":" << rss_gb() << "}";
     return os.str();
 }
 
@@ -882,11 +925,12 @@ std::string openai_model_object(const std::string &id) {
 }
 
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
-                         int running, int queued, int max_queue) {
+                         int running, int queued, int max_queue, double rss_gb) {
     std::ostringstream os;
     os << "{\"requests\":" << requests << ",\"tokens_out\":" << tokens_out
        << ",\"kv_slots\":" << kv_slots << ",\"queue\":" << queue << ",\"running\":" << running
-       << ",\"queued\":" << queued << ",\"max_queue\":" << max_queue << "}";
+       << ",\"queued\":" << queued << ",\"max_queue\":" << max_queue << ",\"rss_gb\":" << rss_gb
+       << "}";
     return os.str();
 }
 
@@ -900,6 +944,10 @@ std::string tokenize_response(const std::vector<int> &ids) {
     }
     os << "]}";
     return os.str();
+}
+
+std::string detokenize_response(const std::string &text) {
+    return std::string("{\"text\":\"") + json_escape(text) + "\"}";
 }
 
 HttpServer::HttpServer() = default;
@@ -1075,7 +1123,7 @@ void HttpServer::handle_client(int cfd) {
         const bool v1 = path.size() >= 4 && path.compare(0, 4, "/v1/") == 0;
         if (method == "OPTIONS" &&
             (path == "/health" || path == "/experts" || path == "/profile" || path == "/metrics" ||
-             path == "/tokenize" || v1)) {
+             path == "/tokenize" || path == "/detokenize" || v1)) {
             http_options(cfd);
             ::close(cfd);
             return;
@@ -1118,7 +1166,8 @@ void HttpServer::handle_client(int cfd) {
                 max_queue = engine_->scheduler().max_queue();
             }
             http_reply(cfd, 200, "OK",
-                       metrics_json(requests, tokens_out, kv, q, running, queued, max_queue),
+                       metrics_json(requests, tokens_out, kv, q, running, queued, max_queue,
+                                    rss_gb()),
                        request_id);
         } else if (method == "GET" && path == "/v1/models") {
             http_reply(cfd, 200, "OK", openai_models_response(model_name(engine_)), request_id);
@@ -1172,6 +1221,22 @@ void HttpServer::handle_client(int cfd) {
                 return;
             }
             http_reply(cfd, 200, "OK", tokenize_response(ids), request_id);
+        } else if (method == "POST" && (path == "/detokenize" || path == "/v1/detokenize")) {
+            if (!engine_) {
+                http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",
+                           request_id);
+                ::close(cfd);
+                return;
+            }
+            std::vector<int> ids;
+            if (!parse_detokenize_ids(body, ids)) {
+                http_reply(cfd, 400, "Bad Request", "{\"error\":\"tokens or ids required\"}",
+                           request_id);
+                ::close(cfd);
+                return;
+            }
+            http_reply(cfd, 200, "OK", detokenize_response(detokenize_ids(engine_, ids)),
+                       request_id);
         } else if (method == "POST" && path == "/v1/messages") {
             if (!engine_) {
                 http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",

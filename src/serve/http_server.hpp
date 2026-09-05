@@ -91,9 +91,11 @@ std::string openai_sse_colibri(Engine *engine); // data: {"colibri":<colibri_jso
 std::string with_colibri(const std::string &body, Engine *engine);
 std::string openai_model_object(const std::string &id);
 std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, int queue,
-                         int running = 0, int queued = 0, int max_queue = 0);
+                         int running = 0, int queued = 0, int max_queue = 0, double rss_gb = 0);
 // POST /tokenize and /v1/tokenize body helper. Compact JSON {"count":N,"tokens":[...]}
 std::string tokenize_response(const std::vector<int> &ids);
+// POST /detokenize and /v1/detokenize body helper. Compact JSON {"text":"..."}
+std::string detokenize_response(const std::string &text);
 
 // Strip :port / [ipv6]:port, lowercase. Empty Host → empty name.
 std::string host_header_name(const std::string &host_header);

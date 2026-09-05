@@ -22,5 +22,8 @@ std::string utf8_encode_cp(uint32_t cp);
 bool uni_is_L(uint32_t cp);
 bool uni_is_N(uint32_t cp);
 bool uni_is_S(uint32_t cp);
+bool uni_is_Lu(uint32_t cp); // uppercase letter
+bool uni_is_Ll(uint32_t cp); // lowercase letter
+uint32_t uni_to_lower(uint32_t cp); // simple case fold; identity if none
 
 } // namespace mvllm
