@@ -61,6 +61,9 @@ set(MVLLM_HOST_SOURCES
     src/tok/k3_tools.cpp
     src/tok/k3_chat1.cpp
     src/tok/gbnf.cpp
+    src/tok/gbnf_forced.cpp
+    src/tok/sample_nuc.cpp
+    src/tok/stop_set.cpp
     src/tok/json_schema.cpp
     src/tok/decode_post.cpp
     src/tok/glm_tools.cpp

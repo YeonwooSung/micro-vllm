@@ -38,6 +38,9 @@
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
 #include "tok/gbnf.hpp"
+#include "tok/gbnf_forced.hpp"
+#include "tok/sample_nuc.hpp"
+#include "tok/stop_set.hpp"
 #include "tok/json_schema.hpp"
 #include "tok/k3_chat1.hpp"
 #include "tok/decode_post.hpp"
@@ -4146,6 +4149,67 @@ int main() {
         CHECK_NEAR(h[2], -2.f, 1e-5);
         CHECK_NEAR(h[3], 0.f, 1e-5);
         CHECK(hadamard_bf16(h, 3) == -1);
+    }
+    {
+        using namespace mvllm;
+        const float logits[] = {0.f, 3.f, 1.f, 2.f};
+        uint64_t rng = 0;
+        CHECK(nuc_pick(logits, 4, 0.f, 1.f, -1, &rng) == 1);
+        float p[4];
+        CHECK(nuc_dist_build(logits, 4, 1.f, 0.5f, p) == 1);
+        CHECK_NEAR(p[1], 1.f, 1e-5);
+        CHECK(p[0] == 0.f && p[2] == 0.f && p[3] == 0.f);
+        CHECK(nuc_dist_sample(p, 4, -1, &rng) == 1);
+        float nanlo[] = {std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::quiet_NaN()};
+        CHECK(nuc_dist_build(nanlo, 2, 1.f, 1.f, p) == 1);
+        CHECK_NEAR(p[0], 1.f, 1e-6);
+        CHECK(p[1] == 0.f);
+        double u = nuc_rng_u01(&rng);
+        CHECK(u >= 0.0 && u < 1.0);
+    }
+    {
+        using namespace mvllm;
+        int stops[] = {2, 5};
+        uint8_t specials[8] = {};
+        specials[7] = 1;
+        StopSet s;
+        s.arm(stops, 2, 1, specials, 8, false);
+        CHECK(s.size() == 4);
+        CHECK(s.data()[0] == 2 && s.data()[1] == 5 && s.data()[2] == 1 && s.data()[3] == 7);
+        CHECK(s.contains(7) && !s.contains(3));
+        CHECK(s.specials_added() == 1);
+        s.arm(stops, 2, 1, specials, 8, true);
+        CHECK(s.size() == 1 && s.data()[0] == 1 && s.specials_added() == 0);
+        s.arm(nullptr, 0, -1, nullptr, 0, false);
+        CHECK(s.size() == 0);
+    }
+    {
+        using namespace mvllm;
+        Gbnf g;
+        std::string e;
+        CHECK(g.compile("root ::= \"yes\"", e) == Status::Ok);
+        char buf[8] = {};
+        CHECK(gbnf_forced_bytes(g, buf, 8) == 3);
+        CHECK(std::string(buf, 3) == "yes");
+        Gbnf g2;
+        CHECK(g2.compile("root ::= \"yes\"", e) == Status::Ok);
+        auto dec = [](int id) -> std::string {
+            if (id == 1)
+                return "y";
+            if (id == 2)
+                return "e";
+            if (id == 3)
+                return "s";
+            if (id == 4)
+                return "n";
+            return "";
+        };
+        int toks[8];
+        CHECK(gbnf_forced_tokens(g2, dec, 5, toks, 8) == 3);
+        CHECK(toks[0] == 1 && toks[1] == 2 && toks[2] == 3);
+        Gbnf dead;
+        CHECK(gbnf_forced_bytes(dead, buf, 8) == 0);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

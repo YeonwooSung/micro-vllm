@@ -216,7 +216,11 @@ last step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
 (`h3_token_reduce_*`; default blocks 4:30, early 10:40).
 
 MoE pick: unused-scan top-k; NaN scores never win (`moe_router_pick`
-falls back to slot index).
+falls back to slot index). Nucleus sampling uses the official max-heap
+partial top-p (`nuc_dist_build`); greedy ignores ban. Stop set: config
+ids + eos + tokenizer specials, cap 64; `eos_only` keeps just eos
+(batched-serve tool-call safety). GBNF forced draft walks while exactly
+one next token/byte is legal (`gbnf_forced_*`).
 
 Host `hw_probe` / `rss_gb` match official HWINFO units (cores, RAM GB, CPU
 brand; GPU fields stay 0).
