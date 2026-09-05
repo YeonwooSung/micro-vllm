@@ -11,6 +11,8 @@
 #include "serve/http_server.hpp"
 #include "io/image.hpp"
 #include "io/av_mux.hpp"
+#include "io/h3_resize.hpp"
+#include "quant/kv_fp8.hpp"
 #include "model/h3_text.hpp"
 #include "model/h3_audio_vae.hpp"
 #include "model/h3_layout.hpp"
@@ -32,6 +34,7 @@
 #include "serve/scheduler.hpp"
 #include "serve/anthropic.hpp"
 #include "serve/mux_stdio.hpp"
+#include "serve/mux_frames.hpp"
 #include "serve/cli_flags.hpp"
 
 #include <algorithm>
@@ -42,6 +45,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <unistd.h>
@@ -3597,6 +3601,102 @@ int main() {
         CHECK(kp3.append(&tok, 1, &p, 0, err) == Status::Ok);
         int two[2] = {5, 6};
         CHECK(kp3.append(two, 2, &p, 0, err) == Status::InvalidArgument);
+    }
+    {
+        using namespace mvllm;
+        const char payload[] = {'A', '\n', '\0', 'B'};
+        std::string tool0 = mux_format_tool(7, nullptr, 0);
+        CHECK(tool0 == "TOOL 7 0\n\n");
+        std::string data = mux_format_data(7, payload, 4);
+        CHECK(data.size() == std::string("DATA 7 4\n").size() + 4 + 1);
+        CHECK(data.compare(0, 9, "DATA 7 4\n") == 0);
+        CHECK(data[9] == 'A' && data[10] == '\n' && data[11] == '\0' && data[12] == 'B');
+        CHECK(data[13] == '\n');
+        CHECK(mux_hex_encode("ab", 2) == "6162");
+        float lp[2] = {-0.1f, -0.2f};
+        std::string tx[2] = {"a", "b"};
+        CHECK(mux_format_topk(1, lp, tx, 2) == "TOPK 1 2 -0.1 61 -0.2 62\n");
+        CHECK(mux_format_hwinfo(8, 16.0, 8.5, 0, 0.0, "cpu|x", "none") ==
+              "HWINFO 8 16.00 8.50 0 0.00 cpu x|none\n");
+        CHECK(mux_format_tiers(1, 2, 3, 1.5, 4.25) == "TIERS 1 2 3 1.50 4.25\n");
+        CHECK(mux_emap_byte(0, 0) == 0);
+        CHECK(mux_emap_byte(2, 0) == 0x80);
+        CHECK(mux_emap_byte(1, 1) == ((1 << 6) | 1));
+        CHECK(mux_emap_byte(1, 2) == ((1 << 6) | 2));
+        uint8_t em[2] = {0, 0x80};
+        CHECK(mux_format_emap(1, 2, em) == "EMAP 1 2 0080\n");
+        uint8_t hit[3] = {1, 0, 1};
+        CHECK(mux_format_hits(1, 3, hit) == "HITS 1 3 05\n");
+        std::string perf = mux_format_perf(9, 0.5, 0.1, 0, 0, 0, 0, 0);
+        CHECK(perf.find("PERF 9 ") == 0);
+        CHECK(perf.back() == '\n');
+        float ent[2] = {1.5f, 2.f};
+        CHECK(mux_format_entropy(ent, 2) == "ENTROPY 1.5 2\n");
+    }
+    {
+        using namespace mvllm;
+        std::string err;
+        const uint8_t in4[12] = {10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120};
+        std::vector<uint8_t> id;
+        CHECK(h3_resize_rgb24(in4, 1, 2, 2, 2, 2, id, err) == Status::Ok);
+        CHECK(id.size() == 12);
+        CHECK(id.data() != in4);
+        for (int i = 0; i < 12; ++i)
+            CHECK(id[static_cast<size_t>(i)] == in4[i]);
+        const uint8_t ab[12] = {0, 0, 0, 255, 0, 0, 0, 255, 0, 255, 255, 0};
+        std::vector<uint8_t> up;
+        CHECK(h3_resize_rgb24(ab, 1, 2, 2, 4, 4, up, err) == Status::Ok);
+        CHECK(up.size() == 4 * 4 * 3);
+        CHECK(up[0] == 0 && up[1] == 0 && up[2] == 0);
+        CHECK(up[3 * 3] == 255 && up[3 * 3 + 1] == 0 && up[3 * 3 + 2] == 0);
+        CHECK(up[3] == 64);
+        CHECK(up[6] == 191);
+        CHECK(h3_resize_rgb24(nullptr, 1, 2, 2, 2, 2, id, err) == Status::InvalidArgument);
+        std::vector<float> fin(12), fout;
+        for (int i = 0; i < 12; ++i)
+            fin[static_cast<size_t>(i)] = in4[i] / 255.f;
+        CHECK(h3_resize_rgb_f32(fin.data(), 1, 2, 2, 2, 2, fout, err) == Status::Ok);
+        CHECK(fout.size() == 12);
+        CHECK_NEAR(fout[0], fin[0], 1e-6);
+        std::vector<float> fup;
+        const float fab[12] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0};
+        CHECK(h3_resize_rgb_f32(fab, 1, 2, 2, 4, 4, fup, err) == Status::Ok);
+        CHECK_NEAR(fup[3], 0.25, 1e-5);
+        CHECK_NEAR(fup[6], 0.75, 1e-5);
+    }
+    {
+        using namespace mvllm;
+        kv_fp8_lut_init();
+        CHECK(kv_fp8_enc(0.f) == 0);
+        CHECK(kv_fp8_enc(1.f) == 0x38);
+        CHECK_NEAR(kv_fp8_lut(0x38), 1.f, 1e-6);
+        CHECK(kv_fp8_enc(-448.f) == 0xfe);
+        CHECK_NEAR(kv_fp8_lut(0xfe), -448.f, 1e-4);
+        CHECK(kv_fp8_enc(std::numeric_limits<float>::quiet_NaN()) == 0);
+        CHECK(kv_fp8_enc(1000.f) == 0x7e);
+        CHECK_NEAR(kv_fp8_lut(0x7e), 448.f, 1e-4);
+        CHECK(kv_fp8_lut(0x7f) == 0.f);
+        float src[4] = {1.f, -2.f, 0.5f, 0.f};
+        uint8_t q[4];
+        float back[4];
+        float sc = kv_fp8_quant_row(src, q, 4);
+        CHECK(sc > 0.f);
+        kv_fp8_dequant_row(q, sc, back, 4);
+        for (int i = 0; i < 4; ++i)
+            CHECK(std::fabs(back[i] - src[i]) < 0.05f);
+        float z[2] = {0.f, 0.f};
+        uint8_t zq[2] = {9, 9};
+        CHECK_NEAR(kv_fp8_quant_row(z, zq, 2), 1.f, 1e-6);
+        CHECK(zq[0] == 0 && zq[1] == 0);
+        CHECK(kv_fp8_nscale(8, 0) == 1);
+        CHECK(kv_fp8_nscale(8, 4) == 2);
+        float scales[2];
+        uint8_t qg[4];
+        float bg[4];
+        kv_fp8_quant_row_gs(src, qg, scales, 4, 2);
+        kv_fp8_dequant_row_gs(qg, scales, bg, 4, 2);
+        for (int i = 0; i < 4; ++i)
+            CHECK(std::fabs(bg[i] - src[i]) < 0.05f);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

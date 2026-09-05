@@ -52,7 +52,7 @@ src/quant    MXFP4, int4-g64, int8-row, SiTU-GLU, clamped SwiGLU
 src/store    ExpertStore (MoE LRU) + BlockStore (DiT 2-slot stream) + COLIKV1 persist
 src/tok      whitespace / HF tokenizer.json / raw ids
 src/model    family registry + llama / kimi_k3 / glm53 / h3 (+ canvas, DiT schedule)
-src/serve    OpenAI HTTP (/v1/chat/completions, /v1/models, /v1/videos)
+src/serve    OpenAI HTTP + mux TOOL/TOPK/HITS/EMAP telemetry frames
 src/legacy   original CUDA Llama demo
 ```
 
@@ -185,4 +185,12 @@ features, AdaLN `row_map` by segment kind, and official RES multistep
 
 K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R
 rows, optional DSA index). `nrec` is fsynced last. Mismatched geometry is
-ignored (empty reopen). Host F32 only (no KV8/TQ).
+ignored (empty reopen). Host F32 only. MLA latent rows can be stored as
+e4m3 (`kv_fp8_*`, per-row amax/448, optional group scale).
+
+Mux sideband (colibri serve_protocol): `TOOL` counted frames (zero-byte
+declares the sideband), `TOPK` hextext, `HITS` bit-hex, `EMAP` `(tier<<6)|heat`,
+plus `HWINFO`/`TIERS`/`PERF`/`ENTROPY` formatters.
+
+H3 RGB resize: portable bilinear + edge-extend (official vImage HQ path
+without Accelerate). Identity geometry still copies.
