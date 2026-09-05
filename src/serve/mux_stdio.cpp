@@ -9,6 +9,7 @@
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include "json.hpp"
 
+#include <algorithm>
 #include <cstdarg>
 #include <cerrno>
 #include <climits>
@@ -552,7 +553,16 @@ struct Mux {
             return;
         }
         // persist_path / stop_ids / eos_only stay on gp for generate_ids.
-        // prefix_bytes is an engine hint; do not convert it to prefix_reuse.
+        // Raw prefix_bytes → prefix_reuse tokens; skip K3CHAT1 and explicit reuse.
+        if (gp.prefix_bytes > 0 && gp.prefix_reuse == 0 && !k3) {
+            const int nb = std::min(gp.prefix_bytes, static_cast<int>(payload.size()));
+            std::vector<int> pids;
+            std::string perr;
+            if (tokenize_raw(payload.substr(0, static_cast<size_t>(nb)), pids, perr) &&
+                !pids.empty())
+                gp.prefix_reuse =
+                    std::min(static_cast<int>(pids.size()), static_cast<int>(ids.size()));
+        }
         slot = clamp_slot(gp.cache_slot, engine.sessions().n_slots());
         gp.cache_slot = slot;
         if (gp.max_new_tokens > 0)

@@ -4425,6 +4425,79 @@ int main() {
         CHECK(ek.persist_nrec() == static_cast<int>(hist1.size()));
         CHECK(ek.persist_hist() == hist1);
         CHECK(ek.prefix_reuse_len(0) == static_cast<int>(hist1.size()));
+        KvPersist kp;
+        KvPersistConfig pcfg;
+        pcfg.n_layers = ek.config().n_layers > 0 ? ek.config().n_layers : 1;
+        pcfg.kv_lora = std::max(ek.config().mla.kv_lora, 0);
+        pcfg.qk_rope = std::max(ek.config().mla.qk_rope, 0);
+        pcfg.index_hd = std::max(ek.config().dsa.head_dim, 0);
+        pcfg.vocab = std::max(ek.config().vocab, 0);
+        pcfg.has_index.assign(static_cast<size_t>(pcfg.n_layers), 0);
+        CHECK(kp.open(kvpath, pcfg, err) == Status::Ok);
+        std::vector<int> phist;
+        std::vector<KvPersistRecord> prows;
+        CHECK(kp.load(phist, &prows, err) == ek.persist_nrec());
+        CHECK(!prows.empty());
+        bool any_l = false;
+        for (const auto &r : prows) {
+            for (float v : r.L) {
+                if (v != 0.f) {
+                    any_l = true;
+                    break;
+                }
+            }
+            if (any_l)
+                break;
+        }
+        CHECK(any_l);
+        FamilyEngine *fe = ek.family_impl();
+        CHECK(fe != nullptr);
+        KvPersistRecord one;
+        one.L.assign(static_cast<size_t>(pcfg.n_layers) * static_cast<size_t>(pcfg.kv_lora), 0.f);
+        one.R.assign(static_cast<size_t>(pcfg.n_layers) * static_cast<size_t>(pcfg.qk_rope), 0.f);
+        CHECK(fe->export_kv_rows(0, 0, 1, &one) == 1);
+        GenParams extra;
+        std::string xerr;
+        CHECK(mux_apply_extra_json("{\"prefix_bytes\":2,\"prefix_reuse\":0}", extra, xerr));
+        CHECK(extra.prefix_bytes == 2 && extra.prefix_reuse == 0);
+        const std::string gdir = tmpdir();
+        write_file(gdir + "/config.json", R"({
+          "model_type": "glm",
+          "architectures": ["Glm5ForConditionalGeneration"],
+          "hidden_size": 32,
+          "num_hidden_layers": 2,
+          "vocab_size": 32,
+          "first_k_dense_replace": 1,
+          "intermediate_size": 32,
+          "num_experts": 2,
+          "num_experts_per_token": 1,
+          "moe_intermediate_size": 16,
+          "num_shared_experts": 1,
+          "q_lora_rank": 8,
+          "kv_lora_rank": 8,
+          "qk_nope_head_dim": 8,
+          "layer_types": ["linear","full_attention"],
+          "linear_attn_config": {"num_heads": 2, "head_dim": 8, "short_conv_kernel_size": 4},
+          "bos_token_id": 0,
+          "eos_token_id": 1
+        })");
+        Engine eg;
+        CHECK(eg.load(gdir, rt, err) == Status::Ok);
+        GenParams gpg;
+        gpg.max_new_tokens = 2;
+        gpg.eos = 1;
+        GenResult grg;
+        CHECK(eg.generate("ok", gpg, grg, err) == Status::Ok);
+        FamilyEngine *fg = eg.family_impl();
+        CHECK(fg != nullptr);
+        KvPersistRecord grow;
+        const int gl = std::max(eg.config().n_layers, 1);
+        const int gkv = std::max(eg.config().mla.kv_lora, 0);
+        const int gqr = std::max(eg.config().mla.qk_rope, 0);
+        grow.L.assign(static_cast<size_t>(gl) * static_cast<size_t>(gkv), 0.f);
+        grow.R.assign(static_cast<size_t>(gl) * static_cast<size_t>(gqr), 0.f);
+        grow.I.assign(static_cast<size_t>(std::max(eg.config().dsa.head_dim, 0)), 0.f);
+        CHECK(fg->export_kv_rows(0, 0, 1, &grow) == 1);
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;

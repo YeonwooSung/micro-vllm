@@ -451,6 +451,68 @@ public:
         slots_[slot].live = false;
     }
 
+    // L/R: layer-major from mla_cache[l][pos]. I: concat DSA keys of is_full layers.
+    int export_kv_rows(int slot, int pos0, int n, KvPersistRecord *rows) const override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        const Glm53Slot &sl = slots_[slot];
+        if (!sl.have)
+            return 0;
+        const int kvL = std::max(cfg_.mla.kv_lora, 0);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const int stride = kvL + qr;
+        const int ID = std::max(cfg_.dsa.head_dim, 0);
+        const int L = cfg_.n_layers;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0 || pos >= sl.pos)
+                return t;
+            KvPersistRecord &rec = rows[t];
+            if (stride > 0) {
+                for (int l = 0; l < L; ++l) {
+                    if (l >= static_cast<int>(sl.mla_cache.size()))
+                        break;
+                    const std::vector<float> &cache = sl.mla_cache[l];
+                    const size_t src = static_cast<size_t>(pos) * static_cast<size_t>(stride);
+                    if (src + static_cast<size_t>(stride) > cache.size())
+                        continue;
+                    if (kvL > 0) {
+                        const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(kvL);
+                        if (dst + static_cast<size_t>(kvL) <= rec.L.size())
+                            std::memcpy(rec.L.data() + dst, cache.data() + src,
+                                        static_cast<size_t>(kvL) * sizeof(float));
+                    }
+                    if (qr > 0) {
+                        const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(qr);
+                        if (dst + static_cast<size_t>(qr) <= rec.R.size())
+                            std::memcpy(rec.R.data() + dst, cache.data() + src + kvL,
+                                        static_cast<size_t>(qr) * sizeof(float));
+                    }
+                }
+            }
+            // Persist I is has_index / is_full layers in layer order; empty is_full = no index.
+            if (ID > 0 && !cfg_.is_full.empty()) {
+                size_t ioff = 0;
+                for (int l = 0; l < L; ++l) {
+                    const bool full =
+                        (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
+                    if (!full)
+                        continue;
+                    if (ioff + static_cast<size_t>(ID) <= rec.I.size() &&
+                        l < static_cast<int>(sl.dsa_ikeys.size())) {
+                        const std::vector<float> &ik = sl.dsa_ikeys[l];
+                        const size_t koff = static_cast<size_t>(pos) * static_cast<size_t>(ID);
+                        if (koff + static_cast<size_t>(ID) <= ik.size())
+                            std::memcpy(rec.I.data() + ioff, ik.data() + koff,
+                                        static_cast<size_t>(ID) * sizeof(float));
+                    }
+                    ioff += static_cast<size_t>(ID);
+                }
+            }
+        }
+        return n;
+    }
+
 private:
     int mhc_mult() const { return cfg_.mhc.mult > 0 ? cfg_.mhc.mult : 1; }
 

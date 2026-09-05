@@ -4,6 +4,7 @@
 #include "../quant/weight.hpp"
 #include "../store/block_store.hpp"
 #include "../store/expert_store.hpp"
+#include "../store/kv_persist.hpp"
 #include "../tok/tokenizer.hpp"
 
 #include <functional>
@@ -175,6 +176,17 @@ public:
         return Status::Ok;
     }
     virtual void end_generate(int slot) { (void)slot; }
+
+    // Copy slot KV at pos0..pos0+n into rows (already sized to persist geometry).
+    // L/R are layer-major [n_layers, kv_lora/qk_rope]; I is concatenated DSA rows.
+    // Returns how many rows were written. Default: none (caller keeps zeros).
+    virtual int export_kv_rows(int slot, int pos0, int n, KvPersistRecord *rows) const {
+        (void)slot;
+        (void)pos0;
+        (void)n;
+        (void)rows;
+        return 0;
+    }
 };
 
 std::unique_ptr<FamilyEngine> make_engine(Family family);

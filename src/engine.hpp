@@ -58,7 +58,7 @@ public:
 
 private:
     KvPersistConfig make_persist_cfg() const;
-    Status persist_append_tail(const std::vector<int> &hist, std::string &err);
+    Status persist_append_tail(int slot, const std::vector<int> &hist, std::string &err);
     Family family_ = Family::Unknown;
     ModelConfig cfg_{};
     RuntimeConfig rt_{};

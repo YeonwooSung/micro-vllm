@@ -245,7 +245,10 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
     }
     const int official = prefixes_[slot].reuse(ids.empty() ? nullptr : ids.data(),
                                                static_cast<int>(ids.size()));
-    g2.prefix_reuse = official;
+    if (official > 0)
+        g2.prefix_reuse = official;
+    else if (g2.prefix_reuse < 0)
+        g2.prefix_reuse = 0;
     g2.cache_slot = slot;
 
     Status st = impl_->generate(ids, g2, out, err);
@@ -261,7 +264,7 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
         if (n > 0)
             prefixes_[slot].record(hist.data(), 0, n);
         if (persist_open_) {
-            Status ast = persist_append_tail(hist, err);
+            Status ast = persist_append_tail(slot, hist, err);
             persist_hist_ = hist;
             if (ast != Status::Ok)
                 err.clear();
@@ -361,7 +364,7 @@ int Engine::prefix_reuse_len(int slot) const {
     return prefixes_[slot].len();
 }
 
-Status Engine::persist_append_tail(const std::vector<int> &hist, std::string &err) {
+Status Engine::persist_append_tail(int slot, const std::vector<int> &hist, std::string &err) {
     if (!persist_open_)
         return Status::Ok;
     const int nrec = persist_nrec();
@@ -391,6 +394,8 @@ Status Engine::persist_append_tail(const std::vector<int> &hist, std::string &er
         recs[static_cast<size_t>(i)].R.assign(want_r, 0.f);
         recs[static_cast<size_t>(i)].I.assign(want_i, 0.f);
     }
+    if (impl_)
+        impl_->export_kv_rows(slot, nrec, rec_n, recs.data());
     if (persist_ver_ == 1)
         return persist_v1_.append(hist.data(), hist_n, recs.data(), rec_n, err);
     if (persist_ver_ == 2)

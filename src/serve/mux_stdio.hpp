@@ -20,6 +20,8 @@ Status mux_stdio_run(Engine &engine, std::string &err);
 // temperature, top_p, top_k, logprobs, max_tokens/max_new_tokens (>0),
 // logit_bias, cache_slot, think/enable_thinking, persist/kv_path/coli_kv,
 // persist_ver/kv_ver (1..3), prefix_bytes, prefix_reuse, stop_ids, eos_only.
+// prefix_bytes on raw SUBMIT is converted to prefix_reuse token count (capped by
+// prompt length).
 // Unknown keys ignored. Invalid typed values for persist/prefix/stop extras fail.
 bool mux_apply_extra_json(const std::string &extra, GenParams &gp, std::string &err);
 

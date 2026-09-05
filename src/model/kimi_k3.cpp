@@ -750,6 +750,51 @@ public:
         slots_[slot].live = false;
     }
 
+    int export_kv_rows(int slot, int pos0, int n, KvPersistRecord *rows) const override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        const K3Slot &sl = slots_[slot];
+        if (!sl.have)
+            return 0;
+        const int kvL = std::max(cfg_.mla.kv_lora, 0);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const int stride = kvL + qr;
+        const int nL = cfg_.n_layers;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0 || pos >= sl.pos)
+                return t;
+            KvPersistRecord &rec = rows[t];
+            for (int l = 0; l < nL; ++l) {
+                const bool have_row = stride > 0 && l < static_cast<int>(sl.mla_cache.size()) &&
+                                      !sl.mla_cache[l].empty();
+                const size_t row0 = static_cast<size_t>(pos) * static_cast<size_t>(stride);
+                if (!have_row || row0 + static_cast<size_t>(stride) > sl.mla_cache[l].size())
+                    continue;
+                const float *src = sl.mla_cache[l].data() + row0;
+                if (kvL > 0) {
+                    const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(kvL);
+                    if (dst < rec.L.size()) {
+                        const int ncopy = std::min(kvL, static_cast<int>(rec.L.size() - dst));
+                        if (ncopy > 0)
+                            std::memcpy(rec.L.data() + dst, src,
+                                        static_cast<size_t>(ncopy) * sizeof(float));
+                    }
+                }
+                if (qr > 0) {
+                    const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(qr);
+                    if (dst < rec.R.size()) {
+                        const int ncopy = std::min(qr, static_cast<int>(rec.R.size() - dst));
+                        if (ncopy > 0)
+                            std::memcpy(rec.R.data() + dst, src + kvL,
+                                        static_cast<size_t>(ncopy) * sizeof(float));
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
 private:
     const float *sw_attn(int l) const {
         return (l < static_cast<int>(d_.attn_sw.size()) && !d_.attn_sw[l].empty())
