@@ -264,6 +264,11 @@ Turn telem includes host `GPUS 0` and a `PROF` line (wall/tokens/phases).
 (old_tier=1 RAM); mux emits them mid-turn and before DONE.
 Streaming chat/completions send a `colibri` SSE frame before `[DONE]`;
 JSON responses attach the same object.
+HTTP success sends `x-colibri-queue-wait-ms`; 429 queue-full/timeout use
+official `rate_limit_error` JSON plus `Retry-After: 1`. Scheduler records
+wait time, expires queued jobs after `queue_timeout_s`, and exposes
+admitted/rejected/timed_out counters on GET /health. `COLI_MAX_QUEUE` /
+`COLI_QUEUE_TIMEOUT` (or `MVLLM_*`) feed `RuntimeConfig`.
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

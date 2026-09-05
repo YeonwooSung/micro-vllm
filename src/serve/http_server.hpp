@@ -71,6 +71,9 @@ bool extract_chat_messages(const std::string &body, std::vector<ChatMessage> &ou
 bool extract_image_url_from_part(const std::string &part, std::string &url);
 bool api_key_ok(const std::string &authorization, const std::string &x_api_key = {});
 std::string health_json(Engine *engine);
+std::string queue_error_json(const char *code); // queue_full | queue_timeout
+std::string queue_wait_header(double wait_s);   // "x-colibri-queue-wait-ms: N\r\n"
+std::string retry_after_header();               // "Retry-After: 1\r\n"
 // Official GET /experts body. engine==null or !authed → empty rows/cols/map/hits, seq 0.
 // consume_hits is always false.
 std::string experts_json(Engine *engine, bool authed = true);

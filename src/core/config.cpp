@@ -563,6 +563,23 @@ RuntimeConfig runtime_from_env() {
         if (rt.kv_tq_bits != 3)
             rt.kv_tq_bits = 4;
     }
+    if (const char *v = get("COLI_MAX_QUEUE") ? get("COLI_MAX_QUEUE") : get("MVLLM_MAX_QUEUE")) {
+        int n = std::atoi(v);
+        if (n >= 0) {
+            if (n > 4096)
+                n = 4096;
+            rt.max_queue = n;
+        }
+    }
+    if (const char *v = get("COLI_QUEUE_TIMEOUT") ? get("COLI_QUEUE_TIMEOUT")
+                                                  : get("MVLLM_QUEUE_TIMEOUT")) {
+        int n = std::atoi(v);
+        if (n > 0) {
+            if (n > 86400)
+                n = 86400;
+            rt.queue_timeout_s = n;
+        }
+    }
     return rt;
 }
 

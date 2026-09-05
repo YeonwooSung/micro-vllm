@@ -24,6 +24,17 @@ struct BatchJob {
     std::string err;
     BatchJobState state = BatchJobState::Queued;
     int reuse = 0;
+    double queued_at = 0; // steady_clock seconds
+    double wait_s = 0;    // filled when the job starts Running
+};
+
+struct SchedulerSnapshot {
+    int active = 0;      // running_count
+    int queued = 0;      // queued_count
+    int capacity = 1;    // 1 if no sessions else sessions n_slots
+    int max_queue = 8;
+    int queue_timeout_seconds = 300;
+    uint64_t admitted = 0, completed = 0, rejected = 0, timed_out = 0, cancelled = 0;
 };
 
 // Prefill is serial; decode is round-robin across active slots (official mux:
@@ -48,6 +59,9 @@ public:
     int queued_count() const;  // Queued only
     int max_queue() const;
     int n_jobs() const;        // jobs_.size(), including terminal
+    double job_wait_s(uint64_t id) const; // 0 if unknown
+    int queue_timeout_s() const;
+    void snapshot(SchedulerSnapshot &out) const;
 
 private:
     Engine *engine_ = nullptr;
@@ -56,6 +70,7 @@ private:
     int queue_timeout_s_ = 300;
     uint64_t next_id_ = 1;
     std::vector<BatchJob> jobs_;
+    uint64_t admitted_ = 0, completed_ = 0, rejected_ = 0, timed_out_ = 0, cancelled_ = 0;
 };
 
 } // namespace mvllm

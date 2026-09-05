@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <cmath>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -182,29 +183,35 @@ void append_request_id(std::ostringstream &os, const std::string &request_id) {
         os << "X-Request-Id: " << request_id << "\r\n";
 }
 
+const char *kExposeHeaders =
+    "Access-Control-Expose-Headers: x-request-id, x-colibri-queue-wait-ms, Retry-After\r\n";
+
 void http_reply(int fd, int code, const char *reason, const std::string &body,
-                const std::string &request_id = {}) {
+                const std::string &request_id = {}, const std::string &extra_headers = {}) {
     std::ostringstream os;
     os << "HTTP/1.1 " << code << ' ' << reason << "\r\n"
        << "Content-Type: application/json; charset=utf-8\r\n"
        << "Content-Length: " << body.size() << "\r\n"
-       << "Access-Control-Allow-Origin: *\r\n";
+       << "Access-Control-Allow-Origin: *\r\n"
+       << kExposeHeaders;
     append_request_id(os, request_id);
-    os << "Connection: close\r\n"
+    os << extra_headers << "Connection: close\r\n"
        << "\r\n"
        << body;
     std::string resp = os.str();
     send_all(fd, resp.data(), resp.size());
 }
 
-void http_sse_headers(int fd, const std::string &request_id = {}) {
+void http_sse_headers(int fd, const std::string &request_id = {},
+                      const std::string &extra_headers = {}) {
     std::ostringstream os;
     os << "HTTP/1.1 200 OK\r\n"
        << "Content-Type: text/event-stream\r\n"
        << "Cache-Control: no-cache\r\n"
-       << "Access-Control-Allow-Origin: *\r\n";
+       << "Access-Control-Allow-Origin: *\r\n"
+       << kExposeHeaders;
     append_request_id(os, request_id);
-    os << "Connection: close\r\n"
+    os << extra_headers << "Connection: close\r\n"
        << "\r\n";
     std::string h = os.str();
     send_all(fd, h.data(), h.size());
@@ -216,6 +223,8 @@ void http_options(int fd) {
                     "Access-Control-Allow-Headers: authorization, content-type, x-api-key, "
                     "anthropic-version\r\n"
                     "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                    "Access-Control-Expose-Headers: x-request-id, x-colibri-queue-wait-ms, "
+                    "Retry-After\r\n"
                     "Content-Length: 0\r\n"
                     "Connection: close\r\n"
                     "\r\n";
@@ -412,10 +421,18 @@ int resolve_http_slot(Engine *engine, const std::vector<ChatMessage> &msgs, int 
 }
 
 std::string busy_error_body(const std::string &err) {
+    if (err.find("timeout") != std::string::npos || err.find("TIMEOUT") != std::string::npos)
+        return queue_error_json("queue_timeout");
     if (err.find("queue") != std::string::npos || err.find("QUEUE") != std::string::npos ||
         err.find("full") != std::string::npos)
-        return "{\"error\":\"queue full\"}";
+        return queue_error_json("queue_full");
     return "{\"error\":\"SLOT_BUSY\"}";
+}
+
+bool is_queue_limit_err(const std::string &err) {
+    return err.find("timeout") != std::string::npos || err.find("TIMEOUT") != std::string::npos ||
+           err.find("queue") != std::string::npos || err.find("QUEUE") != std::string::npos ||
+           err.find("full") != std::string::npos;
 }
 
 bool read_http(int fd, std::string &method, std::string &path, std::string &body,
@@ -627,6 +644,26 @@ bool api_key_ok(const std::string &authorization, const std::string &x_api_key) 
     return x_api_key == key;
 }
 
+std::string queue_error_json(const char *code) {
+    const bool timeout = code && std::strcmp(code, "queue_timeout") == 0;
+    const char *msg =
+        timeout ? "Timed out waiting for the inference engine." : "The inference queue is full.";
+    const char *out_code = timeout ? "queue_timeout" : (code && code[0] ? code : "queue_full");
+    std::ostringstream os;
+    os << "{\"error\":{\"message\":\"" << msg
+       << "\",\"type\":\"rate_limit_error\",\"param\":null,\"code\":\"" << out_code << "\"}}";
+    return os.str();
+}
+
+std::string queue_wait_header(double wait_s) {
+    long long ms = std::llround(wait_s * 1000.0);
+    if (ms < 0)
+        ms = 0;
+    return "x-colibri-queue-wait-ms: " + std::to_string(ms) + "\r\n";
+}
+
+std::string retry_after_header() { return "Retry-After: 1\r\n"; }
+
 std::string health_json(Engine *engine) {
     int kv = 1;
     int q = 0;
@@ -645,6 +682,16 @@ std::string health_json(Engine *engine) {
            << json_escape(engine->model_id()) << "\",\"family\":\""
            << family_name(engine->family()) << "\",\"device\":\""
            << device_name(engine->runtime().device) << '"';
+        SchedulerSnapshot snap{};
+        engine->scheduler().snapshot(snap);
+        os << ",\"scheduler\":{\"active\":" << snap.active << ",\"queued\":" << snap.queued
+           << ",\"capacity\":" << snap.capacity << ",\"max_queue\":" << snap.max_queue
+           << ",\"queue_timeout_seconds\":" << snap.queue_timeout_seconds << ",\"admitted\":"
+           << static_cast<unsigned long long>(snap.admitted) << ",\"completed\":"
+           << static_cast<unsigned long long>(snap.completed) << ",\"rejected\":"
+           << static_cast<unsigned long long>(snap.rejected) << ",\"timed_out\":"
+           << static_cast<unsigned long long>(snap.timed_out) << ",\"cancelled\":"
+           << static_cast<unsigned long long>(snap.cancelled) << '}';
     }
     os << "}";
     return os.str();
@@ -1161,15 +1208,6 @@ void HttpServer::handle_client(int cfd) {
                 std::string model = model_name(engine_);
                 const int kv_slots = engine_->runtime().kv_slots;
                 if (stream) {
-                    http_sse_headers(cfd, request_id);
-                    if (chat) {
-                        std::string role = openai_sse_chunk(id, model, "{\"role\":\"assistant\"}",
-                                                            nullptr);
-                        send_all(cfd, role.data(), role.size());
-                    } else if (echo && !prompt.empty()) {
-                        std::string ev = openai_sse_text_chunk(id, model, prompt, nullptr);
-                        send_all(cfd, ev.data(), ev.size());
-                    }
                     Engine *eng = engine_;
                     gp.token_text = [eng](int tid) { return eng->decode_token(tid); };
                     auto decode = gp.token_text;
@@ -1188,6 +1226,20 @@ void HttpServer::handle_client(int cfd) {
                 GenResult out;
                 std::string gerr;
                 Status st = Status::Ok;
+                double wait_s = 0;
+                bool sse_open = false;
+                auto open_sse = [&]() {
+                    http_sse_headers(cfd, request_id, queue_wait_header(wait_s));
+                    sse_open = true;
+                    if (chat) {
+                        std::string role = openai_sse_chunk(id, model, "{\"role\":\"assistant\"}",
+                                                            nullptr);
+                        send_all(cfd, role.data(), role.size());
+                    } else if (echo && !prompt.empty()) {
+                        std::string ev = openai_sse_text_chunk(id, model, prompt, nullptr);
+                        send_all(cfd, ev.data(), ev.size());
+                    }
+                };
                 if (kv_slots > 1) {
                     std::vector<int> ids;
                     if (!tokenize_request(engine_, msgs, prompt, chat, gp, ids, gerr)) {
@@ -1206,18 +1258,17 @@ void HttpServer::handle_client(int cfd) {
                             jid = engine_->scheduler().submit(slot, ids, gp, gerr);
                         }
                         if (jid == 0) {
-                            std::string ebody = busy_error_body(gerr);
-                            if (stream) {
-                                std::string ev = "data: " + ebody + "\n\n";
-                                send_all(cfd, ev.data(), ev.size());
-                                std::string done = openai_sse_done();
-                                send_all(cfd, done.data(), done.size());
-                            } else {
-                                http_reply(cfd, 429, "Too Many Requests", ebody, request_id);
-                            }
+                            http_reply(cfd, 429, "Too Many Requests", busy_error_body(gerr),
+                                       request_id, retry_after_header());
                             ::close(cfd);
                             return;
                         }
+                        {
+                            std::lock_guard<std::mutex> lock(engine_mu_);
+                            wait_s = engine_->scheduler().job_wait_s(jid);
+                        }
+                        if (stream)
+                            open_sse();
                         bool hungup = false;
                         auto sched_finished = [&]() {
                             std::lock_guard<std::mutex> lock(engine_mu_);
@@ -1269,6 +1320,8 @@ void HttpServer::handle_client(int cfd) {
                         }
                     }
                 } else {
+                    if (stream)
+                        open_sse();
                     std::lock_guard<std::mutex> lock(engine_mu_);
                     if (!msgs.empty())
                         st = engine_->generate_chat(msgs, gp, out, gerr);
@@ -1276,11 +1329,14 @@ void HttpServer::handle_client(int cfd) {
                         st = engine_->generate(prompt, gp, out, gerr);
                 }
                 if (st != Status::Ok) {
-                    if (stream) {
+                    if (sse_open) {
                         std::string ev = "data: {\"error\":\"" + json_escape(gerr) + "\"}\n\n";
                         send_all(cfd, ev.data(), ev.size());
                         std::string done = openai_sse_done();
                         send_all(cfd, done.data(), done.size());
+                    } else if (is_queue_limit_err(gerr)) {
+                        http_reply(cfd, 429, "Too Many Requests", busy_error_body(gerr), request_id,
+                                   retry_after_header());
                     } else {
                         http_reply(cfd, 500, "Internal Server Error",
                                    "{\"error\":\"" + json_escape(gerr) + "\"}", request_id);
@@ -1331,6 +1387,7 @@ void HttpServer::handle_client(int cfd) {
                         std::string done = openai_sse_done();
                         send_all(cfd, done.data(), done.size());
                     } else if (chat) {
+                        const std::string wait_hdr = queue_wait_header(wait_s);
                         const std::string lp = openai_logprobs_content(engine_, out);
                         std::string stripped;
                         std::vector<K3ParsedCall> calls;
@@ -1343,7 +1400,7 @@ void HttpServer::handle_client(int cfd) {
                                                             out.reasoning_tokens),
                                                         lp),
                                                     engine_),
-                                       request_id);
+                                       request_id, wait_hdr);
                         } else {
                             const char *fr = sse_finish_reason(out, gp, engine_->config());
                             http_reply(cfd, 200, "OK",
@@ -1354,7 +1411,7 @@ void HttpServer::handle_client(int cfd) {
                                                             gp.prefix_reuse, out.reasoning_tokens),
                                                         lp),
                                                     engine_),
-                                       request_id);
+                                       request_id, wait_hdr);
                         }
                     } else {
                         const char *fr = sse_finish_reason(out, gp, engine_->config());
@@ -1367,7 +1424,7 @@ void HttpServer::handle_client(int cfd) {
                                                         gp.prefix_reuse, out.reasoning_tokens),
                                                     openai_logprobs_content(engine_, out)),
                                                 engine_),
-                                   request_id);
+                                   request_id, queue_wait_header(wait_s));
                     }
                 }
             }

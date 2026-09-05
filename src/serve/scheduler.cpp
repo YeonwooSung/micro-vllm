@@ -1,12 +1,18 @@
 #include "scheduler.hpp"
 #include "../engine.hpp"
 
+#include <chrono>
 #include <mutex>
 
 namespace mvllm {
 namespace {
 
 std::mutex g_batch_mu;
+
+double now_s() {
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
 
 bool terminal(BatchJobState s) {
     return s == BatchJobState::Done || s == BatchJobState::Cancelled;
@@ -72,6 +78,7 @@ uint64_t BatchScheduler::submit(int slot, const std::vector<int> &ids, const Gen
         return 0;
     }
     if (live_count(jobs_) >= max_queue_) {
+        ++rejected_;
         err = "queue full";
         return 0;
     }
@@ -84,6 +91,7 @@ uint64_t BatchScheduler::submit(int slot, const std::vector<int> &ids, const Gen
     job.slot = slot;
     job.ids = ids;
     job.gp = gp;
+    job.queued_at = now_s();
     // Official KvPrefix reuse is all-or-nothing; no LCP fallback.
     int official = engine_->prefix_match(slot, ids);
     if (official > 0)
@@ -122,6 +130,7 @@ bool BatchScheduler::cancel(uint64_t id) {
         sessions_->release(j->slot);
     j->state = BatchJobState::Cancelled;
     j->err = "CANCELLED";
+    ++cancelled_;
     return true;
 }
 
@@ -143,6 +152,7 @@ int BatchScheduler::pump() {
         j.state = BatchJobState::Done;
         if (j.status != Status::Ok && j.err.empty())
             j.status = Status::Ok;
+        ++completed_;
     };
     auto finish_err = [&](BatchJob &j, Status st, const std::string &e) {
         end_slot(engine_, j.slot);
@@ -158,6 +168,24 @@ int BatchScheduler::pump() {
             finish_done(j);
     }
 
+    // Expire queued jobs that waited past queue_timeout_s_.
+    if (queue_timeout_s_ > 0) {
+        const double now = now_s();
+        for (auto &j : jobs_) {
+            if (j.state != BatchJobState::Queued)
+                continue;
+            if (now - j.queued_at < static_cast<double>(queue_timeout_s_))
+                continue;
+            end_slot(engine_, j.slot);
+            if (sessions_)
+                sessions_->release(j.slot);
+            j.state = BatchJobState::Done;
+            j.status = Status::InvalidArgument;
+            j.err = "queue timeout";
+            ++timed_out_;
+        }
+    }
+
     BatchJob *queued = nullptr;
     for (auto &j : jobs_) {
         if (j.state == BatchJobState::Queued) {
@@ -168,6 +196,9 @@ int BatchScheduler::pump() {
 
     if (queued) {
         queued->state = BatchJobState::Running;
+        const double wait = now_s() - queued->queued_at;
+        queued->wait_s = wait < 0.0 ? 0.0 : wait;
+        ++admitted_;
         GenParams gp = queued->gp;
         gp.prefix_reuse = queued->reuse;
         gp.cache_slot = queued->slot;
@@ -332,6 +363,45 @@ int BatchScheduler::max_queue() const {
 int BatchScheduler::n_jobs() const {
     std::lock_guard<std::mutex> lock(g_batch_mu);
     return static_cast<int>(jobs_.size());
+}
+
+double BatchScheduler::job_wait_s(uint64_t id) const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    const BatchJob *j = find_job(jobs_, id);
+    return j ? j->wait_s : 0.0;
+}
+
+int BatchScheduler::queue_timeout_s() const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    return queue_timeout_s_;
+}
+
+void BatchScheduler::snapshot(SchedulerSnapshot &out) const {
+    std::lock_guard<std::mutex> lock(g_batch_mu);
+    int running = 0;
+    int queued = 0;
+    for (const auto &j : jobs_) {
+        if (j.state == BatchJobState::Running || j.state == BatchJobState::Stopped)
+            ++running;
+        else if (j.state == BatchJobState::Queued)
+            ++queued;
+    }
+    int cap = 1;
+    if (sessions_) {
+        cap = sessions_->n_slots();
+        if (cap < 1)
+            cap = 1;
+    }
+    out.active = running;
+    out.queued = queued;
+    out.capacity = cap;
+    out.max_queue = max_queue_;
+    out.queue_timeout_seconds = queue_timeout_s_;
+    out.admitted = admitted_;
+    out.completed = completed_;
+    out.rejected = rejected_;
+    out.timed_out = timed_out_;
+    out.cancelled = cancelled_;
 }
 
 } // namespace mvllm

@@ -3572,6 +3572,14 @@ int main() {
         BatchScheduler sch;
         sch.configure(4, 10);
         CHECK(sch.max_queue() == 4);
+        CHECK(sch.queue_timeout_s() == 10);
+        SchedulerSnapshot snap{};
+        sch.snapshot(snap);
+        CHECK(snap.max_queue == 4 && snap.queue_timeout_seconds == 10);
+        CHECK(snap.admitted == 0 && snap.rejected == 0);
+        CHECK(queue_error_json("queue_full").find("\"code\":\"queue_full\"") != std::string::npos);
+        CHECK(queue_error_json("queue_timeout").find("queue_timeout") != std::string::npos);
+        CHECK(queue_wait_header(0.0123).find("x-colibri-queue-wait-ms: 12") != std::string::npos);
         CHECK(sch.running_count() == 0);
         CHECK(sch.queued_count() == 0);
         CHECK(sch.n_jobs() == 0);
@@ -4602,6 +4610,22 @@ int main() {
             setenv("MVLLM_KV", old_kv_s.c_str(), 1);
         else
             unsetenv("MVLLM_KV");
+        const char *old_mq = std::getenv("COLI_MAX_QUEUE");
+        std::string old_mq_s = old_mq ? old_mq : "";
+        const char *old_qt = std::getenv("COLI_QUEUE_TIMEOUT");
+        std::string old_qt_s = old_qt ? old_qt : "";
+        setenv("COLI_MAX_QUEUE", "16", 1);
+        setenv("COLI_QUEUE_TIMEOUT", "60", 1);
+        RuntimeConfig rtq = runtime_from_env();
+        CHECK(rtq.max_queue == 16 && rtq.queue_timeout_s == 60);
+        if (!old_mq_s.empty())
+            setenv("COLI_MAX_QUEUE", old_mq_s.c_str(), 1);
+        else
+            unsetenv("COLI_MAX_QUEUE");
+        if (!old_qt_s.empty())
+            setenv("COLI_QUEUE_TIMEOUT", old_qt_s.c_str(), 1);
+        else
+            unsetenv("COLI_QUEUE_TIMEOUT");
         const std::string kdir = tmpdir();
         write_file(kdir + "/config.json", R"({
           "model_type": "kimi_linear",

@@ -44,6 +44,7 @@ Status Engine::load(const std::string &model_dir, const RuntimeConfig &rt, std::
         model_id_ = cfg_.architecture;
     sessions_.configure(rt_.kv_slots);
     sched_.bind(this, &sessions_);
+    sched_.configure(rt_.max_queue, rt_.queue_timeout_s);
     if (!rt_.kv_path.empty()) {
         std::string perr;
         persist_open(rt_.kv_path, rt_.kv_persist_ver, perr);
