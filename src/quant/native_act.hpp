@@ -24,6 +24,10 @@ int fp4_activation_qdq(float *output, uint8_t *scales, const float *input,
 int fp8_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
                const float *x);
 
+// Hoisted-qdq: xhat is already QDQ'd. Same checks as fp8_matvec.
+int fp8_matvec_pre(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+                   const float *xhat);
+
 // Shared-qdq dual (official dual_matvec): one x QDQ, two matvecs.
 int fp8_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
                     const uint8_t *wb, const uint8_t *sb, int O, int I, const float *x);
@@ -32,6 +36,10 @@ int fp8_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
 // W is [O, I/2] (low nibble = even col). Returns 0 or -1.
 int fp4_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
                const float *x);
+
+// Hoisted-qdq: xhat is already QDQ'd. Same checks as fp4_matvec.
+int fp4_matvec_pre(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+                   const float *xhat);
 
 // Shared-qdq dual: one x QDQ, two matvecs.
 int fp4_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,

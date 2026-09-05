@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "../quant/quant.hpp"
+#include "../tok/logit_dump.hpp"
 #include "../tok/sample_nuc.hpp"
 
 #include <algorithm>
@@ -585,6 +586,7 @@ int sample_token(const float *logits, int vocab, float temperature, float top_p,
                 work[static_cast<size_t>(i)] = std::numeric_limits<float>::quiet_NaN();
         lo = work.data();
     }
+    logit_dump_maybe(lo, vocab);
     int chosen = nuc_pick(lo, vocab, temperature, top_p, /*ban=*/-1, rng);
     if (out_logprob)
         *out_logprob = token_logprob(logits, vocab, chosen, allow);

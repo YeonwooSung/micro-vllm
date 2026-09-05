@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace mvllm {
@@ -29,6 +30,14 @@ int argmax_id(const float *logits, int vocab) {
         }
     }
     return best < 0 ? 0 : best;
+}
+
+// Unset, empty, or "0" is off. Anything else is on.
+int env_flag_on(const char *name) {
+    const char *v = std::getenv(name);
+    if (!v || !v[0] || (v[0] == '0' && !v[1]))
+        return 0;
+    return 1;
 }
 
 } // namespace
@@ -104,6 +113,36 @@ std::string logit_gap_line(int pos, const float *logits, int vocab) {
     std::snprintf(buf, sizeof(buf), "LOGITGAP pos=%d top1=%d:%.6f top2=%d:%.6f gap=%.9f\n", pos,
                   top1, t1, top2, t2, gap);
     return std::string(buf);
+}
+
+int logit_dump_enabled() {
+    static int cached = -1;
+    if (cached < 0)
+        cached = env_flag_on("COLI_LOGIT_DUMP") || env_flag_on("MVLLM_LOGIT_DUMP");
+    return cached;
+}
+
+int logit_gap_enabled() {
+    static int cached = -1;
+    if (cached < 0)
+        cached = env_flag_on("COLI_LOGIT_GAP") || env_flag_on("MVLLM_LOGIT_GAP");
+    return cached;
+}
+
+int logit_dump_maybe(const float *logits, int vocab) {
+    if (!logit_dump_enabled())
+        return 0;
+    const std::string line = logit_dump_line(logits, vocab);
+    std::fputs(line.c_str(), stderr);
+    return 1;
+}
+
+int logit_gap_maybe(int pos, const float *logits, int vocab) {
+    if (!logit_gap_enabled())
+        return 0;
+    const std::string line = logit_gap_line(pos, logits, vocab);
+    std::fputs(line.c_str(), stderr);
+    return 1;
 }
 
 } // namespace mvllm

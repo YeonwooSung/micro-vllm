@@ -214,6 +214,14 @@ int qdq_xhat(std::vector<float> &xhat, const float *x, int I) {
 
 } // namespace
 
+int fp8_matvec_pre(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+                   const float *xhat) {
+    if (!y || !w || !scales || !xhat || bad_fp8_matvec(O, I))
+        return -1;
+    fp8_matvec_xhat(y, w, scales, O, I, xhat);
+    return 0;
+}
+
 int fp8_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
                const float *x) {
     if (!y || !w || !scales || !x || bad_fp8_matvec(O, I))
@@ -222,8 +230,7 @@ int fp8_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
     std::vector<float> xhat;
     if (qdq_xhat(xhat, x, I) != 0)
         return -1;
-    fp8_matvec_xhat(y, w, scales, O, I, xhat.data());
-    return 0;
+    return fp8_matvec_pre(y, w, scales, O, I, xhat.data());
 }
 
 int fp8_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,
@@ -272,6 +279,14 @@ void fp4_matvec_xhat(float *y, const uint8_t *w, const uint8_t *scales, int O, i
 
 } // namespace
 
+int fp4_matvec_pre(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
+                   const float *xhat) {
+    if (!y || !w || !scales || !xhat || bad_fp4_matvec(O, I))
+        return -1;
+    fp4_matvec_xhat(y, w, scales, O, I, xhat);
+    return 0;
+}
+
 int fp4_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
                const float *x) {
     if (!y || !w || !scales || !x || bad_fp4_matvec(O, I))
@@ -280,8 +295,7 @@ int fp4_matvec(float *y, const uint8_t *w, const uint8_t *scales, int O, int I,
     std::vector<float> xhat;
     if (qdq_xhat(xhat, x, I) != 0)
         return -1;
-    fp4_matvec_xhat(y, w, scales, O, I, xhat.data());
-    return 0;
+    return fp4_matvec_pre(y, w, scales, O, I, xhat.data());
 }
 
 int fp4_dual_matvec(float *ya, float *yb, const uint8_t *wa, const uint8_t *sa,

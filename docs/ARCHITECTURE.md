@@ -216,7 +216,10 @@ for the current token. Native FP8 matvec (`fp8_matvec` / `fp8_dual_matvec`)
 is E4M3 W × QDQ-x with UE8M0 128-col tiles; dual shares one x QDQ.
 Native FP4 matvec uses E2M1 packed W, UE8M0 per 32 cols, and the same
 E4M3 x QDQ; `fp4_matvec_rows16` is the official column-order path
-(I%32==0, O%16==0, x already qdq'd). H3 AdaLN gate score is mean |mod|
+(I%32==0, O%16==0, x already qdq'd). `fp8_matvec_pre` / `fp4_matvec_pre`
+take already-QDQ'd x. Batch GEMM is `fp8_matmul_batch` / `_pre` (and FP4).
+Logit dump honors `COLI_LOGIT_DUMP` / `MVLLM_LOGIT_DUMP` and
+`COLI_LOGIT_GAP` / `MVLLM_LOGIT_GAP`. H3 AdaLN gate score is mean |mod|
 of slots 2 and 5; `h3_dit_prune_blocks` drops blocks below a min score.
 H3 `encode_mm(..., layer_count)` is the official prefix-layer multimodal
 encode.

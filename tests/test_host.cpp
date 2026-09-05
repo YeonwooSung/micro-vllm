@@ -38,6 +38,7 @@
 #include "quant/int8_dyn.hpp"
 #include "quant/native_act.hpp"
 #include "quant/native_fp4.hpp"
+#include "quant/native_batch.hpp"
 #include "quant/bf16.hpp"
 #include "tok/tokenizer.hpp"
 #include "tok/k3_tools.hpp"
@@ -4165,6 +4166,20 @@ int main() {
         CHECK_NEAR(ya[0], y[0], 1e-5);
         CHECK_NEAR(yb[1], y[1], 1e-5);
         CHECK(fp8_matvec(y.data(), w.data(), tsc, 2, 127, x.data()) == -1);
+        std::vector<float> xhat(128, 1.f), ypre(2, 0.f);
+        CHECK(fp8_matvec_pre(ypre.data(), w.data(), tsc, 2, 128, xhat.data()) == 0);
+        CHECK(std::isfinite(ypre[0]));
+        std::vector<float> xb(2 * 128, 1.f), ybch(2 * 2, 0.f);
+        CHECK(fp8_matmul_batch(ybch.data(), w.data(), tsc, 2, 128, xb.data(), 2) == 0);
+        CHECK_NEAR(ybch[0], y[0], 1e-4);
+        CHECK(fp8_matmul_batch_pre(ybch.data(), w.data(), tsc, 2, 128, xb.data(), 2) == 0);
+        CHECK(fp8_matmul_batch(ybch.data(), w.data(), tsc, 2, 128, xb.data(), 0) == -1);
+        unsetenv("COLI_LOGIT_DUMP");
+        unsetenv("MVLLM_LOGIT_DUMP");
+        unsetenv("COLI_LOGIT_GAP");
+        unsetenv("MVLLM_LOGIT_GAP");
+        CHECK(logit_dump_maybe(y.data(), 2) == 0);
+        CHECK(logit_gap_maybe(0, y.data(), 2) == 0);
         std::vector<uint8_t> w4(2 * 64, 0x22);
         uint8_t s4[2 * 4];
         for (int i = 0; i < 8; ++i)
