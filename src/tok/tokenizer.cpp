@@ -1,9 +1,11 @@
 #include "tokenizer.hpp"
+#include "glm_tools.hpp"
 
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include "json.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -821,90 +823,195 @@ void xtml_append_encode(const Tokenizer &tk, const std::string &s, std::vector<i
     ids.insert(ids.end(), piece.begin(), piece.end());
 }
 
+std::string xtml_trim(const std::string &s) {
+    size_t a = 0, b = s.size();
+    while (a < b && std::isspace(static_cast<unsigned char>(s[a])))
+        ++a;
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1])))
+        --b;
+    return s.substr(a, b - a);
+}
+
+bool xtml_looks_json_object(const std::string &s) {
+    const std::string t = xtml_trim(s);
+    return t.size() >= 2 && t.front() == '{' && t.back() == '}';
+}
+
+std::vector<K3ToolCall> xtml_effective_calls(const ChatMessage &m) {
+    if (!m.tool_calls.empty())
+        return m.tool_calls;
+    const bool assistantish = m.role == "assistant" || m.role == "tool_call";
+    if (!assistantish || (m.tool_name.empty() && m.role != "tool_call"))
+        return {};
+    K3ToolCall c;
+    c.name = m.tool_name;
+    c.index = 1;
+    const std::string body = xtml_trim(m.content);
+    if (xtml_looks_json_object(body))
+        c.json = body;
+    else {
+        K3ToolArg a;
+        a.key = "input";
+        a.type = "string";
+        a.value = m.content;
+        c.args.push_back(std::move(a));
+    }
+    return {std::move(c)};
+}
+
+bool xtml_synthesized_call(const ChatMessage &m) {
+    return m.tool_calls.empty() &&
+           (m.role == "tool_call" || (m.role == "assistant" && !m.tool_name.empty()));
+}
+
+// One plain <image> per URL when the text has no vision token yet (K3 / Llama).
+void append_plain_image_placeholders(std::string &body, const std::vector<std::string> &urls) {
+    if (urls.empty() || body.find("<image>") != std::string::npos ||
+        body.find("<|image|>") != std::string::npos)
+        return;
+    for (size_t i = 0; i < urls.size(); ++i)
+        body += "<image>";
+}
+
+void xtml_attr_encode(const Tokenizer &tk, const char *key, const std::string &val,
+                      std::vector<int> &ids) {
+    xtml_append_encode(tk, std::string(" ") + key, ids);
+    xtml_append_encode(tk, "=\"", ids);
+    xtml_append_encode(tk, k3_xtml_escape_attr(val), ids);
+    xtml_append_encode(tk, "\"", ids);
+}
+
+void xtml_encode_tools_block(const Tokenizer &tk, const std::vector<K3ToolCall> &calls, int op,
+                             int cl, int sep, std::vector<int> &ids) {
+    if (calls.empty())
+        return;
+    auto open = [&](const char *tag) {
+        ids.push_back(op);
+        xtml_append_encode(tk, tag, ids);
+    };
+    auto close = [&](const char *tag) {
+        ids.push_back(cl);
+        xtml_append_encode(tk, tag, ids);
+        ids.push_back(sep);
+    };
+    open("tools");
+    ids.push_back(sep);
+    for (size_t i = 0; i < calls.size(); ++i) {
+        const auto &c = calls[i];
+        const int idx = c.index >= 1 ? c.index : static_cast<int>(i) + 1;
+        open("call");
+        xtml_attr_encode(tk, "tool", c.name, ids);
+        xtml_attr_encode(tk, "index", std::to_string(idx), ids);
+        ids.push_back(sep);
+        if (!c.json.empty()) {
+            open("json");
+            xtml_attr_encode(tk, "type", "object", ids);
+            ids.push_back(sep);
+            xtml_append_encode(tk, c.json, ids);
+            close("json");
+        } else {
+            for (const auto &a : c.args) {
+                open("argument");
+                xtml_attr_encode(tk, "key", a.key, ids);
+                xtml_attr_encode(tk, "type", a.type.empty() ? "string" : a.type, ids);
+                ids.push_back(sep);
+                xtml_append_encode(tk, a.value, ids);
+                close("argument");
+            }
+        }
+        close("call");
+    }
+    close("tools");
+}
+
 } // namespace
 
 Status Tokenizer::encode_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
-                              std::vector<int> &ids, const std::string &effort) const {
+                              std::vector<int> &ids, const std::string &effort,
+                              const std::vector<K3ToolDecl> *tools) const {
     ids.clear();
     if (family != Family::KimiK3 || !has_xtml())
-        return encode(apply_chat(family, msgs, think, effort), ids);
+        return encode(apply_chat(family, msgs, think, effort, tools), ids);
 
     const int op = id_of("<|open|>");
     const int cl = id_of("<|close|>");
     const int sep = id_of("<|sep|>");
     const int eom = id_of("<|end_of_msg|>");
-    auto open_tag = [&](const char *tag, const char *role, const char *name = nullptr) {
+    auto open_tag = [&](const char *tag) {
         ids.push_back(op);
         xtml_append_encode(*this, tag, ids);
-        if (role) {
-            xtml_append_encode(*this, " role", ids);
-            xtml_append_encode(*this, "=\"", ids);
-            xtml_append_encode(*this, role, ids);
-            xtml_append_encode(*this, "\"", ids);
-        }
-        if (name && *name) {
-            xtml_append_encode(*this, " name", ids);
-            xtml_append_encode(*this, "=\"", ids);
-            xtml_append_encode(*this, name, ids);
-            xtml_append_encode(*this, "\"", ids);
-        }
-        ids.push_back(sep);
     };
     auto close_tag = [&](const char *tag) {
         ids.push_back(cl);
         xtml_append_encode(*this, tag, ids);
         ids.push_back(sep);
     };
+    auto open_message = [&](const std::string &role, const std::string &type = {}) {
+        open_tag("message");
+        xtml_attr_encode(*this, "role", role, ids);
+        if (!type.empty())
+            xtml_attr_encode(*this, "type", type, ids);
+        ids.push_back(sep);
+    };
+
+    if (tools && !tools->empty()) {
+        open_message("system", "tool-declare");
+        xtml_append_encode(*this, k3_tool_declare_body(*tools), ids);
+        close_tag("message");
+        ids.push_back(eom);
+    }
 
     for (const auto &m : msgs) {
         std::string role = m.role == "developer" ? "system" : m.role;
-        const char *tname = m.tool_name.empty() ? nullptr : m.tool_name.c_str();
         if (role == "tool" || role == "tool_result") {
-            open_tag("tool_result", nullptr, tname);
+            open_tag("message");
+            xtml_attr_encode(*this, "role", "tool", ids);
+            xtml_attr_encode(*this, "tool", m.tool_name, ids);
+            xtml_attr_encode(*this, "index",
+                             std::to_string(m.tool_index >= 1 ? m.tool_index : 1), ids);
+            ids.push_back(sep);
             xtml_append_encode(*this, m.content, ids);
-            close_tag("tool_result");
-            ids.push_back(eom);
-            continue;
-        }
-        if (role == "tool_call") {
-            open_tag("tool_call", nullptr, tname);
-            xtml_append_encode(*this, m.content, ids);
-            close_tag("tool_call");
-            ids.push_back(eom);
-            continue;
-        }
-        if (role == "assistant") {
-            open_tag("message", "assistant");
-            if (!m.reasoning.empty()) {
-                open_tag("think", nullptr);
-                xtml_append_encode(*this, m.reasoning, ids);
-                close_tag("think");
-            }
-            if (tname) {
-                open_tag("tool_call", nullptr, tname);
-                xtml_append_encode(*this, m.content, ids);
-                close_tag("tool_call");
-            } else {
-                open_tag("response", nullptr);
-                xtml_append_encode(*this, m.content, ids);
-                close_tag("response");
-            }
             close_tag("message");
             ids.push_back(eom);
             continue;
         }
-        open_tag("message", role.c_str());
-        xtml_append_encode(*this, m.content, ids);
+        if (role == "assistant" || role == "tool_call") {
+            const std::vector<K3ToolCall> calls = xtml_effective_calls(m);
+            const bool syn = xtml_synthesized_call(m);
+            open_message("assistant");
+            if (!m.reasoning.empty()) {
+                open_tag("think");
+                ids.push_back(sep);
+                xtml_append_encode(*this, m.reasoning, ids);
+                close_tag("think");
+            }
+            open_tag("response");
+            ids.push_back(sep);
+            if (!syn)
+                xtml_append_encode(*this, m.content, ids);
+            close_tag("response");
+            if (!calls.empty())
+                xtml_encode_tools_block(*this, calls, op, cl, sep, ids);
+            close_tag("message");
+            ids.push_back(eom);
+            continue;
+        }
+        open_message(role, m.xtml_type);
+        std::string body = m.content;
+        append_plain_image_placeholders(body, m.image_urls);
+        xtml_append_encode(*this, body, ids);
         close_tag("message");
         ids.push_back(eom);
     }
-    open_tag("message", "assistant");
-    open_tag(think ? "think" : "response", nullptr);
+    open_message("assistant");
+    open_tag(think ? "think" : "response");
+    ids.push_back(sep);
     return Status::Ok;
 }
 
 std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> &msgs,
-                                  bool think, const std::string &effort) const {
+                                  bool think, const std::string &effort,
+                                  const std::vector<K3ToolDecl> *tools) const {
     if (family == Family::Glm53) {
         auto expand_images = [](std::string s) {
             const std::string needle = "<image>";
@@ -929,13 +1036,25 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
                 label = "High";
             p += "<|system|>Reasoning Effort: " + label;
         }
+        if (tools && !tools->empty())
+            p += glm_tool_declare(*tools);
         for (const auto &m : msgs) {
             if (m.role == "system")
                 p += "<|system|>" + m.content;
-            else if (m.role == "user")
-                p += "<|user|>" + expand_images(m.content);
-            else if (m.role == "assistant")
+            else if (m.role == "user") {
+                std::string body = expand_images(m.content);
+                if (!m.image_urls.empty() && body.find("<image>") == std::string::npos &&
+                    body.find("<|image|>") == std::string::npos) {
+                    for (size_t i = 0; i < m.image_urls.size(); ++i)
+                        body += "<|begin_of_image|><image><|end_of_image|>";
+                }
+                p += "<|user|>" + body;
+            }
+            else if (m.role == "assistant") {
                 p += "<|assistant|><think></think>" + m.content;
+                if (!m.tool_calls.empty())
+                    p += glm_render_tool_calls(m.tool_calls);
+            }
             else if (m.role == "tool")
                 p += "<|observation|><tool_response>" + m.content + "</tool_response>";
         }
@@ -945,86 +1064,88 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
     if (family == Family::KimiK3) {
         if (has_xtml()) {
             std::string p;
-            auto open = [&](const char *tag, const char *role) {
+            auto attr = [&](const char *key, const std::string &val) {
+                p += " ";
+                p += key;
+                p += "=\"";
+                p += k3_xtml_escape_attr(val);
+                p += "\"";
+            };
+            auto open = [&](const char *tag) {
                 p += "<|open|>";
                 p += tag;
-                if (role) {
-                    p += " role=\"";
-                    p += role;
-                    p += "\"";
-                }
-                p += "<|sep|>";
             };
             auto close = [&](const char *tag) {
                 p += "<|close|>";
                 p += tag;
                 p += "<|sep|>";
             };
-            auto open_named = [&](const char *tag, const char *role, const char *name) {
-                p += "<|open|>";
-                p += tag;
-                if (role) {
-                    p += " role=\"";
-                    p += role;
-                    p += "\"";
-                }
-                if (name && *name) {
-                    p += " name=\"";
-                    p += name;
-                    p += "\"";
-                }
-                p += "<|sep|>";
+            auto end_open = [&]() { p += "<|sep|>"; };
+            auto open_message = [&](const std::string &role, const std::string &type = {}) {
+                open("message");
+                attr("role", role);
+                if (!type.empty())
+                    attr("type", type);
+                end_open();
             };
+            if (tools && !tools->empty()) {
+                open_message("system", "tool-declare");
+                p += k3_tool_declare_body(*tools);
+                close("message");
+                p += "<|end_of_msg|>";
+            }
             for (const auto &m : msgs) {
                 std::string role = m.role == "developer" ? "system" : m.role;
-                const char *tname = m.tool_name.empty() ? nullptr : m.tool_name.c_str();
                 if (role == "tool" || role == "tool_result") {
-                    open_named("tool_result", nullptr, tname);
+                    open("message");
+                    attr("role", "tool");
+                    attr("tool", m.tool_name);
+                    attr("index", std::to_string(m.tool_index >= 1 ? m.tool_index : 1));
+                    end_open();
                     p += m.content;
-                    close("tool_result");
-                    p += "<|end_of_msg|>";
-                    continue;
-                }
-                if (role == "tool_call") {
-                    open_named("tool_call", nullptr, tname);
-                    p += m.content;
-                    close("tool_call");
-                    p += "<|end_of_msg|>";
-                    continue;
-                }
-                if (role == "assistant") {
-                    open("message", "assistant");
-                    if (!m.reasoning.empty()) {
-                        open("think", nullptr);
-                        p += m.reasoning;
-                        close("think");
-                    }
-                    if (tname) {
-                        open_named("tool_call", nullptr, tname);
-                        p += m.content;
-                        close("tool_call");
-                    } else {
-                        open("response", nullptr);
-                        p += m.content;
-                        close("response");
-                    }
                     close("message");
                     p += "<|end_of_msg|>";
                     continue;
                 }
-                open("message", role.c_str());
-                p += m.content;
+                if (role == "assistant" || role == "tool_call") {
+                    const std::vector<K3ToolCall> calls = xtml_effective_calls(m);
+                    const bool syn = xtml_synthesized_call(m);
+                    open_message("assistant");
+                    if (!m.reasoning.empty()) {
+                        open("think");
+                        end_open();
+                        p += m.reasoning;
+                        close("think");
+                    }
+                    open("response");
+                    end_open();
+                    if (!syn)
+                        p += m.content;
+                    close("response");
+                    if (!calls.empty())
+                        p += k3_render_tools_block(calls);
+                    close("message");
+                    p += "<|end_of_msg|>";
+                    continue;
+                }
+                open_message(role, m.xtml_type);
+                std::string body = m.content;
+                append_plain_image_placeholders(body, m.image_urls);
+                p += body;
                 close("message");
                 p += "<|end_of_msg|>";
             }
-            open("message", "assistant");
-            open(think ? "think" : "response", nullptr);
+            open_message("assistant");
+            open(think ? "think" : "response");
+            end_open();
             return p;
         }
         std::string p;
         for (const auto &m : msgs) {
             std::string role = m.role == "developer" ? "system" : m.role;
-            p += "<|im_start|>" + role + "\n" + m.content + "<|im_end|>\n";
+            std::string body = m.content;
+            append_plain_image_placeholders(body, m.image_urls);
+            p += "<|im_start|>" + role + "\n" + body + "<|im_end|>\n";
         }
         p += "<|im_start|>assistant\n";
         if (think)
@@ -1035,7 +1156,9 @@ std::string Tokenizer::apply_chat(Family family, const std::vector<ChatMessage> 
     for (const auto &m : msgs) {
         if (!p.empty())
             p += "\n";
-        p += m.content;
+        std::string body = m.content;
+        append_plain_image_placeholders(body, m.image_urls);
+        p += body;
     }
     return p;
 }

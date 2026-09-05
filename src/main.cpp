@@ -1,6 +1,8 @@
 #include "engine.hpp"
 #include "io/shard_probe.hpp"
+#include "serve/cli_flags.hpp"
 #include "serve/http_server.hpp"
+#include "serve/mux_stdio.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -13,11 +15,16 @@ void usage() {
     std::cerr
         << "micro-vllm — consumer-hardware inference server\n"
         << "  micro-vllm info     --model DIR\n"
-        << "  micro-vllm smoke    --model DIR\n"
+        << "  micro-vllm smoke    --model DIR   (headers + one expert/DiT payload)\n"
         << "  micro-vllm generate --model DIR --prompt TEXT [--n N] [--chat] [--think|--no-think]\n"
         << "                      [--temp T] [--top-p P] [--seed S]\n"
-        << "  micro-vllm serve    --model DIR [--host H] [--port P]\n"
+        << "                      [--stop S] [--grammar STR] [--json] [--top-k N] [--min-p F]\n"
+        << "                      [--rep-penalty F] [--freq-penalty F] [--presence-penalty F] [--image PATH]\n"
+        << "  micro-vllm serve    --model DIR [--host H] [--port P] [--kv-slots N]\n"
+        << "  micro-vllm mux      --model DIR [--kv-slots N]\n"
         << "  micro-vllm video    --model DIR --prompt TEXT [-o FILE]\n"
+        << "                      [--width W] [--height H] [--frames N] [--seed S] [--audio PATH]\n"
+        << "                      [--ref-image PATH]... [--first-frame PATH] [--last-frame PATH]\n"
         << "\n"
         << "Families: llama | kimi_k3 | glm53 | h3\n"
         << "  --device cpu|metal|cuda   expert GEMM / H3 DiT backend (default cpu)\n"
@@ -68,6 +75,13 @@ int main(int argc, char **argv) {
         rt.expert_gb = std::stod(g);
     if (const std::string d = arg(argc, argv, "--device"); !d.empty())
         rt.device = mvllm::parse_device(d);
+    if (const std::string k = arg(argc, argv, "--kv-slots"); !k.empty()) {
+        rt.kv_slots = std::stoi(k);
+        if (rt.kv_slots < 1)
+            rt.kv_slots = 1;
+        if (rt.kv_slots > 16)
+            rt.kv_slots = 16;
+    }
 
     if (cmd == "smoke") {
         mvllm::ShardReport rep;
@@ -122,6 +136,11 @@ int main(int argc, char **argv) {
         else if (gp.apply_template && engine.family() == mvllm::Family::Glm53 &&
                  !has(argc, argv, "--think"))
             gp.think = true;
+        mvllm::CliGenExtras extras;
+        if (!mvllm::apply_cli_gen_flags(argc, argv, gp, extras, err)) {
+            std::cerr << err << "\n";
+            return 1;
+        }
         mvllm::GenResult out;
         st = engine.generate(prompt, gp, out, err);
         if (st != mvllm::Status::Ok) {
@@ -139,15 +158,13 @@ int main(int argc, char **argv) {
 
     if (cmd == "video") {
         mvllm::H3GenParams hp;
-        hp.prompt = arg(argc, argv, "--prompt");
-        if (hp.prompt.empty())
-            hp.prompt = arg(argc, argv, "-p", "a red fox");
-        hp.output_path = arg(argc, argv, "-o", "h3_out.txt");
-        if (const std::string s = arg(argc, argv, "--steps"); !s.empty())
-            hp.steps = std::stoi(s);
-        if (const std::string s = arg(argc, argv, "--layers"); !s.empty())
-            hp.dit_layers = std::stoi(s);
+        hp.prompt = "a red fox";
+        hp.output_path = "h3_out.txt";
         hp.ssd_streaming = true;
+        if (!mvllm::apply_cli_video_flags(argc, argv, hp, err)) {
+            std::cerr << err << "\n";
+            return 1;
+        }
         mvllm::H3GenResult out;
         st = engine.generate_video(hp, out, err);
         if (st != mvllm::Status::Ok) {
@@ -156,6 +173,15 @@ int main(int argc, char **argv) {
         }
         std::cout << out.output_path << "\n" << out.note << "\n"
                   << "blocks=" << out.blocks_streamed << " steps=" << out.steps_run << "\n";
+        return 0;
+    }
+
+    if (cmd == "mux") {
+        st = mvllm::mux_stdio_run(engine, err);
+        if (st != mvllm::Status::Ok) {
+            std::cerr << "mux: " << err << "\n";
+            return 1;
+        }
         return 0;
     }
 

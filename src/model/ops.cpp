@@ -81,8 +81,8 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
 
     const float qscale = 1.f / std::sqrt(static_cast<float>(D));
     for (int h = 0; h < H; ++h) {
-        l2_normalize(q.data() + h * D, D, eps);
-        l2_normalize(k.data() + h * D, D, eps);
+        l2_normalize(q.data() + h * D, D, 1e-6f);
+        l2_normalize(k.data() + h * D, D, 1e-6f);
         for (int i = 0; i < D; ++i)
             q[h * D + i] *= qscale;
     }
@@ -265,6 +265,109 @@ void mhc_mix(float *streams, int hidden, int mult, const float *alpha, int iters
     std::memcpy(streams, out.data(), out.size() * sizeof(float));
 }
 
+int mhc_pre(float *collapsed, float *post, float *comb, const float *streams, const float *fn,
+            const float *scale, const float *base, int mult, int hidden, int iters, float norm_eps,
+            float hc_eps) {
+    if (!collapsed || !post || !comb || !streams || !fn || !scale || !base || mult < 1 ||
+        hidden < 1)
+        return -1;
+    const int flat = mult * hidden;
+    const int mix_n = (2 + mult) * mult;
+    float ms = 0.f;
+    for (int i = 0; i < flat; ++i)
+        ms += streams[i] * streams[i];
+    const float inv = 1.f / std::sqrt(ms / static_cast<float>(flat) + norm_eps);
+    std::vector<float> mixes(static_cast<size_t>(mix_n), 0.f);
+    std::vector<float> pre(static_cast<size_t>(mult), 0.f);
+    for (int r = 0; r < mix_n; ++r) {
+        float s = 0.f;
+        const float *row = fn + static_cast<size_t>(r) * flat;
+        for (int c = 0; c < flat; ++c)
+            s += row[c] * streams[c];
+        mixes[static_cast<size_t>(r)] = s * inv;
+    }
+    for (int i = 0; i < mult; ++i) {
+        pre[static_cast<size_t>(i)] =
+            quant::sigmoid(mixes[static_cast<size_t>(i)] * scale[0] + base[i]) + hc_eps;
+        post[i] = 2.f * quant::sigmoid(mixes[static_cast<size_t>(mult + i)] * scale[1] +
+                                       base[mult + i]);
+    }
+    const int off = 2 * mult;
+    for (int r = 0; r < mult; ++r) {
+        float mx = -1e30f;
+        for (int c = 0; c < mult; ++c) {
+            float v = mixes[static_cast<size_t>(off + r * mult + c)] * scale[2] +
+                      base[off + r * mult + c];
+            comb[r * mult + c] = v;
+            if (v > mx)
+                mx = v;
+        }
+        float z = 0.f;
+        for (int c = 0; c < mult; ++c) {
+            float e = std::exp(comb[r * mult + c] - mx);
+            comb[r * mult + c] = e;
+            z += e;
+        }
+        for (int c = 0; c < mult; ++c)
+            comb[r * mult + c] = comb[r * mult + c] / z + hc_eps;
+    }
+    std::vector<float> sums(static_cast<size_t>(mult), 0.f);
+    for (int c = 0; c < mult; ++c) {
+        float s = 0.f;
+        for (int r = 0; r < mult; ++r)
+            s += comb[r * mult + c];
+        sums[static_cast<size_t>(c)] = s;
+    }
+    for (int r = 0; r < mult; ++r)
+        for (int c = 0; c < mult; ++c)
+            comb[r * mult + c] /= sums[static_cast<size_t>(c)] + hc_eps;
+    for (int it = 1; it < iters; ++it) {
+        for (int r = 0; r < mult; ++r) {
+            float s = 0.f;
+            for (int c = 0; c < mult; ++c)
+                s += comb[r * mult + c];
+            sums[static_cast<size_t>(r)] = s;
+        }
+        for (int r = 0; r < mult; ++r)
+            for (int c = 0; c < mult; ++c)
+                comb[r * mult + c] /= sums[static_cast<size_t>(r)] + hc_eps;
+        for (int c = 0; c < mult; ++c) {
+            float s = 0.f;
+            for (int r = 0; r < mult; ++r)
+                s += comb[r * mult + c];
+            sums[static_cast<size_t>(c)] = s;
+        }
+        for (int r = 0; r < mult; ++r)
+            for (int c = 0; c < mult; ++c)
+                comb[r * mult + c] /= sums[static_cast<size_t>(c)] + hc_eps;
+    }
+    for (int c = 0; c < hidden; ++c) {
+        float s = 0.f;
+        for (int m = 0; m < mult; ++m)
+            s += pre[static_cast<size_t>(m)] * streams[m * hidden + c];
+        collapsed[c] = s;
+    }
+    return 0;
+}
+
+int mhc_post(float *streams, const float *branch, const float *residual, const float *post,
+             const float *comb, int mult, int hidden) {
+    if (!streams || !branch || !residual || !post || !comb || mult < 1 || hidden < 1)
+        return -1;
+    std::vector<float> out(static_cast<size_t>(mult) * hidden, 0.f);
+    for (int dst = 0; dst < mult; ++dst) {
+        for (int c = 0; c < hidden; ++c) {
+            float v = 0.f;
+            for (int src = 0; src < mult; ++src)
+                v += comb[src * mult + dst] * residual[src * hidden + c];
+            v += post[dst] * branch[c];
+            out[static_cast<size_t>(dst) * hidden + c] = v;
+        }
+    }
+    std::memcpy(streams, out.data(), out.size() * sizeof(float));
+    return 0;
+}
+
 int moe_topk(const float *choice, int n, int k, int *idx, float *w, const float *mix) {
     if (k > n)
         k = n;
@@ -309,69 +412,254 @@ void apply_rope(float *x, int n, int pos, float theta) {
     }
 }
 
-int sample_token(const float *logits, int vocab, float temperature, float top_p, uint64_t *rng) {
-    if (!logits || vocab <= 0)
-        return 0;
-    if (temperature <= 0.f) {
-        int best = 0;
-        for (int i = 1; i < vocab; ++i)
-            if (logits[i] > logits[best])
-                best = i;
-        return best;
+void apply_penalties(float *logits, int vocab, const int *hist, int hist_n, float frequency,
+                     float presence) {
+    if (!logits || vocab <= 0 || !hist || hist_n <= 0)
+        return;
+    if (frequency == 0.f && presence == 0.f)
+        return;
+    std::vector<int> count(static_cast<size_t>(vocab), 0);
+    bool any = false;
+    for (int i = 0; i < hist_n; ++i) {
+        int t = hist[i];
+        if (t >= 0 && t < vocab) {
+            ++count[static_cast<size_t>(t)];
+            any = true;
+        }
     }
-    std::vector<float> p(static_cast<size_t>(vocab));
+    if (!any)
+        return;
+    for (int t = 0; t < vocab; ++t) {
+        int c = count[static_cast<size_t>(t)];
+        if (c > 0)
+            logits[t] -= frequency * static_cast<float>(c) + presence;
+    }
+}
+
+void apply_repetition_penalty(float *logits, int vocab, const int *hist, int hist_n, float penalty) {
+    if (!logits || vocab <= 0 || !hist || hist_n <= 0)
+        return;
+    if (penalty == 1.f || penalty <= 0.f)
+        return;
+    std::vector<uint8_t> seen(static_cast<size_t>(vocab), 0);
+    for (int i = 0; i < hist_n; ++i) {
+        int t = hist[i];
+        if (t < 0 || t >= vocab || seen[static_cast<size_t>(t)])
+            continue;
+        seen[static_cast<size_t>(t)] = 1;
+        if (logits[t] < 0.f)
+            logits[t] *= penalty;
+        else
+            logits[t] /= penalty;
+    }
+}
+
+void apply_top_k(float *logits, int vocab, int k) {
+    if (!logits || vocab <= 0 || k <= 0 || k >= vocab)
+        return;
+    std::vector<int> order(static_cast<size_t>(vocab));
+    for (int i = 0; i < vocab; ++i)
+        order[static_cast<size_t>(i)] = i;
+    std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int a, int b) {
+        if (logits[a] != logits[b])
+            return logits[a] > logits[b];
+        return a < b;
+    });
+    std::vector<uint8_t> keep(static_cast<size_t>(vocab), 0);
+    for (int i = 0; i < k; ++i)
+        keep[static_cast<size_t>(order[static_cast<size_t>(i)])] = 1;
+    for (int i = 0; i < vocab; ++i)
+        if (!keep[static_cast<size_t>(i)])
+            logits[i] = -1e30f;
+}
+
+void apply_min_p(float *logits, int vocab, float min_p) {
+    if (!logits || vocab <= 0 || min_p <= 0.f || min_p >= 1.f)
+        return;
     float m = logits[0];
     for (int i = 1; i < vocab; ++i)
         if (logits[i] > m)
             m = logits[i];
+    std::vector<float> p(static_cast<size_t>(vocab));
     float sum = 0.f;
     for (int i = 0; i < vocab; ++i) {
-        p[static_cast<size_t>(i)] = std::exp((logits[i] - m) / temperature);
+        p[static_cast<size_t>(i)] = std::exp(logits[i] - m);
         sum += p[static_cast<size_t>(i)];
     }
     if (!(sum > 0.f))
-        return 0;
-    for (int i = 0; i < vocab; ++i)
+        return;
+    float p_max = 0.f;
+    for (int i = 0; i < vocab; ++i) {
         p[static_cast<size_t>(i)] /= sum;
-    if (top_p > 0.f && top_p < 1.f) {
-        std::vector<int> ord(static_cast<size_t>(vocab));
+        if (p[static_cast<size_t>(i)] > p_max)
+            p_max = p[static_cast<size_t>(i)];
+    }
+    const float thresh = min_p * p_max;
+    for (int i = 0; i < vocab; ++i)
+        if (p[static_cast<size_t>(i)] < thresh)
+            logits[i] = -1e30f;
+}
+
+void apply_logit_bias(float *logits, int vocab, const std::pair<int, float> *bias, int n_bias) {
+    if (!logits || !bias || vocab <= 0)
+        return;
+    for (int i = 0; i < n_bias; ++i) {
+        int t = bias[i].first;
+        if (t >= 0 && t < vocab)
+            logits[t] += bias[i].second;
+    }
+}
+
+float token_logprob(const float *logits, int vocab, int token, const uint8_t *allow) {
+    if (!logits || vocab <= 0 || token < 0 || token >= vocab)
+        return -1e30f;
+    if (allow && !allow[token])
+        return -1e30f;
+    float m = 0.f;
+    bool have = false;
+    for (int i = 0; i < vocab; ++i) {
+        if (allow && !allow[i])
+            continue;
+        if (!have || logits[i] > m) {
+            m = logits[i];
+            have = true;
+        }
+    }
+    if (!have)
+        return -1e30f;
+    float sum = 0.f;
+    for (int i = 0; i < vocab; ++i) {
+        if (allow && !allow[i])
+            continue;
+        sum += std::exp(logits[i] - m);
+    }
+    if (!(sum > 0.f))
+        return -1e30f;
+    return (logits[token] - m) - std::log(sum);
+}
+
+void top_logprobs(const float *logits, int vocab, int k, GenLogprob *out, int *n_out,
+                  const uint8_t *allow) {
+    if (n_out)
+        *n_out = 0;
+    if (!logits || !out || vocab <= 0 || k < 1)
+        return;
+    std::vector<int> idx;
+    idx.reserve(static_cast<size_t>(vocab));
+    for (int i = 0; i < vocab; ++i) {
+        if (allow && !allow[i])
+            continue;
+        idx.push_back(i);
+    }
+    if (idx.empty())
+        return;
+    const int take = std::min(k, static_cast<int>(idx.size()));
+    std::partial_sort(idx.begin(), idx.begin() + take, idx.end(), [&](int a, int b) {
+        if (logits[a] != logits[b])
+            return logits[a] > logits[b];
+        return a < b;
+    });
+    for (int i = 0; i < take; ++i) {
+        out[i].token = idx[static_cast<size_t>(i)];
+        out[i].logprob = token_logprob(logits, vocab, idx[static_cast<size_t>(i)], allow);
+    }
+    if (n_out)
+        *n_out = take;
+}
+
+int sample_token(const float *logits, int vocab, float temperature, float top_p, uint64_t *rng,
+                 const uint8_t *allow, float *out_logprob) {
+    int chosen = 0;
+    if (!logits || vocab <= 0) {
+        if (out_logprob)
+            *out_logprob = -1e30f;
+        return 0;
+    }
+    auto ok = [&](int i) { return !allow || allow[i]; };
+    if (temperature <= 0.f) {
+        int best = -1;
         for (int i = 0; i < vocab; ++i)
-            ord[static_cast<size_t>(i)] = i;
-        std::sort(ord.begin(), ord.end(), [&](int a, int b) {
-            return p[static_cast<size_t>(a)] > p[static_cast<size_t>(b)];
-        });
-        float acc = 0.f;
+            if (ok(i) && (best < 0 || logits[i] > logits[best]))
+                best = i;
+        chosen = best < 0 ? 0 : best;
+    } else {
+        std::vector<float> p(static_cast<size_t>(vocab));
+        float m = 0.f;
+        bool have = false;
         for (int i = 0; i < vocab; ++i) {
-            acc += p[static_cast<size_t>(ord[static_cast<size_t>(i)])];
-            if (acc >= top_p) {
-                for (int j = i + 1; j < vocab; ++j)
-                    p[static_cast<size_t>(ord[static_cast<size_t>(j)])] = 0.f;
+            if (!ok(i))
+                continue;
+            if (!have || logits[i] > m) {
+                m = logits[i];
+                have = true;
+            }
+        }
+        if (!have) {
+            if (out_logprob)
+                *out_logprob = token_logprob(logits, vocab, 0, allow);
+            return 0;
+        }
+        float sum = 0.f;
+        for (int i = 0; i < vocab; ++i) {
+            if (!ok(i)) {
+                p[static_cast<size_t>(i)] = 0.f;
+                continue;
+            }
+            p[static_cast<size_t>(i)] = std::exp((logits[i] - m) / temperature);
+            sum += p[static_cast<size_t>(i)];
+        }
+        if (!(sum > 0.f)) {
+            if (out_logprob)
+                *out_logprob = token_logprob(logits, vocab, 0, allow);
+            return 0;
+        }
+        for (int i = 0; i < vocab; ++i)
+            p[static_cast<size_t>(i)] /= sum;
+        if (top_p > 0.f && top_p < 1.f) {
+            std::vector<int> ord(static_cast<size_t>(vocab));
+            for (int i = 0; i < vocab; ++i)
+                ord[static_cast<size_t>(i)] = i;
+            std::sort(ord.begin(), ord.end(), [&](int a, int b) {
+                return p[static_cast<size_t>(a)] > p[static_cast<size_t>(b)];
+            });
+            float acc = 0.f;
+            for (int i = 0; i < vocab; ++i) {
+                acc += p[static_cast<size_t>(ord[static_cast<size_t>(i)])];
+                if (acc >= top_p) {
+                    for (int j = i + 1; j < vocab; ++j)
+                        p[static_cast<size_t>(ord[static_cast<size_t>(j)])] = 0.f;
+                    break;
+                }
+            }
+            float s2 = 0.f;
+            for (int i = 0; i < vocab; ++i)
+                s2 += p[static_cast<size_t>(i)];
+            if (s2 > 0.f) {
+                for (int i = 0; i < vocab; ++i)
+                    p[static_cast<size_t>(i)] /= s2;
+            }
+        }
+        uint64_t s = rng ? *rng : 1ull;
+        s += 0x9E3779B97F4A7C15ull;
+        s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ull;
+        s = (s ^ (s >> 27)) * 0x94D049BB133111EBull;
+        s ^= s >> 31;
+        if (rng)
+            *rng = s;
+        float u = static_cast<float>((s >> 11) * (1.0 / 9007199254740992.0));
+        float c = 0.f;
+        chosen = vocab - 1;
+        for (int i = 0; i < vocab; ++i) {
+            c += p[static_cast<size_t>(i)];
+            if (u <= c) {
+                chosen = i;
                 break;
             }
         }
-        float s2 = 0.f;
-        for (int i = 0; i < vocab; ++i)
-            s2 += p[static_cast<size_t>(i)];
-        if (s2 > 0.f) {
-            for (int i = 0; i < vocab; ++i)
-                p[static_cast<size_t>(i)] /= s2;
-        }
     }
-    uint64_t s = rng ? *rng : 1ull;
-    s += 0x9E3779B97F4A7C15ull;
-    s = (s ^ (s >> 30)) * 0xBF58476D1CE4E5B9ull;
-    s = (s ^ (s >> 27)) * 0x94D049BB133111EBull;
-    s ^= s >> 31;
-    if (rng)
-        *rng = s;
-    float u = static_cast<float>((s >> 11) * (1.0 / 9007199254740992.0));
-    float c = 0.f;
-    for (int i = 0; i < vocab; ++i) {
-        c += p[static_cast<size_t>(i)];
-        if (u <= c)
-            return i;
-    }
-    return vocab - 1;
+    if (out_logprob)
+        *out_logprob = token_logprob(logits, vocab, chosen, allow);
+    return chosen;
 }
 
 int moe_union_ids(const int *idx, int n_tok, int topk, int *out, int out_cap) {
@@ -402,7 +690,8 @@ void bf16_to_f32(const uint16_t *src, float *dst, int64_t n) {
 
 void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                       int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
-                      int tokens, float eps) {
+                      int tokens, float eps, const float *adaln_mod, const float *q_norm,
+                      const float *k_norm, const float *rope_cos, const float *rope_sin) {
     if (!blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
         return;
     const int64_t qkv_n = qkv_bytes / 2;
@@ -428,8 +717,18 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     const int H = hidden;
     std::vector<float> xn(static_cast<size_t>(T) * H);
     std::vector<float> ones(H, 1.f);
-    for (int t = 0; t < T; ++t)
-        quant::rmsnorm(x + t * H, ones.data(), xn.data() + t * H, H, eps);
+    auto apply_adaln = [&](const float *src, float *dst, int scale_slot, int shift_slot) {
+        for (int t = 0; t < T; ++t) {
+            quant::rmsnorm(src + t * H, ones.data(), dst + t * H, H, eps);
+            if (!adaln_mod)
+                continue;
+            const float *s = adaln_mod + scale_slot * H;
+            const float *b = adaln_mod + shift_slot * H;
+            for (int i = 0; i < H; ++i)
+                dst[t * H + i] = dst[t * H + i] * (1.f + s[i]) + b[i];
+        }
+    };
+    apply_adaln(x, xn.data(), 0, 1);
 
     std::vector<float> qkv(static_cast<size_t>(T) * 3 * I);
     quant::matmul_f32(qkv.data(), xn.data(), Wqkv.data(), T, H, 3 * I);
@@ -439,6 +738,37 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     if (heads < 1) {
         heads = 1;
         hd = I;
+    }
+    if (q_norm || k_norm) {
+        for (int t = 0; t < T; ++t) {
+            for (int h = 0; h < heads; ++h) {
+                float *q = qkv.data() + t * 3 * I + h * hd;
+                float *k = qkv.data() + t * 3 * I + I + h * hd;
+                if (q_norm)
+                    quant::rmsnorm(q, q_norm, q, hd, eps);
+                if (k_norm)
+                    quant::rmsnorm(k, k_norm, k, hd, eps);
+            }
+        }
+    }
+    if (rope_cos && rope_sin && hd >= 96) {
+        const int half = 48;
+        for (int t = 0; t < T; ++t) {
+            const float *c = rope_cos + static_cast<size_t>(t) * half;
+            const float *s = rope_sin + static_cast<size_t>(t) * half;
+            for (int h = 0; h < heads; ++h) {
+                float *q = qkv.data() + t * 3 * I + h * hd;
+                float *k = qkv.data() + t * 3 * I + I + h * hd;
+                for (int d = 0; d < half; ++d) {
+                    float qa = q[d], qb = q[d + half];
+                    q[d] = qa * c[d] - qb * s[d];
+                    q[d + half] = qa * s[d] + qb * c[d];
+                    float ka = k[d], kb = k[d + half];
+                    k[d] = ka * c[d] - kb * s[d];
+                    k[d + half] = ka * s[d] + kb * c[d];
+                }
+            }
+        }
     }
     std::vector<float> ctx(static_cast<size_t>(T) * I, 0.f);
     const float scale = 1.f / std::sqrt(static_cast<float>(hd));
@@ -470,11 +800,13 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
 
     std::vector<float> attn(static_cast<size_t>(T) * H);
     quant::matmul_f32(attn.data(), ctx.data(), Wout.data(), T, I, H);
-    for (int i = 0; i < T * H; ++i)
-        x[i] += attn[i];
-
     for (int t = 0; t < T; ++t)
-        quant::rmsnorm(x + t * H, ones.data(), xn.data() + t * H, H, eps);
+        for (int i = 0; i < H; ++i) {
+            float g = adaln_mod ? adaln_mod[2 * H + i] : 1.f;
+            x[t * H + i] += g * attn[t * H + i];
+        }
+
+    apply_adaln(x, xn.data(), 3, 4);
     std::vector<float> h1(static_cast<size_t>(T) * (2 * ffn));
     quant::matmul_f32(h1.data(), xn.data(), Wfc1.data(), T, H, 2 * ffn);
     for (int t = 0; t < T; ++t) {
@@ -490,8 +822,11 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                     static_cast<size_t>(ffn) * sizeof(float));
     std::vector<float> down(static_cast<size_t>(T) * H);
     quant::matmul_f32(down.data(), gated.data(), Wfc2.data(), T, ffn, H);
-    for (int i = 0; i < T * H; ++i)
-        x[i] += down[i];
+    for (int t = 0; t < T; ++t)
+        for (int i = 0; i < H; ++i) {
+            float g = adaln_mod ? adaln_mod[5 * H + i] : 1.f;
+            x[t * H + i] += g * down[t * H + i];
+        }
 }
 
 void mla_absorb_kvb(const float *kv_b, int n_heads, int qk_nope, int v_head, int kv_lora,
@@ -673,9 +1008,9 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
     w_kva->gemm(crow, x, 1);
     if (kva_ln)
         quant::rmsnorm(crow, kva_ln, crow, L, eps);
-    if (R > 0 && mla.rope_theta > 0.f)
+    if (R > 0 && !mla.nope && mla.rope_theta > 0.f)
         apply_rope(crow + L, R, pos, mla.rope_theta);
-    if (R > 0 && mla.rope_theta > 0.f) {
+    if (R > 0 && !mla.nope && mla.rope_theta > 0.f) {
         for (int h = 0; h < H; ++h)
             apply_rope(q.data() + static_cast<size_t>(h) * QH + QK, R, pos, mla.rope_theta);
     }
@@ -734,12 +1069,324 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
         std::memset(y, 0, static_cast<size_t>(hidden) * sizeof(float));
 }
 
+namespace {
+
+void vit_matvec(float *out, const float *w, const float *b, const float *in, int rows, int cols) {
+    for (int r = 0; r < rows; ++r) {
+        float s = b ? b[r] : 0.f;
+        const float *wr = w + static_cast<size_t>(r) * cols;
+        for (int c = 0; c < cols; ++c)
+            s += wr[c] * in[c];
+        out[r] = s;
+    }
+}
+
+float vit_gelu(float x) {
+    return 0.5f * x * (1.f + std::erff(x * 0.70710678118654752f));
+}
+
+} // namespace
+
+int glm_vit_forward(const GlmVitTower &tower, const float *pixels, int grid_h, int grid_w,
+                    float *out) {
+    const VisionConfig &c = tower.cfg;
+    if (!out || !pixels || grid_h < 1 || grid_w < 1 || !tower.ready())
+        return -1;
+    const int merge = c.merge > 0 ? c.merge : 1;
+    if (grid_h % merge || grid_w % merge)
+        return -1;
+    const int hidden = c.hidden;
+    const int heads = c.heads > 0 ? c.heads : 1;
+    const int hd = hidden / heads;
+    if (hidden <= 0 || hd <= 0 || hd % 4)
+        return -1;
+    const int tokens = grid_h * grid_w;
+    const int pin = c.in_channels * c.temporal * c.patch * c.patch;
+    const int rot = hd / 2;
+    const int half = rot / 2;
+    std::vector<float> state(static_cast<size_t>(tokens) * hidden, 0.f);
+    std::vector<float> cost(static_cast<size_t>(tokens) * hd, 0.f);
+    std::vector<float> sint(static_cast<size_t>(tokens) * hd, 0.f);
+    std::vector<float> qkv(static_cast<size_t>(tokens) * 3 * hidden, 0.f);
+    std::vector<float> scores(static_cast<size_t>(tokens), 0.f);
+    std::vector<float> scratch(static_cast<size_t>(std::max(hidden, c.intermediate)), 0.f);
+    std::vector<float> branch(static_cast<size_t>(tokens) * hidden, 0.f);
+    if (static_cast<int>(tower.patch_w.size()) < hidden * pin)
+        return -1;
+    for (int t = 0; t < tokens; ++t)
+        vit_matvec(state.data() + static_cast<size_t>(t) * hidden, tower.patch_w.data(),
+                   tower.patch_b.empty() ? nullptr : tower.patch_b.data(),
+                   pixels + static_cast<size_t>(t) * pin, hidden, pin);
+    int index = 0;
+    const float theta = c.rope_theta > 0.f ? c.rope_theta : 10000.f;
+    for (int bh = 0; bh < grid_h / merge; ++bh)
+        for (int bw = 0; bw < grid_w / merge; ++bw)
+            for (int ih = 0; ih < merge; ++ih)
+                for (int iw = 0; iw < merge; ++iw, ++index) {
+                    float pos[2] = {static_cast<float>(bh * merge + ih),
+                                    static_cast<float>(bw * merge + iw)};
+                    float *cosine = cost.data() + static_cast<size_t>(index) * hd;
+                    float *sine = sint.data() + static_cast<size_t>(index) * hd;
+                    for (int axis = 0; axis < 2; ++axis)
+                        for (int j = 0; j < half; ++j) {
+                            float inv = std::pow(theta, -2.f * static_cast<float>(j) /
+                                                            static_cast<float>(rot));
+                            float ang = pos[axis] * inv;
+                            int slot = axis * half + j;
+                            cosine[slot] = std::cos(ang);
+                            sine[slot] = std::sin(ang);
+                            cosine[slot + rot] = cosine[slot];
+                            sine[slot + rot] = sine[slot];
+                        }
+                }
+    const float eps = c.eps > 0.f ? c.eps : 1e-5f;
+    const float slim = c.swiglu_limit > 0.f ? c.swiglu_limit : 10.f;
+    for (const GlmVitBlock &block : tower.blocks) {
+        if (block.qkv_w.empty() || block.norm1.empty())
+            continue;
+        for (int t = 0; t < tokens; ++t) {
+            quant::rmsnorm(state.data() + static_cast<size_t>(t) * hidden, block.norm1.data(),
+                           scratch.data(), hidden, eps);
+            vit_matvec(qkv.data() + static_cast<size_t>(t) * 3 * hidden, block.qkv_w.data(),
+                       block.qkv_b.empty() ? nullptr : block.qkv_b.data(), scratch.data(),
+                       3 * hidden, hidden);
+        }
+        for (int t = 0; t < tokens; ++t) {
+            float *row = qkv.data() + static_cast<size_t>(t) * 3 * hidden;
+            const float *cosine = cost.data() + static_cast<size_t>(t) * hd;
+            const float *sine = sint.data() + static_cast<size_t>(t) * hd;
+            for (int h = 0; h < heads; ++h) {
+                float *q = row + h * hd;
+                float *k = row + hidden + h * hd;
+                if (!block.q_norm.empty())
+                    quant::rmsnorm(q, block.q_norm.data(), q, hd, eps);
+                if (!block.k_norm.empty())
+                    quant::rmsnorm(k, block.k_norm.data(), k, hd, eps);
+                for (int pass = 0; pass < 2; ++pass) {
+                    float *vec = pass ? k : q;
+                    std::vector<float> rotated(static_cast<size_t>(hd));
+                    for (int i = 0; i < hd; ++i)
+                        rotated[static_cast<size_t>(i)] =
+                            i < hd / 2 ? -vec[i + hd / 2] : vec[i - hd / 2];
+                    for (int i = 0; i < hd; ++i)
+                        vec[i] = vec[i] * cosine[i] + rotated[static_cast<size_t>(i)] * sine[i];
+                }
+            }
+        }
+        const float scale = 1.f / std::sqrt(static_cast<float>(hd));
+        for (int t = 0; t < tokens; ++t) {
+            float *result = branch.data() + static_cast<size_t>(t) * hidden;
+            for (int h = 0; h < heads; ++h) {
+                const float *q = qkv.data() + static_cast<size_t>(t) * 3 * hidden + h * hd;
+                float mx = -1e30f;
+                for (int s = 0; s < tokens; ++s) {
+                    const float *k = qkv.data() + static_cast<size_t>(s) * 3 * hidden + hidden +
+                                     h * hd;
+                    float dot = 0.f;
+                    for (int i = 0; i < hd; ++i)
+                        dot += q[i] * k[i];
+                    scores[static_cast<size_t>(s)] = dot * scale;
+                    if (scores[static_cast<size_t>(s)] > mx)
+                        mx = scores[static_cast<size_t>(s)];
+                }
+                float z = 0.f;
+                for (int s = 0; s < tokens; ++s) {
+                    scores[static_cast<size_t>(s)] = std::exp(scores[static_cast<size_t>(s)] - mx);
+                    z += scores[static_cast<size_t>(s)];
+                }
+                float *slot = result + h * hd;
+                std::fill(slot, slot + hd, 0.f);
+                for (int s = 0; s < tokens; ++s) {
+                    const float *vv = qkv.data() + static_cast<size_t>(s) * 3 * hidden +
+                                      2 * hidden + h * hd;
+                    float a = scores[static_cast<size_t>(s)] / z;
+                    for (int i = 0; i < hd; ++i)
+                        slot[i] += a * vv[i];
+                }
+            }
+        }
+        for (int t = 0; t < tokens; ++t) {
+            if (!block.proj_w.empty())
+                vit_matvec(scratch.data(), block.proj_w.data(),
+                           block.proj_b.empty() ? nullptr : block.proj_b.data(),
+                           branch.data() + static_cast<size_t>(t) * hidden, hidden, hidden);
+            else
+                std::memcpy(scratch.data(), branch.data() + static_cast<size_t>(t) * hidden,
+                            static_cast<size_t>(hidden) * sizeof(float));
+            float *st = state.data() + static_cast<size_t>(t) * hidden;
+            for (int i = 0; i < hidden; ++i)
+                st[i] += scratch[i];
+        }
+        const int I = c.intermediate > 0 ? c.intermediate : hidden;
+        std::vector<float> gate(static_cast<size_t>(I) * 2, 0.f);
+        for (int t = 0; t < tokens; ++t) {
+            float *up = gate.data() + I;
+            if (!block.norm2.empty())
+                quant::rmsnorm(state.data() + static_cast<size_t>(t) * hidden, block.norm2.data(),
+                               scratch.data(), hidden, eps);
+            else
+                std::memcpy(scratch.data(), state.data() + static_cast<size_t>(t) * hidden,
+                            static_cast<size_t>(hidden) * sizeof(float));
+            if (!block.gate_w.empty())
+                vit_matvec(gate.data(), block.gate_w.data(),
+                           block.gate_b.empty() ? nullptr : block.gate_b.data(), scratch.data(), I,
+                           hidden);
+            if (!block.up_w.empty())
+                vit_matvec(up, block.up_w.data(), block.up_b.empty() ? nullptr : block.up_b.data(),
+                           scratch.data(), I, hidden);
+            for (int i = 0; i < I; ++i) {
+                float g = gate[static_cast<size_t>(i)] > slim ? slim : gate[static_cast<size_t>(i)];
+                float u = up[i];
+                if (u > slim)
+                    u = slim;
+                if (u < -slim)
+                    u = -slim;
+                gate[static_cast<size_t>(i)] = g * quant::sigmoid(g) * u;
+            }
+            if (!block.down_w.empty())
+                vit_matvec(scratch.data(), block.down_w.data(),
+                           block.down_b.empty() ? nullptr : block.down_b.data(), gate.data(), hidden,
+                           I);
+            float *st = state.data() + static_cast<size_t>(t) * hidden;
+            for (int i = 0; i < hidden; ++i)
+                st[i] += scratch[i];
+        }
+    }
+    if (!tower.post_norm.empty()) {
+        for (int t = 0; t < tokens; ++t)
+            quant::rmsnorm(state.data() + static_cast<size_t>(t) * hidden, tower.post_norm.data(),
+                           state.data() + static_cast<size_t>(t) * hidden, hidden, eps);
+    }
+    const int nblk = (grid_h / merge) * (grid_w / merge);
+    const int oh = c.out_hidden > 0 ? c.out_hidden : hidden;
+    const int pi = c.proj_intermediate > 0 ? c.proj_intermediate : c.intermediate;
+    std::vector<float> merged(static_cast<size_t>(oh), 0.f);
+    std::vector<float> gated(static_cast<size_t>(std::max(pi, 1)) * 2, 0.f);
+    for (int n = 0; n < nblk; ++n) {
+        if (!tower.down_w.empty()) {
+            for (int o = 0; o < oh; ++o) {
+                float s = o < static_cast<int>(tower.down_b.size()) ? tower.down_b[static_cast<size_t>(o)]
+                                                                    : 0.f;
+                for (int ch = 0; ch < hidden; ++ch)
+                    for (int kh = 0; kh < merge; ++kh)
+                        for (int kw = 0; kw < merge; ++kw) {
+                            size_t wi = (((static_cast<size_t>(o) * hidden + ch) * merge + kh) *
+                                             merge +
+                                         kw);
+                            size_t tok = static_cast<size_t>(n) * merge * merge +
+                                         static_cast<size_t>(kh) * merge + kw;
+                            if (wi < tower.down_w.size())
+                                s += tower.down_w[wi] * state[tok * hidden + ch];
+                        }
+                merged[static_cast<size_t>(o)] = s;
+            }
+        } else {
+            std::fill(merged.begin(), merged.end(), 0.f);
+            int cnt = 0;
+            for (int kh = 0; kh < merge; ++kh)
+                for (int kw = 0; kw < merge; ++kw) {
+                    size_t tok = static_cast<size_t>(n) * merge * merge +
+                                 static_cast<size_t>(kh) * merge + kw;
+                    for (int i = 0; i < std::min(oh, hidden); ++i)
+                        merged[static_cast<size_t>(i)] += state[tok * hidden + i];
+                    ++cnt;
+                }
+            if (cnt > 0)
+                for (int i = 0; i < oh; ++i)
+                    merged[static_cast<size_t>(i)] /= static_cast<float>(cnt);
+        }
+        if (!tower.merger_proj.empty()) {
+            std::vector<float> tmp(static_cast<size_t>(oh), 0.f);
+            vit_matvec(tmp.data(), tower.merger_proj.data(), nullptr, merged.data(), oh, oh);
+            layernorm(tmp.data(),
+                      tower.merger_norm_w.empty() ? nullptr : tower.merger_norm_w.data(),
+                      tower.merger_norm_b.empty() ? nullptr : tower.merger_norm_b.data(),
+                      merged.data(), oh, 1e-5f);
+            for (int i = 0; i < oh; ++i)
+                merged[static_cast<size_t>(i)] = vit_gelu(merged[static_cast<size_t>(i)]);
+        }
+        if (!tower.merger_gate.empty() && !tower.merger_up.empty() && !tower.merger_down.empty() &&
+            pi > 0) {
+            float *up = gated.data() + pi;
+            vit_matvec(gated.data(), tower.merger_gate.data(), nullptr, merged.data(), pi, oh);
+            vit_matvec(up, tower.merger_up.data(), nullptr, merged.data(), pi, oh);
+            for (int i = 0; i < pi; ++i) {
+                float g = gated[static_cast<size_t>(i)] > slim ? slim : gated[static_cast<size_t>(i)];
+                float u = up[i];
+                if (u > slim)
+                    u = slim;
+                if (u < -slim)
+                    u = -slim;
+                gated[static_cast<size_t>(i)] = g * quant::sigmoid(g) * u;
+            }
+            vit_matvec(out + static_cast<size_t>(n) * oh, tower.merger_down.data(), nullptr,
+                       gated.data(), oh, pi);
+        } else {
+            std::memcpy(out + static_cast<size_t>(n) * oh, merged.data(),
+                        static_cast<size_t>(oh) * sizeof(float));
+        }
+    }
+    return nblk;
+}
+
 int glm_vit_embed(const float *rgb, int width, int height, const VisionConfig &v,
                   const quant::QuantMat *patch, const quant::QuantMat *proj, float *out,
-                  int out_cap) {
+                  int out_cap, const GlmVitTower *tower) {
     if (!rgb || !out || out_cap <= 0 || width <= 0 || height <= 0)
         return 0;
     const int P = v.patch > 0 ? v.patch : 14;
+    if (tower && tower->ready()) {
+        const int merge = v.merge > 0 ? v.merge : tower->cfg.merge;
+        const int isz = v.image_size > 0 ? v.image_size : std::max(width, P * std::max(merge, 1));
+        const int step = P * std::max(merge, 1);
+        int side = (isz / step) * step;
+        if (side < step)
+            side = step;
+        const int gh = side / P, gw = side / P;
+        const int T = v.temporal > 0 ? v.temporal : 2;
+        const int C = v.in_channels > 0 ? v.in_channels : 3;
+        const int pin = C * T * P * P;
+        std::vector<float> pixels(static_cast<size_t>(gh) * gw * pin, 0.f);
+        const float mean[3] = {0.48145466f, 0.4578275f, 0.40821073f};
+        const float stdv[3] = {0.26862954f, 0.26130258f, 0.27577711f};
+        int idx = 0;
+        for (int bh = 0; bh < gh / std::max(merge, 1); ++bh)
+            for (int bw = 0; bw < gw / std::max(merge, 1); ++bw)
+                for (int ih = 0; ih < std::max(merge, 1); ++ih)
+                    for (int iw = 0; iw < std::max(merge, 1); ++iw, ++idx) {
+                        const int py = bh * merge + ih;
+                        const int px = bw * merge + iw;
+                        float *dst = pixels.data() + static_cast<size_t>(idx) * pin;
+                        for (int tt = 0; tt < T; ++tt)
+                            for (int dy = 0; dy < P; ++dy)
+                                for (int dx = 0; dx < P; ++dx)
+                                    for (int ch = 0; ch < C; ++ch) {
+                                        int sy = (py * P + dy) * height / side;
+                                        int sx = (px * P + dx) * width / side;
+                                        if (sy >= height)
+                                            sy = height - 1;
+                                        if (sx >= width)
+                                            sx = width - 1;
+                                        if (sy < 0)
+                                            sy = 0;
+                                        if (sx < 0)
+                                            sx = 0;
+                                        float val = rgb[(static_cast<size_t>(sy) * width + sx) * 3 +
+                                                        ch];
+                                        val = (val - mean[ch]) / stdv[ch];
+                                        dst[((tt * P + dy) * P + dx) * C + ch] = val;
+                                    }
+                    }
+        const int nout = (gh / std::max(merge, 1)) * (gw / std::max(merge, 1));
+        const int take = std::min(nout, out_cap);
+        std::vector<float> full(static_cast<size_t>(std::max(nout, 1)) *
+                                std::max(v.out_hidden > 0 ? v.out_hidden : v.hidden, 1));
+        if (glm_vit_forward(*tower, pixels.data(), gh, gw, full.data()) < 0)
+            return 0;
+        const int od = v.out_hidden > 0 ? v.out_hidden : v.hidden;
+        std::memcpy(out, full.data(), static_cast<size_t>(take) * od * sizeof(float));
+        return take;
+    }
     const int isz = v.image_size > 0 ? v.image_size : std::max(width, P);
     const int merge = v.merge > 0 ? v.merge : 1;
     const int gh = std::max(isz / P, 1);
@@ -825,6 +1472,74 @@ int glm_vit_embed(const float *rgb, int width, int height, const VisionConfig &v
         }
     }
     return take;
+}
+
+int h3_dit_patchify(const float *z, int ch, int t, int h, int w, float *rows) {
+    if (!z || !rows || ch < 1 || t < 1 || h < 2 || w < 2 || (h & 1) || (w & 1))
+        return 0;
+    int n = 0;
+    for (int ti = 0; ti < t; ++ti)
+        for (int y = 0; y < h; y += 2)
+            for (int x = 0; x < w; x += 2)
+                for (int c = 0; c < ch; ++c)
+                    for (int dy = 0; dy < 2; ++dy)
+                        for (int dx = 0; dx < 2; ++dx) {
+                            size_t in = (((static_cast<size_t>(c) * t + ti) * h + (y + dy)) * w) +
+                                        (x + dx);
+                            rows[n++] = z[in];
+                        }
+    return n;
+}
+
+int h3_dit_unpatchify(const float *rows, int ch, int t, int h, int w, float *z) {
+    if (!rows || !z || ch < 1 || t < 1 || h < 2 || w < 2 || (h & 1) || (w & 1))
+        return 0;
+    int n = 0;
+    for (int ti = 0; ti < t; ++ti)
+        for (int y = 0; y < h; y += 2)
+            for (int x = 0; x < w; x += 2)
+                for (int c = 0; c < ch; ++c)
+                    for (int dy = 0; dy < 2; ++dy)
+                        for (int dx = 0; dx < 2; ++dx) {
+                            size_t out = (((static_cast<size_t>(c) * t + ti) * h + (y + dy)) * w) +
+                                         (x + dx);
+                            z[out] = rows[n++];
+                        }
+    return n;
+}
+
+void h3_sigma_video(int steps, float *sigmas, float shift) {
+    if (!sigmas || steps < 1)
+        return;
+    if (shift <= 0.f)
+        shift = 12.f;
+    for (int i = 0; i < steps; ++i) {
+        int base_index = (i * 1000) / steps;
+        float base = static_cast<float>(1000 - base_index) / 1000.f;
+        sigmas[i] = shift * base / (1.f + (shift - 1.f) * base);
+    }
+    sigmas[steps] = 0.f;
+}
+
+void h3_time_features(float t, float *out, int dim) {
+    if (!out || dim < 2)
+        return;
+    const int half = dim / 2;
+    for (int i = 0; i < half; ++i) {
+        float freq = std::exp(-std::log(10000.f) * static_cast<float>(i) / static_cast<float>(half));
+        float ang = t * freq;
+        out[i] = std::cos(ang);
+        out[half + i] = std::sin(ang);
+    }
+}
+
+int h3_euler_step(float *sample, const float *velocity, int n, float sigma, float sigma_next) {
+    if (!sample || !velocity || n <= 0 || !(sigma > sigma_next) || sigma_next < 0.f)
+        return 0;
+    const float d = sigma - sigma_next;
+    for (int i = 0; i < n; ++i)
+        sample[i] += d * velocity[i];
+    return 1;
 }
 
 } // namespace mvllm

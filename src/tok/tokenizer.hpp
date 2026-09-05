@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/types.hpp"
+#include "k3_tools.hpp"
 
 #include <cstdint>
 #include <string>
@@ -13,7 +14,11 @@ struct ChatMessage {
     std::string role;
     std::string content;
     std::string reasoning; // past assistant think body; empty = none
-    std::string tool_name; // XTML tool_call / tool_result name=
+    std::string tool_name; // fallback name when tool_calls empty
+    int tool_index = 0;    // official tool result index (1-based)
+    std::string xtml_type; // e.g. tool-declare on system
+    std::vector<K3ToolCall> tool_calls;
+    std::vector<std::string> image_urls; // OpenAI image_url / local path / data URI
 };
 
 class Tokenizer {
@@ -23,10 +28,12 @@ public:
     Status decode(const std::vector<int> &ids, std::string &text) const;
     // Prompt string for inspection. GLM: [gMASK]<sop>…; K3 XTML or <|im_start|> fallback.
     std::string apply_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
-                          const std::string &effort = {}) const;
+                          const std::string &effort = {},
+                          const std::vector<K3ToolDecl> *tools = nullptr) const;
     // K3 XTML encodes tag/attr pieces as separate tok_encode calls (rank-BPE contract).
     Status encode_chat(Family family, const std::vector<ChatMessage> &msgs, bool think,
-                       std::vector<int> &ids, const std::string &effort = {}) const;
+                       std::vector<int> &ids, const std::string &effort = {},
+                       const std::vector<K3ToolDecl> *tools = nullptr) const;
     int id_of(const std::string &content) const;
     bool has_xtml() const;
     int vocab_size() const { return vocab_size_; }

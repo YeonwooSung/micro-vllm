@@ -4,7 +4,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mvllm {
@@ -33,6 +35,9 @@ public:
     Status acquire(int index, const uint8_t **data, int64_t *bytes, std::string &err);
     void release(int index);
     Status prefetch(int index, std::string &err);
+    // Load block on a helper thread so compute on the pinned slot can overlap I/O.
+    void prefetch_async(int index);
+    Status wait_prefetch(std::string &err);
 
     int n_blocks() const { return n_blocks_; }
     int n_slots() const { return n_slots_; }
@@ -84,6 +89,10 @@ private:
     std::vector<Meta> meta_;
     bool open_ = false;
     bool use_direct_ = true;
+    std::mutex mu_;
+    std::thread prefetch_th_;
+    Status prefetch_st_ = Status::Ok;
+    std::string prefetch_err_;
 };
 
 } // namespace mvllm

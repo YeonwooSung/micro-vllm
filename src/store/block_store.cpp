@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
 
 namespace mvllm {
 
@@ -38,6 +39,10 @@ Status BlockStore::open(int n_blocks, int64_t block_bytes, int n_slots, std::str
 }
 
 void BlockStore::close() {
+    {
+        std::string ignored;
+        wait_prefetch(ignored);
+    }
     for (Slot &slot : slots_) {
         if (slot.base) {
             io::aligned_free_pages(slot.base);
@@ -286,6 +291,7 @@ Status BlockStore::acquire(int index, const uint8_t **data, int64_t *bytes, std:
         return Status::NotFound;
     }
 
+    std::lock_guard<std::mutex> lock(mu_);
     if (Slot *hit = find(index)) {
         ++hits_;
         ++hit->pins;
@@ -310,9 +316,31 @@ Status BlockStore::acquire(int index, const uint8_t **data, int64_t *bytes, std:
 }
 
 void BlockStore::release(int index) {
+    std::lock_guard<std::mutex> lock(mu_);
     if (Slot *slot = find(index)) {
         if (slot->pins > 0) --slot->pins;
     }
+}
+
+void BlockStore::prefetch_async(int index) {
+    std::string ignored;
+    wait_prefetch(ignored);
+    prefetch_err_.clear();
+    prefetch_st_ = Status::Ok;
+    prefetch_th_ = std::thread([this, index]() {
+        std::string err;
+        prefetch_st_ = prefetch(index, err);
+        if (prefetch_st_ != Status::Ok)
+            prefetch_err_ = err;
+    });
+}
+
+Status BlockStore::wait_prefetch(std::string &err) {
+    if (prefetch_th_.joinable())
+        prefetch_th_.join();
+    if (prefetch_st_ != Status::Ok && err.empty())
+        err = prefetch_err_;
+    return prefetch_st_;
 }
 
 Status BlockStore::prefetch(int index, std::string &err) {
@@ -329,6 +357,7 @@ Status BlockStore::prefetch(int index, std::string &err) {
         err = "block not registered";
         return Status::NotFound;
     }
+    std::lock_guard<std::mutex> lock(mu_);
     if (Slot *hit = find(index)) {
         hit->used = clock_++;
         return Status::Ok;

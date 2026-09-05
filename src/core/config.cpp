@@ -106,7 +106,7 @@ void apply_family_defaults(ModelConfig &cfg) {
             cfg.n_layers = 45;
         if (!cfg.vocab && full)
             cfg.vocab = 154880;
-        if (!cfg.first_dense)
+        if (!cfg.first_dense && full)
             cfg.first_dense = 3;
         if (!cfg.dense_intermediate && full)
             cfg.dense_intermediate = 12288;
@@ -139,7 +139,7 @@ void apply_family_defaults(ModelConfig &cfg) {
         if (!cfg.mhc.iters)
             cfg.mhc.iters = 20;
         if (!cfg.dsa.kpool)
-            cfg.dsa.kpool = 4;
+            cfg.dsa.kpool = 1;
         cfg.kda.full_rank_gate = false;
         if (!cfg.kda.conv_k)
             cfg.kda.conv_k = 4;
@@ -406,22 +406,31 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
     out.mhc.mult = jnum(text, "hc_mult", 0);
     out.mhc.iters = jnum(text, "hc_iters", jnum(text, "hc_sinkhorn_iters", 20));
     out.mhc.eps = jfloat(text, "hc_eps", 1e-6f);
-    out.dsa.topk = jnum(text, "index_topk", 0);
-    out.dsa.n_heads = jnum(text, "index_n_heads", 0);
-    out.dsa.head_dim = jnum(text, "index_head_dim", 0);
-    out.dsa.kpool = jnum(text, "index_kpool", 4);
+    out.dsa.topk = jnum(text, "index_topk", out.dsa.topk);
+    out.dsa.n_heads = jnum(text, "index_n_heads", out.dsa.n_heads);
+    out.dsa.head_dim = jnum(text, "index_head_dim", out.dsa.head_dim);
+    out.dsa.kpool = jnum(text, "index_kpool", out.dsa.kpool);
 
     if (root.contains("vision_config") && root["vision_config"].is_object()) {
         const json &v = root["vision_config"];
-        out.vision.layers = jnum(v, "num_hidden_layers", 0);
+        out.vision.layers = jnum(v, "depth", jnum(v, "num_hidden_layers", 0));
         out.vision.hidden = jnum(v, "hidden_size", 0);
-        out.vision.heads = jnum(v, "num_attention_heads", 0);
+        out.vision.heads = jnum(v, "num_heads", jnum(v, "num_attention_heads", 0));
         out.vision.intermediate = jnum(v, "intermediate_size", 0);
         out.vision.patch = jnum(v, "patch_size", 14);
         out.vision.image_size = jnum(v, "image_size", 448);
         out.vision.merge = jnum(v, "spatial_merge_size", 2);
         out.vision.out_hidden = jnum(v, "out_hidden_size", out.hidden);
+        out.vision.temporal = jnum(v, "temporal_patch_size", 2);
+        out.vision.in_channels = jnum(v, "in_channels", 3);
+        out.vision.proj_intermediate = jnum(v, "projection_intermediate_size", 0);
+        out.vision.eps = jfloat(v, "rms_norm_eps", 1e-5f);
+        out.vision.swiglu_limit = jfloat(v, "swiglu_limit", 10.f);
+        out.vision.rope_theta = jfloat(v, "rope_theta", 10000.f);
     }
+    out.vision.image_token = jnum(root, "image_token_id", -1);
+    out.vision.image_start_token = jnum(root, "image_start_token_id", -1);
+    out.vision.image_end_token = jnum(root, "image_end_token_id", -1);
 
     // Layer kinds.
     out.is_kda.assign(out.n_layers > 0 ? out.n_layers : 0, 0);
@@ -521,6 +530,15 @@ RuntimeConfig runtime_from_env() {
         rt.mla_bits = std::atoi(v);
     if (const char *v = get("GLM53_BITS"))
         rt.dense_bits = std::atoi(v);
+    if (const char *v = get("MVLLM_KV_SLOTS") ? get("MVLLM_KV_SLOTS")
+                                              : (get("KV_SLOTS") ? get("KV_SLOTS")
+                                                                 : get("COLI_KV_SLOTS"))) {
+        rt.kv_slots = std::atoi(v);
+        if (rt.kv_slots < 1)
+            rt.kv_slots = 1;
+        if (rt.kv_slots > 16)
+            rt.kv_slots = 16;
+    }
     return rt;
 }
 

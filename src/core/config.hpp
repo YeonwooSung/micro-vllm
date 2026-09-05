@@ -53,8 +53,8 @@ struct DsaConfig {
     int topk = 0;
     int n_heads = 0;
     int head_dim = 0;
-    int kpool = 4;
-    bool always_select_tail = true;
+    int kpool = 1;
+    bool always_select_tail = false;
 };
 
 struct VisionConfig {
@@ -66,6 +66,15 @@ struct VisionConfig {
     int image_size = 448;
     int merge = 2;
     int out_hidden = 0;
+    int temporal = 2;
+    int in_channels = 3;
+    int proj_intermediate = 0;
+    int image_token = -1;
+    int image_start_token = -1;
+    int image_end_token = -1;
+    float eps = 1e-5f;
+    float swiglu_limit = 10.f;
+    float rope_theta = 10000.f;
 };
 
 struct H3Config {
@@ -85,6 +94,13 @@ struct H3Config {
     int vae_layers = 36;
     int vae_heads = 32;
     int vae_head_dim = 64;
+    int time_dim = 2688;
+    int time_input = 256;
+    float video_sigma_shift = 12.f;
+    float audio_sigma_shift = 3.f;
+    int audio_latent_ch = 32;
+    int audio_hop = 800;
+    int audio_rate = 32000;
 };
 
 struct ModelConfig {
@@ -137,6 +153,7 @@ struct RuntimeConfig {
     int host_port = 8000;
     std::string host = "127.0.0.1";
     std::string model_dir;
+    int kv_slots = 1; // 1–16; official mux KV_SLOTS
 };
 
 inline bool is_stop_token(int id, const ModelConfig &cfg, int extra_eos = -1) {

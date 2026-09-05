@@ -40,19 +40,40 @@ set(MVLLM_HOST_SOURCES
     src/io/file_io.cpp
     src/io/safetensors.cpp
     src/io/shard_probe.cpp
+    src/io/image.cpp
+    src/io/av_mux.cpp
     src/quant/quant.cpp
     src/quant/weight.cpp
     src/store/expert_store.cpp
     src/store/block_store.cpp
+    src/store/kv_persist.cpp
     src/tok/tokenizer.cpp
+    src/tok/k3_tools.cpp
+    src/tok/k3_chat1.cpp
+    src/tok/gbnf.cpp
+    src/tok/json_schema.cpp
+    src/tok/decode_post.cpp
+    src/tok/glm_tools.cpp
+    src/serve/mux_stdio.cpp
+    src/serve/cli_flags.cpp
+    src/serve/anthropic.cpp
     src/model/ops.cpp
     src/model/family.cpp
     src/model/kimi_k3.cpp
     src/model/glm53.cpp
     src/model/h3.cpp
+    src/model/h3_layout.cpp
+    src/model/h3_text.cpp
+    src/model/h3_vision.cpp
+    src/model/h3_mm.cpp
     src/model/h3_vae.cpp
+    src/model/h3_audio_vae.cpp
+    src/model/h3_dit_schedule.cpp
+    src/model/h3_canvas.cpp
     src/model/llama.cpp
     src/serve/http_server.cpp
+    src/serve/session.cpp
+    src/serve/scheduler.cpp
     src/engine.cpp
     src/gpu/backend.cpp
 )
@@ -77,6 +98,17 @@ add_library(mvllm_host STATIC ${MVLLM_HOST_SOURCES})
 target_include_directories(mvllm_host PUBLIC src include)
 if(UNIX)
     target_link_libraries(mvllm_host PUBLIC pthread)
+endif()
+find_package(ZLIB)
+if(ZLIB_FOUND)
+    target_link_libraries(mvllm_host PUBLIC ZLIB::ZLIB)
+else()
+    target_link_libraries(mvllm_host PUBLIC z)
+endif()
+if(APPLE)
+    target_compile_definitions(mvllm_host PUBLIC MVLLM_WITH_IMAGEIO=1)
+    target_link_libraries(mvllm_host PUBLIC "-framework ImageIO" "-framework CoreGraphics"
+                                            "-framework CoreFoundation")
 endif()
 if(APPLE AND MVLLM_METAL)
     set_source_files_properties(src/gpu/metal.mm PROPERTIES

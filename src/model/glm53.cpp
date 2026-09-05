@@ -3,6 +3,9 @@
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
+#include "../serve/session.hpp"
+#include "../tok/decode_post.hpp"
+#include "../tok/gbnf.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -61,12 +64,62 @@ const char *kExpertPieces[6] = {
     "down_proj.weight", "down_proj.weight.qs",
 };
 
+int sample_penalized(const float *logits, int vocab, const GenParams &gp, const int *hist,
+                     int hist_n, uint64_t *rng, const uint8_t *allow, float *lp,
+                     std::vector<float> *token_lps,
+                     std::vector<std::vector<GenLogprob>> *top_lps) {
+    std::vector<float> work(static_cast<size_t>(std::max(vocab, 0)));
+    if (logits && vocab > 0)
+        std::memcpy(work.data(), logits, static_cast<size_t>(vocab) * sizeof(float));
+    apply_penalties(work.data(), vocab, hist, hist_n, gp.frequency_penalty, gp.presence_penalty);
+    apply_logit_bias(work.data(), vocab, gp.logit_bias.empty() ? nullptr : gp.logit_bias.data(),
+                     static_cast<int>(gp.logit_bias.size()));
+    apply_repetition_penalty(work.data(), vocab, hist, hist_n, gp.repetition_penalty);
+    apply_top_k(work.data(), vocab, gp.top_k);
+    apply_min_p(work.data(), vocab, gp.min_p);
+    float local_lp = 0.f;
+    int tok = sample_token(work.data(), vocab, gp.temperature, gp.top_p, rng, allow, &local_lp);
+    if (lp)
+        *lp = local_lp;
+    if (gp.logprobs > 0 && token_lps && top_lps) {
+        token_lps->push_back(local_lp);
+        std::vector<GenLogprob> row(static_cast<size_t>(gp.logprobs));
+        int n = 0;
+        top_logprobs(work.data(), vocab, gp.logprobs, row.data(), &n, allow);
+        row.resize(static_cast<size_t>(std::max(n, 0)));
+        top_lps->push_back(std::move(row));
+    }
+    return tok;
+}
+
 } // namespace
 
 class Glm53Engine final : public FamilyEngine {
 public:
     Family family() const override { return Family::Glm53; }
     const ModelConfig &config() const override { return cfg_; }
+
+    struct Glm53Slot {
+        std::vector<int> history;
+        std::vector<std::vector<float>> S, winq, wink, winv, mla_cache, dsa_ikeys, dsa_igates;
+        std::vector<float> streams;
+        std::vector<float> vis;
+        int nvis = 0;
+        int vis_i = 0;
+        int vod = 0;
+        int image_tok = -1;
+        int pos = 0;
+        bool have = false;
+        bool live = false;
+        GenParams gp;
+        uint64_t rng = 1;
+        int emitted = 0;
+        Gbnf g;
+        std::vector<uint8_t> allow;
+        std::string decoded;
+        std::vector<float> token_lps;
+        std::vector<std::vector<GenLogprob>> top_lps;
+    };
 
     Status load(const std::string &model_dir, const RuntimeConfig &rt, std::string &err) override {
         rt_ = rt;
@@ -77,8 +130,6 @@ public:
             err = "not a GLM-5.3 config";
             return Status::Unsupported;
         }
-        if (cfg_.moe.swiglu_limit <= 0.f)
-            cfg_.moe.swiglu_limit = 7.f;
         alloc_synthetic();
         const int64_t ebytes = expert_bytes();
         const int64_t cap = static_cast<int64_t>(rt_.expert_gb * 1024.0 * 1024.0 * 1024.0);
@@ -110,246 +161,94 @@ public:
             err = "empty prompt";
             return Status::InvalidArgument;
         }
-        const int H = cfg_.hidden;
-        const int L = cfg_.n_layers;
-        const int M = cfg_.mhc.mult > 0 ? cfg_.mhc.mult : 1;
-        std::vector<float> streams(static_cast<size_t>(M) * H, 0.f);
-        float *h = streams.data();
-        const int kd = std::max(cfg_.kda.head_dim, 1);
-        const int kh = std::max(cfg_.kda.heads, 1);
-        std::vector<std::vector<float>> S(L);
-        const int P = kh * kd;
-        const int Kc = cfg_.kda.conv_k > 0 ? cfg_.kda.conv_k : 4;
-        std::vector<std::vector<float>> winq(L), wink(L), winv(L);
-        const int kvL = std::max(cfg_.mla.kv_lora, 0);
-        const int kvStride = kvL + std::max(cfg_.mla.qk_rope, 0);
-        int Tmax = std::max(rt_.max_seq, static_cast<int>(prompt.size()) + gp.max_new_tokens);
+        const int cslot = gp.cache_slot;
+        const bool use_slot = cslot >= 0 && cslot < kMaxKvSlots;
+        Glm53Slot local;
+        Glm53Slot *work = use_slot ? &slots_[cslot] : &local;
+        int Tmax = std::max(rt_.max_seq, static_cast<int>(prompt.size()) + gp.max_new_tokens + 256);
         if (Tmax <= 0)
             Tmax = 4096;
-        std::vector<std::vector<float>> mla_cache(L);
-        for (int l = 0; l < L; ++l) {
-            S[l].assign(static_cast<size_t>(kh) * kd * kd, 0.f);
-            winq[l].assign(static_cast<size_t>(P) * Kc, 0.f);
-            wink[l].assign(static_cast<size_t>(P) * Kc, 0.f);
-            winv[l].assign(static_cast<size_t>(P) * Kc, 0.f);
-            if (kvStride > 0)
-                mla_cache[l].assign(static_cast<size_t>(Tmax) * kvStride, 0.f);
-            if (cfg_.dsa.topk > 0 && cfg_.dsa.head_dim > 0) {
-                dsa_ikeys_[l].assign(static_cast<size_t>(Tmax) * cfg_.dsa.head_dim, 0.f);
-                dsa_igates_[l].assign(static_cast<size_t>(Tmax) * cfg_.dsa.head_dim, 0.f);
+
+        std::vector<int> ids = prompt;
+        int vis_keep = -1;
+        int reuse = 0;
+        if (use_slot && gp.prefix_reuse > 0) {
+            Glm53Slot &sl = slots_[cslot];
+            const int match = sl.have ? kv_common_prefix(sl.history, prompt) : 0;
+            const int want = std::min(gp.prefix_reuse, match);
+            if (sl.have && sl.pos > 0 && sl.pos <= want &&
+                sl.pos <= static_cast<int>(prompt.size())) {
+                reuse = sl.pos;
+                vis_keep = sl.vis_i;
+                slot_ensure_t(sl, Tmax);
             }
         }
-        int pos = 0;
-
-        std::vector<float> vis;
-        int nvis = 0;
-        int vis_i = 0;
-        const int vod = !vit_proj_.empty() ? vit_proj_.O : H;
-        if (gp.image_rgb && gp.image_w > 0 && gp.image_h > 0 && gp.image_token >= 0 &&
-            (!vit_patch_.empty() || cfg_.vision.layers > 0 || cfg_.vision.hidden > 0)) {
-            const int cap = 64;
-            vis.assign(static_cast<size_t>(cap) * std::max(vod, 1), 0.f);
-            nvis = glm_vit_embed(gp.image_rgb, gp.image_w, gp.image_h, cfg_.vision,
-                                 vit_patch_.empty() ? nullptr : &vit_patch_,
-                                 vit_proj_.empty() ? nullptr : &vit_proj_, vis.data(), cap);
-        }
-
-        auto embed_tok = [&](int id) {
-            int tid = id;
-            if (tid < 0 || tid >= cfg_.vocab)
-                tid = 0;
-            if (nvis > 0 && id == gp.image_token) {
-                const float *src = vis.data() + static_cast<size_t>(vis_i % nvis) * vod;
-                std::memcpy(h, src, static_cast<size_t>(std::min(H, vod)) * sizeof(float));
-                if (H > vod)
-                    std::memset(h + vod, 0, static_cast<size_t>(H - vod) * sizeof(float));
-                ++vis_i;
-            } else {
-                std::memcpy(h, embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
-            }
-            for (int m = 1; m < M; ++m)
-                std::memset(streams.data() + static_cast<size_t>(m) * H, 0, H * sizeof(float));
-        };
-
-        auto mhc_layer = [&](float *st, int l) {
-            if (M > 1 && !mhc_alpha_[l].empty())
-                mhc_mix(st, H, M, mhc_alpha_[l].data(), cfg_.mhc.iters, cfg_.mhc.eps);
-        };
-
-        auto attn_one = [&](float *hh, int at, int l) {
-            std::vector<float> n(H), y(H, 0.f);
-            quant::rmsnorm(hh, in_n_[l].data(), n.data(), H, cfg_.rms_eps);
-            bool full = (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
-            if (!full && cfg_.kda.heads > 0) {
-                kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l],
-                         &wfb_[l], wdt_[l].data(), static_cast<int>(wdt_[l].size()),
-                         alog_[l].data(), &wg_[l],
-                         (l < static_cast<int>(wgb_.size()) && !wgb_[l].empty()) ? &wgb_[l]
-                                                                                : nullptr,
-                         &wo_[l], on_[l].empty() ? nullptr : on_[l].data(),
-                         S[l].data(), y.data(), cfg_.rms_eps,
-                         l < static_cast<int>(conv_q_.size()) && !conv_q_[l].empty()
-                             ? conv_q_[l].data()
-                             : nullptr,
-                         l < static_cast<int>(conv_k_.size()) && !conv_k_[l].empty()
-                             ? conv_k_[l].data()
-                             : nullptr,
-                         l < static_cast<int>(conv_v_.size()) && !conv_v_[l].empty()
-                             ? conv_v_[l].data()
-                             : nullptr,
-                         winq[l].data(), wink[l].data(), winv[l].data());
-            } else {
-                const int *sel = nullptr;
-                int nsel = 0;
-                std::vector<int> selbuf;
-                if (dsa_live(l) && at >= 0) {
-                    std::vector<float> qn(std::max(cfg_.mla.q_lora, 1));
-                    if (!mla_qa_[l].empty()) {
-                        mla_qa_[l].gemm(qn.data(), n.data(), 1);
-                        if (!mla_qa_ln_[l].empty())
-                            quant::rmsnorm(qn.data(), mla_qa_ln_[l].data(), qn.data(),
-                                           cfg_.mla.q_lora, cfg_.rms_eps);
-                    }
-                    const int ID = std::max(cfg_.dsa.head_dim, 1);
-                    const int IH = std::max(cfg_.dsa.n_heads, 1);
-                    std::vector<float> iq(static_cast<size_t>(IH) * ID, 0.f), hw(IH, 0.f);
-                    if (!dsa_wq_[l].empty())
-                        dsa_wq_[l].gemm(iq.data(), qn.data(), 1);
-                    if (!dsa_wk_[l].empty() && !dsa_ikeys_[l].empty()) {
-                        std::vector<float> kraw(ID, 0.f);
-                        dsa_wk_[l].gemm(kraw.data(), n.data(), 1);
-                        layernorm(kraw.data(),
-                                  dsa_knw_[l].empty() ? nullptr : dsa_knw_[l].data(),
-                                  dsa_knb_[l].empty() ? nullptr : dsa_knb_[l].data(),
-                                  dsa_ikeys_[l].data() + static_cast<size_t>(at) * ID, ID, 1e-5f);
-                    }
-                    if (!dsa_kg_[l].empty() && !dsa_igates_[l].empty())
-                        dsa_kg_[l].gemm(dsa_igates_[l].data() + static_cast<size_t>(at) * ID,
-                                        n.data(), 1);
-                    if (!dsa_wp_[l].empty()) {
-                        dsa_wp_[l].gemm(hw.data(), n.data(), 1);
-                        float s = 1.f / std::sqrt(static_cast<float>(IH));
-                        for (int i = 0; i < IH; ++i)
-                            hw[i] *= s;
-                    }
-                    nsel = dsa_index_width(cfg_.dsa);
-                    selbuf.assign(static_cast<size_t>(std::max(nsel, 1)), -1);
-                    dsa_select(selbuf.data(), iq.data(), dsa_ikeys_[l].data(),
-                               dsa_igates_[l].empty() ? nullptr : dsa_igates_[l].data(), hw.data(),
-                               dsa_ape_[l].empty() ? nullptr : dsa_ape_[l].data(), at + 1,
-                               cfg_.dsa);
-                    sel = selbuf.data();
-                }
-                mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],
-                         mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
-                         &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
-                         &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
-                         mla_cache[l].empty() ? nullptr : mla_cache[l].data(), at, y.data(),
-                         cfg_.rms_eps, sel, nsel);
-            }
-            for (int i = 0; i < H; ++i)
-                hh[i] += y[i];
-        };
-
-        auto ffn_one = [&](float *hh, int l) -> Status {
-            std::vector<float> n(H);
-            quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
-            if (l < cfg_.first_dense) {
-                dense_mlp(l, n.data(), hh);
-                return Status::Ok;
-            }
-            return moe_layer(l, n.data(), hh, err);
-        };
-
-        auto step = [&](int token) -> Status {
-            embed_tok(token);
-            for (int l = 0; l < L; ++l) {
-                mhc_layer(streams.data(), l);
-                attn_one(h, pos, l);
-                Status st = ffn_one(h, l);
-                if (st != Status::Ok)
-                    return st;
-                mhc_layer(streams.data(), l);
-            }
-            ++pos;
-            return Status::Ok;
-        };
-
-        const int chunk = rt_.prefill_chunk > 0 ? rt_.prefill_chunk : static_cast<int>(prompt.size());
-        for (size_t i = 0; i < prompt.size();) {
-            const int C = static_cast<int>(
-                std::min(static_cast<size_t>(chunk), prompt.size() - i));
-            std::vector<float> act(static_cast<size_t>(C) * M * H, 0.f);
-            for (int c = 0; c < C; ++c) {
-                int tid = prompt[i + static_cast<size_t>(c)];
-                const int raw = tid;
-                if (tid < 0 || tid >= cfg_.vocab)
-                    tid = 0;
-                float *dst = act.data() + static_cast<size_t>(c) * M * H;
-                if (nvis > 0 && raw == gp.image_token) {
-                    const float *src = vis.data() + static_cast<size_t>(vis_i % nvis) * vod;
-                    std::memcpy(dst, src, static_cast<size_t>(std::min(H, vod)) * sizeof(float));
-                    if (H > vod)
-                        std::memset(dst + vod, 0, static_cast<size_t>(H - vod) * sizeof(float));
-                    ++vis_i;
-                } else {
-                    std::memcpy(dst, embed_.data() + static_cast<size_t>(tid) * H,
-                                H * sizeof(float));
-                }
-            }
-            for (int l = 0; l < L; ++l) {
-                for (int c = 0; c < C; ++c) {
-                    float *st = act.data() + static_cast<size_t>(c) * M * H;
-                    mhc_layer(st, l);
-                    attn_one(st, pos + c, l);
-                }
-                if (l < cfg_.first_dense) {
-                    for (int c = 0; c < C; ++c) {
-                        float *hh = act.data() + static_cast<size_t>(c) * M * H;
-                        std::vector<float> n(H);
-                        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
-                        dense_mlp(l, n.data(), hh);
-                    }
-                } else {
-                    std::vector<float> norms(static_cast<size_t>(C) * H), s0(static_cast<size_t>(C) * H);
-                    for (int c = 0; c < C; ++c) {
-                        float *hh = act.data() + static_cast<size_t>(c) * M * H;
-                        std::memcpy(s0.data() + static_cast<size_t>(c) * H, hh, H * sizeof(float));
-                        quant::rmsnorm(hh, out_n_[l].data(),
-                                       norms.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
-                    }
-                    Status st = moe_layer_n(l, norms.data(), s0.data(), C, err);
-                    if (st != Status::Ok)
-                        return st;
-                    for (int c = 0; c < C; ++c)
-                        std::memcpy(act.data() + static_cast<size_t>(c) * M * H,
-                                    s0.data() + static_cast<size_t>(c) * H, H * sizeof(float));
-                }
-                for (int c = 0; c < C; ++c)
-                    mhc_layer(act.data() + static_cast<size_t>(c) * M * H, l);
-            }
-            std::memcpy(streams.data(), act.data() + static_cast<size_t>(C - 1) * M * H,
-                        static_cast<size_t>(M) * H * sizeof(float));
-            pos += C;
-            i += static_cast<size_t>(C);
-        }
+        if (reuse == 0)
+            slot_alloc(*work, Tmax);
+        slot_prep_vision(*work, gp);
+        if (vis_keep >= 0)
+            work->vis_i = vis_keep;
+        expand_image_ids(*work, ids);
+        if (reuse > 0 && reuse > static_cast<int>(ids.size()))
+            reuse = 0;
+        Status pst = slot_prefill(*work, ids, reuse, err);
+        if (pst != Status::Ok)
+            return pst;
 
         out.tokens.clear();
+        out.token_logprobs.clear();
+        out.top_logprobs.clear();
         out.prompt_tokens = static_cast<int>(prompt.size());
         uint64_t rng = gp.seed ? gp.seed : 1ull;
+        std::vector<uint8_t> allow;
+        Gbnf g;
+        if (!gp.grammar.empty()) {
+            std::string e;
+            if (g.compile(gp.grammar, e) == Status::Ok && g.ready() && gp.token_text) {
+                allow.assign(cfg_.vocab, 0);
+                g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+            }
+        }
+        std::string decoded;
+        work->history = prompt;
+        work->token_lps.clear();
+        work->top_lps.clear();
         for (int ntok = 0; ntok < gp.max_new_tokens; ++ntok) {
-            std::vector<float> n(H), logits(cfg_.vocab);
-            quant::rmsnorm(h, norm_.data(), n.data(), H, cfg_.rms_eps);
-            lm_head_.gemm(logits.data(), n.data(), 1);
-            int next = sample_token(logits.data(), cfg_.vocab, gp.temperature, gp.top_p, &rng);
+            int next = slot_sample(*work, gp, &rng, allow.empty() ? nullptr : allow.data());
             out.tokens.push_back(next);
-            if (is_stop_token(next, cfg_, gp.eos))
+            work->history.push_back(next);
+            if (g.ready() && gp.token_text)
+                g.accept_bytes(gp.token_text(next));
+            if (gp.on_token)
+                gp.on_token(next);
+            bool stop = is_stop_token(next, cfg_, gp.eos);
+            if (!stop && gp.token_text) {
+                decoded += gp.token_text(next);
+                if (stop_cut(decoded, gp.stop) != std::string::npos) {
+                    stop = true;
+                    out.stopped_by_stop = true;
+                }
+            }
+            if (stop)
                 break;
-            Status st = step(next);
+            Status st = slot_step(*work, next, err);
             if (st != Status::Ok)
                 return st;
+            if (g.ready() && gp.token_text) {
+                allow.assign(cfg_.vocab, 0);
+                g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+            }
         }
         out.completion_tokens = static_cast<int>(out.tokens.size());
+        out.token_logprobs = work->token_lps;
+        out.top_logprobs = work->top_lps;
+        if (use_slot) {
+            Glm53Slot &sl = slots_[cslot];
+            sl.history = prompt;
+            sl.history.insert(sl.history.end(), out.tokens.begin(), out.tokens.end());
+            sl.have = true;
+            sl.live = false;
+        }
         return Status::Ok;
     }
 
@@ -375,7 +274,724 @@ public:
 
     void expert_stats(ExpertStoreStats &out) const override { store_.stats(out); }
 
+    Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
+                          std::string &err) override {
+        if (!loaded_) {
+            err = "glm53 not loaded";
+            return Status::InvalidArgument;
+        }
+        if (slot < 0 || slot >= kMaxKvSlots) {
+            err = "bad cache slot";
+            return Status::InvalidArgument;
+        }
+        if (ids.empty()) {
+            err = "empty prompt";
+            return Status::InvalidArgument;
+        }
+        Glm53Slot &st = slots_[slot];
+        const int match = st.have ? kv_common_prefix(st.history, ids) : 0;
+        const int want = std::min(std::max(gp.prefix_reuse, 0), match);
+        int applied = 0;
+        int Tmax = std::max(rt_.max_seq, static_cast<int>(ids.size()) + gp.max_new_tokens + 256);
+        if (Tmax <= 0)
+            Tmax = 4096;
+        int vis_keep = -1;
+        if (st.have && st.pos > 0 && st.pos <= want && st.pos <= static_cast<int>(ids.size())) {
+            applied = st.pos;
+            vis_keep = st.vis_i;
+            slot_ensure_t(st, Tmax);
+        } else {
+            slot_alloc(st, Tmax);
+        }
+        slot_prep_vision(st, gp);
+        if (vis_keep >= 0)
+            st.vis_i = vis_keep;
+        std::vector<int> fed = ids;
+        expand_image_ids(st, fed);
+        Status pst = slot_prefill(st, fed, applied, err);
+        if (pst != Status::Ok)
+            return pst;
+        st.history = ids;
+        st.live = true;
+        st.have = true;
+        st.gp = gp;
+        st.rng = gp.seed ? gp.seed : 1ull;
+        st.emitted = 0;
+        st.allow.clear();
+        st.decoded.clear();
+        st.token_lps.clear();
+        st.top_lps.clear();
+        st.g = Gbnf{};
+        if (!gp.grammar.empty()) {
+            std::string e;
+            if (st.g.compile(gp.grammar, e) == Status::Ok && st.g.ready() && gp.token_text) {
+                st.allow.assign(cfg_.vocab, 0);
+                st.g.allow_mask(gp.token_text, st.allow.data(), cfg_.vocab);
+            }
+        }
+        reuse = applied;
+        return Status::Ok;
+    }
+
+    Status next_token(int slot, int &token, bool &done, std::string &err) override {
+        if (slot < 0 || slot >= kMaxKvSlots) {
+            err = "bad cache slot";
+            return Status::InvalidArgument;
+        }
+        Glm53Slot &st = slots_[slot];
+        if (!st.live) {
+            err = "no live generate";
+            return Status::InvalidArgument;
+        }
+        done = false;
+        if (st.gp.max_new_tokens <= 0 || st.emitted >= st.gp.max_new_tokens) {
+            done = true;
+            token = -1;
+            return Status::Ok;
+        }
+        const uint8_t *allow = st.allow.empty() ? nullptr : st.allow.data();
+        token = slot_sample(st, st.gp, &st.rng, allow);
+        ++st.emitted;
+        st.history.push_back(token);
+        if (st.g.ready() && st.gp.token_text)
+            st.g.accept_bytes(st.gp.token_text(token));
+        bool stop = is_stop_token(token, cfg_, st.gp.eos) || st.emitted >= st.gp.max_new_tokens;
+        if (!stop && st.gp.token_text) {
+            st.decoded += st.gp.token_text(token);
+            if (stop_cut(st.decoded, st.gp.stop) != std::string::npos)
+                stop = true;
+        }
+        if (stop) {
+            done = true;
+        } else {
+            Status sst = slot_step(st, token, err);
+            if (sst != Status::Ok)
+                return sst;
+            done = false;
+        }
+        if (st.g.ready() && st.gp.token_text) {
+            st.allow.assign(cfg_.vocab, 0);
+            st.g.allow_mask(st.gp.token_text, st.allow.data(), cfg_.vocab);
+        }
+        return Status::Ok;
+    }
+
+    Status next_tokens(const int *slots, int n, int *tokens, uint8_t *done,
+                       std::string &err) override {
+        if (n < 1)
+            return Status::Ok;
+        if (!slots || !tokens || !done) {
+            err = "next_tokens bad args";
+            return Status::InvalidArgument;
+        }
+        if (n == 1) {
+            bool d = false;
+            Status st = next_token(slots[0], tokens[0], d, err);
+            done[0] = d ? 1 : 0;
+            return st;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (slots[i] < 0 || slots[i] >= kMaxKvSlots) {
+                err = "bad cache slot";
+                return Status::InvalidArgument;
+            }
+            if (!slots_[slots[i]].live) {
+                err = "no live generate";
+                return Status::InvalidArgument;
+            }
+        }
+        std::vector<Glm53Slot *> step_s;
+        std::vector<int> step_tok;
+        step_s.reserve(static_cast<size_t>(n));
+        step_tok.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            Glm53Slot &st = slots_[slots[i]];
+            done[i] = 0;
+            if (st.gp.max_new_tokens <= 0 || st.emitted >= st.gp.max_new_tokens) {
+                done[i] = 1;
+                tokens[i] = -1;
+                continue;
+            }
+            const uint8_t *allow = st.allow.empty() ? nullptr : st.allow.data();
+            tokens[i] = slot_sample(st, st.gp, &st.rng, allow);
+            ++st.emitted;
+            st.history.push_back(tokens[i]);
+            if (st.g.ready() && st.gp.token_text)
+                st.g.accept_bytes(st.gp.token_text(tokens[i]));
+            bool stop = is_stop_token(tokens[i], cfg_, st.gp.eos) ||
+                        st.emitted >= st.gp.max_new_tokens;
+            if (!stop && st.gp.token_text) {
+                st.decoded += st.gp.token_text(tokens[i]);
+                if (stop_cut(st.decoded, st.gp.stop) != std::string::npos)
+                    stop = true;
+            }
+            if (stop)
+                done[i] = 1;
+            else {
+                step_s.push_back(&st);
+                step_tok.push_back(tokens[i]);
+            }
+            if (st.g.ready() && st.gp.token_text) {
+                st.allow.assign(cfg_.vocab, 0);
+                st.g.allow_mask(st.gp.token_text, st.allow.data(), cfg_.vocab);
+            }
+        }
+        if (!step_s.empty()) {
+            Status sst = slot_step_n(step_s.data(), step_tok.data(),
+                                     static_cast<int>(step_s.size()), err);
+            if (sst != Status::Ok)
+                return sst;
+        }
+        return Status::Ok;
+    }
+
+    void end_generate(int slot) override {
+        if (slot < 0 || slot >= kMaxKvSlots)
+            return;
+        slots_[slot].live = false;
+    }
+
 private:
+    int mhc_mult() const { return cfg_.mhc.mult > 0 ? cfg_.mhc.mult : 1; }
+
+    int kv_stride() const {
+        return std::max(cfg_.mla.kv_lora, 0) + std::max(cfg_.mla.qk_rope, 0);
+    }
+
+    bool official_hc(int l, bool ffn) const {
+        const int M = mhc_mult();
+        const auto &fn = ffn ? hc_ffn_fn_ : hc_attn_fn_;
+        const auto &base = ffn ? hc_ffn_base_ : hc_attn_base_;
+        const auto &sc = ffn ? hc_ffn_scale_ : hc_attn_scale_;
+        return M > 1 && l >= 0 && l < static_cast<int>(fn.size()) && !fn[l].empty() &&
+               !base[l].empty() && sc[l].size() >= 3;
+    }
+
+    void apply_mhc(float *st, int l) const {
+        const int M = mhc_mult();
+        const int H = cfg_.hidden;
+        if (M > 1 && l >= 0 && l < static_cast<int>(mhc_alpha_.size()) && !mhc_alpha_[l].empty())
+            mhc_mix(st, H, M, mhc_alpha_[l].data(), cfg_.mhc.iters, cfg_.mhc.eps);
+    }
+
+    void hc_enter(float *st, int l, bool ffn, float *collapsed, float *post, float *comb) const {
+        const int M = mhc_mult();
+        const int H = cfg_.hidden;
+        const auto &fn = ffn ? hc_ffn_fn_[l] : hc_attn_fn_[l];
+        const auto &base = ffn ? hc_ffn_base_[l] : hc_attn_base_[l];
+        const auto &sc = ffn ? hc_ffn_scale_[l] : hc_attn_scale_[l];
+        mhc_pre(collapsed, post, comb, st, fn.data(), sc.data(), base.data(), M, H, cfg_.mhc.iters,
+                cfg_.rms_eps, cfg_.mhc.eps);
+    }
+
+    void slot_prep_vision(Glm53Slot &s, const GenParams &gp) {
+        const int H = cfg_.hidden;
+        s.vod = !vit_proj_.empty() ? vit_proj_.O : H;
+        s.nvis = 0;
+        s.vis_i = 0;
+        s.vis.clear();
+        s.image_tok = gp.image_token >= 0 ? gp.image_token : cfg_.vision.image_token;
+        if (gp.image_rgb && gp.image_w > 0 && gp.image_h > 0 && gp.image_token >= 0 &&
+            (!vit_patch_.empty() || cfg_.vision.layers > 0 || cfg_.vision.hidden > 0)) {
+            const int cap = 64;
+            s.vis.assign(static_cast<size_t>(cap) * std::max(s.vod, 1), 0.f);
+            s.nvis = glm_vit_embed(gp.image_rgb, gp.image_w, gp.image_h, cfg_.vision,
+                                   vit_patch_.empty() ? nullptr : &vit_patch_,
+                                   vit_proj_.empty() ? nullptr : &vit_proj_, s.vis.data(), cap,
+                                   vit_.ready() ? &vit_ : nullptr);
+        }
+    }
+
+    void expand_image_ids(const Glm53Slot &s, std::vector<int> &ids) const {
+        if (s.nvis > 1 && s.image_tok >= 0) {
+            std::vector<int> exp;
+            exp.reserve(ids.size() + static_cast<size_t>(s.nvis));
+            for (int id : ids) {
+                if (id == s.image_tok)
+                    for (int k = 0; k < s.nvis; ++k)
+                        exp.push_back(id);
+                else
+                    exp.push_back(id);
+            }
+            ids.swap(exp);
+        }
+    }
+
+    void slot_embed(Glm53Slot &s, int id) {
+        const int H = cfg_.hidden;
+        const int M = mhc_mult();
+        if (static_cast<int>(s.streams.size()) < M * H)
+            s.streams.assign(static_cast<size_t>(M) * H, 0.f);
+        float *h = s.streams.data();
+        int tid = id;
+        if (tid < 0 || tid >= cfg_.vocab)
+            tid = 0;
+        if (s.nvis > 0 && id == s.image_tok) {
+            const float *src = s.vis.data() + static_cast<size_t>(s.vis_i % s.nvis) * s.vod;
+            std::memcpy(h, src, static_cast<size_t>(std::min(H, s.vod)) * sizeof(float));
+            if (H > s.vod)
+                std::memset(h + s.vod, 0, static_cast<size_t>(H - s.vod) * sizeof(float));
+            ++s.vis_i;
+        } else {
+            std::memcpy(h, embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
+        }
+        const bool rep = official_hc(0, false);
+        for (int m = 1; m < M; ++m) {
+            if (rep)
+                std::memcpy(s.streams.data() + static_cast<size_t>(m) * H, h,
+                            static_cast<size_t>(H) * sizeof(float));
+            else
+                std::memset(s.streams.data() + static_cast<size_t>(m) * H, 0,
+                            static_cast<size_t>(H) * sizeof(float));
+        }
+    }
+
+    void attn_one(Glm53Slot &s, float *hh, int at, int l, float *branch) {
+        const int H = cfg_.hidden;
+        std::vector<float> n(static_cast<size_t>(H)), y(static_cast<size_t>(H), 0.f);
+        quant::rmsnorm(hh, in_n_[l].data(), n.data(), H, cfg_.rms_eps);
+        bool full = (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
+        if (!full && cfg_.kda.heads > 0) {
+            kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l], &wfb_[l],
+                     wdt_[l].data(), static_cast<int>(wdt_[l].size()), alog_[l].data(), &wg_[l],
+                     (l < static_cast<int>(wgb_.size()) && !wgb_[l].empty()) ? &wgb_[l] : nullptr,
+                     &wo_[l], on_[l].empty() ? nullptr : on_[l].data(), s.S[l].data(), y.data(),
+                     cfg_.rms_eps,
+                     l < static_cast<int>(conv_q_.size()) && !conv_q_[l].empty() ? conv_q_[l].data()
+                                                                                : nullptr,
+                     l < static_cast<int>(conv_k_.size()) && !conv_k_[l].empty() ? conv_k_[l].data()
+                                                                                : nullptr,
+                     l < static_cast<int>(conv_v_.size()) && !conv_v_[l].empty() ? conv_v_[l].data()
+                                                                                : nullptr,
+                     s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
+        } else {
+            const int *sel = nullptr;
+            int nsel = 0;
+            std::vector<int> selbuf;
+            if (dsa_live(l) && at >= 0) {
+                std::vector<float> qn(static_cast<size_t>(std::max(cfg_.mla.q_lora, 1)));
+                if (!mla_qa_[l].empty()) {
+                    mla_qa_[l].gemm(qn.data(), n.data(), 1);
+                    if (!mla_qa_ln_[l].empty())
+                        quant::rmsnorm(qn.data(), mla_qa_ln_[l].data(), qn.data(), cfg_.mla.q_lora,
+                                       cfg_.rms_eps);
+                }
+                const int ID = std::max(cfg_.dsa.head_dim, 1);
+                const int IH = std::max(cfg_.dsa.n_heads, 1);
+                std::vector<float> iq(static_cast<size_t>(IH) * ID, 0.f), hw(static_cast<size_t>(IH),
+                                                                            0.f);
+                if (!dsa_wq_[l].empty())
+                    dsa_wq_[l].gemm(iq.data(), qn.data(), 1);
+                std::vector<float> &ikeys =
+                    (l < static_cast<int>(s.dsa_ikeys.size()) && !s.dsa_ikeys[l].empty())
+                        ? s.dsa_ikeys[l]
+                        : dsa_ikeys_[l];
+                std::vector<float> &igates =
+                    (l < static_cast<int>(s.dsa_igates.size()) && !s.dsa_igates[l].empty())
+                        ? s.dsa_igates[l]
+                        : dsa_igates_[l];
+                if (!dsa_wk_[l].empty() && !ikeys.empty()) {
+                    std::vector<float> kraw(static_cast<size_t>(ID), 0.f);
+                    dsa_wk_[l].gemm(kraw.data(), n.data(), 1);
+                    layernorm(kraw.data(), dsa_knw_[l].empty() ? nullptr : dsa_knw_[l].data(),
+                              dsa_knb_[l].empty() ? nullptr : dsa_knb_[l].data(),
+                              ikeys.data() + static_cast<size_t>(at) * ID, ID, 1e-5f);
+                }
+                if (!dsa_kg_[l].empty() && !igates.empty())
+                    dsa_kg_[l].gemm(igates.data() + static_cast<size_t>(at) * ID, n.data(), 1);
+                if (!dsa_wp_[l].empty()) {
+                    dsa_wp_[l].gemm(hw.data(), n.data(), 1);
+                    float sc = 1.f / std::sqrt(static_cast<float>(IH));
+                    for (int i = 0; i < IH; ++i)
+                        hw[static_cast<size_t>(i)] *= sc;
+                }
+                nsel = dsa_index_width(cfg_.dsa);
+                selbuf.assign(static_cast<size_t>(std::max(nsel, 1)), -1);
+                dsa_select(selbuf.data(), iq.data(), ikeys.empty() ? nullptr : ikeys.data(),
+                           igates.empty() ? nullptr : igates.data(), hw.data(),
+                           dsa_ape_[l].empty() ? nullptr : dsa_ape_[l].data(), at + 1, cfg_.dsa);
+                sel = selbuf.data();
+            }
+            mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],
+                     mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
+                     &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
+                     &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
+                     s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at, y.data(),
+                     cfg_.rms_eps, sel, nsel);
+        }
+        if (branch)
+            std::memcpy(branch, y.data(), static_cast<size_t>(H) * sizeof(float));
+        else {
+            for (int i = 0; i < H; ++i)
+                hh[i] += y[i];
+        }
+    }
+
+    Status ffn_one(float *hh, int l, std::string &err) {
+        const int H = cfg_.hidden;
+        std::vector<float> n(static_cast<size_t>(H));
+        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+        if (l < cfg_.first_dense) {
+            dense_mlp(l, n.data(), hh);
+            return Status::Ok;
+        }
+        return moe_layer(l, n.data(), hh, err);
+    }
+
+    void slot_alloc(Glm53Slot &s, int t_max) {
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        const int M = mhc_mult();
+        const int kd = std::max(cfg_.kda.head_dim, 1);
+        const int kh = std::max(cfg_.kda.heads, 1);
+        const int P = kh * kd;
+        const int Kc = cfg_.kda.conv_k > 0 ? cfg_.kda.conv_k : 4;
+        const int kvStride = kv_stride();
+        const int tcap = std::max(t_max, 1);
+        s.streams.assign(static_cast<size_t>(M) * H, 0.f);
+        s.S.assign(static_cast<size_t>(L), {});
+        s.winq.assign(static_cast<size_t>(L), {});
+        s.wink.assign(static_cast<size_t>(L), {});
+        s.winv.assign(static_cast<size_t>(L), {});
+        s.mla_cache.assign(static_cast<size_t>(L), {});
+        s.dsa_ikeys.assign(static_cast<size_t>(L), {});
+        s.dsa_igates.assign(static_cast<size_t>(L), {});
+        for (int l = 0; l < L; ++l) {
+            s.S[l].assign(static_cast<size_t>(kh) * kd * kd, 0.f);
+            s.winq[l].assign(static_cast<size_t>(P) * Kc, 0.f);
+            s.wink[l].assign(static_cast<size_t>(P) * Kc, 0.f);
+            s.winv[l].assign(static_cast<size_t>(P) * Kc, 0.f);
+            if (kvStride > 0)
+                s.mla_cache[l].assign(static_cast<size_t>(tcap) * kvStride, 0.f);
+            if (cfg_.dsa.topk > 0 && cfg_.dsa.head_dim > 0) {
+                s.dsa_ikeys[l].assign(static_cast<size_t>(tcap) * cfg_.dsa.head_dim, 0.f);
+                s.dsa_igates[l].assign(static_cast<size_t>(tcap) * cfg_.dsa.head_dim, 0.f);
+            }
+        }
+        s.pos = 0;
+        s.have = false;
+        s.live = false;
+        s.history.clear();
+        s.emitted = 0;
+        s.allow.clear();
+        s.decoded.clear();
+        s.token_lps.clear();
+        s.top_lps.clear();
+        s.g = Gbnf{};
+        s.nvis = 0;
+        s.vis_i = 0;
+        s.vis.clear();
+        s.vod = 0;
+        s.image_tok = -1;
+    }
+
+    void slot_ensure_t(Glm53Slot &s, int t_max) {
+        const int L = cfg_.n_layers;
+        const int kvStride = kv_stride();
+        const int tcap = std::max(t_max, 1);
+        if (static_cast<int>(s.mla_cache.size()) < L)
+            s.mla_cache.resize(static_cast<size_t>(L));
+        if (static_cast<int>(s.dsa_ikeys.size()) < L)
+            s.dsa_ikeys.resize(static_cast<size_t>(L));
+        if (static_cast<int>(s.dsa_igates.size()) < L)
+            s.dsa_igates.resize(static_cast<size_t>(L));
+        if (kvStride > 0) {
+            const size_t need = static_cast<size_t>(tcap) * kvStride;
+            for (int l = 0; l < L; ++l) {
+                if (s.mla_cache[l].size() < need)
+                    s.mla_cache[l].resize(need, 0.f);
+            }
+        }
+        if (cfg_.dsa.topk > 0 && cfg_.dsa.head_dim > 0) {
+            const size_t need = static_cast<size_t>(tcap) * cfg_.dsa.head_dim;
+            for (int l = 0; l < L; ++l) {
+                if (s.dsa_ikeys[l].size() < need)
+                    s.dsa_ikeys[l].resize(need, 0.f);
+                if (s.dsa_igates[l].size() < need)
+                    s.dsa_igates[l].resize(need, 0.f);
+            }
+        }
+    }
+
+    Status slot_step(Glm53Slot &s, int token, std::string &err) {
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        const int M = mhc_mult();
+        slot_embed(s, token);
+        float *h = s.streams.data();
+        for (int l = 0; l < L; ++l) {
+            if (official_hc(l, false)) {
+                std::vector<float> collapsed(static_cast<size_t>(H)), post(static_cast<size_t>(M)),
+                    comb(static_cast<size_t>(M) * M), branch(static_cast<size_t>(H), 0.f);
+                hc_enter(s.streams.data(), l, false, collapsed.data(), post.data(), comb.data());
+                attn_one(s, collapsed.data(), s.pos, l, branch.data());
+                mhc_post(s.streams.data(), branch.data(), s.streams.data(), post.data(),
+                         comb.data(), M, H);
+            } else {
+                apply_mhc(s.streams.data(), l);
+                attn_one(s, h, s.pos, l, nullptr);
+            }
+            if (official_hc(l, true)) {
+                std::vector<float> collapsed(static_cast<size_t>(H)), post(static_cast<size_t>(M)),
+                    comb(static_cast<size_t>(M) * M), branch(static_cast<size_t>(H), 0.f);
+                hc_enter(s.streams.data(), l, true, collapsed.data(), post.data(), comb.data());
+                std::vector<float> n(static_cast<size_t>(H));
+                quant::rmsnorm(collapsed.data(), out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                if (l < cfg_.first_dense)
+                    dense_mlp(l, n.data(), branch.data());
+                else {
+                    Status st = moe_layer(l, n.data(), branch.data(), err);
+                    if (st != Status::Ok)
+                        return st;
+                }
+                mhc_post(s.streams.data(), branch.data(), s.streams.data(), post.data(),
+                         comb.data(), M, H);
+            } else {
+                Status st = ffn_one(h, l, err);
+                if (st != Status::Ok)
+                    return st;
+                apply_mhc(s.streams.data(), l);
+            }
+        }
+        ++s.pos;
+        return Status::Ok;
+    }
+
+    Status slot_step_n(Glm53Slot **ss, const int *tokens, int S, std::string &err) {
+        if (S <= 0)
+            return Status::Ok;
+        if (S == 1)
+            return slot_step(*ss[0], tokens[0], err);
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        const int M = mhc_mult();
+        for (int c = 0; c < S; ++c)
+            slot_embed(*ss[c], tokens[c]);
+        for (int l = 0; l < L; ++l) {
+            for (int c = 0; c < S; ++c) {
+                Glm53Slot &s = *ss[c];
+                float *st = s.streams.data();
+                if (official_hc(l, false)) {
+                    std::vector<float> collapsed(static_cast<size_t>(H)),
+                        post(static_cast<size_t>(M)), comb(static_cast<size_t>(M) * M),
+                        branch(static_cast<size_t>(H), 0.f);
+                    hc_enter(st, l, false, collapsed.data(), post.data(), comb.data());
+                    attn_one(s, collapsed.data(), s.pos, l, branch.data());
+                    mhc_post(st, branch.data(), st, post.data(), comb.data(), M, H);
+                } else {
+                    apply_mhc(st, l);
+                    attn_one(s, st, s.pos, l, nullptr);
+                }
+            }
+            if (official_hc(l, true)) {
+                if (l < cfg_.first_dense) {
+                    for (int c = 0; c < S; ++c) {
+                        Glm53Slot &s = *ss[c];
+                        std::vector<float> collapsed(static_cast<size_t>(H)),
+                            post(static_cast<size_t>(M)), comb(static_cast<size_t>(M) * M),
+                            branch(static_cast<size_t>(H), 0.f);
+                        hc_enter(s.streams.data(), l, true, collapsed.data(), post.data(),
+                                 comb.data());
+                        std::vector<float> n(static_cast<size_t>(H));
+                        quant::rmsnorm(collapsed.data(), out_n_[l].data(), n.data(), H,
+                                       cfg_.rms_eps);
+                        dense_mlp(l, n.data(), branch.data());
+                        mhc_post(s.streams.data(), branch.data(), s.streams.data(), post.data(),
+                                 comb.data(), M, H);
+                    }
+                } else {
+                    std::vector<float> norms(static_cast<size_t>(S) * H),
+                        branches(static_cast<size_t>(S) * H, 0.f);
+                    std::vector<float> posts(static_cast<size_t>(S) * M),
+                        combs(static_cast<size_t>(S) * M * M);
+                    for (int c = 0; c < S; ++c) {
+                        Glm53Slot &s = *ss[c];
+                        std::vector<float> collapsed(static_cast<size_t>(H));
+                        hc_enter(s.streams.data(), l, true, collapsed.data(),
+                                 posts.data() + static_cast<size_t>(c) * M,
+                                 combs.data() + static_cast<size_t>(c) * M * M);
+                        quant::rmsnorm(collapsed.data(), out_n_[l].data(),
+                                       norms.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
+                    }
+                    Status st = moe_layer_n(l, norms.data(), branches.data(), S, err);
+                    if (st != Status::Ok)
+                        return st;
+                    for (int c = 0; c < S; ++c) {
+                        Glm53Slot &s = *ss[c];
+                        mhc_post(s.streams.data(), branches.data() + static_cast<size_t>(c) * H,
+                                 s.streams.data(), posts.data() + static_cast<size_t>(c) * M,
+                                 combs.data() + static_cast<size_t>(c) * M * M, M, H);
+                    }
+                }
+            } else if (l < cfg_.first_dense) {
+                for (int c = 0; c < S; ++c) {
+                    float *hh = ss[c]->streams.data();
+                    std::vector<float> n(static_cast<size_t>(H));
+                    quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                    dense_mlp(l, n.data(), hh);
+                }
+                for (int c = 0; c < S; ++c)
+                    apply_mhc(ss[c]->streams.data(), l);
+            } else {
+                std::vector<float> norms(static_cast<size_t>(S) * H),
+                    s0(static_cast<size_t>(S) * H);
+                for (int c = 0; c < S; ++c) {
+                    float *hh = ss[c]->streams.data();
+                    std::memcpy(s0.data() + static_cast<size_t>(c) * H, hh,
+                                static_cast<size_t>(H) * sizeof(float));
+                    quant::rmsnorm(hh, out_n_[l].data(), norms.data() + static_cast<size_t>(c) * H,
+                                   H, cfg_.rms_eps);
+                }
+                Status st = moe_layer_n(l, norms.data(), s0.data(), S, err);
+                if (st != Status::Ok)
+                    return st;
+                for (int c = 0; c < S; ++c) {
+                    std::memcpy(ss[c]->streams.data(), s0.data() + static_cast<size_t>(c) * H,
+                                static_cast<size_t>(H) * sizeof(float));
+                    apply_mhc(ss[c]->streams.data(), l);
+                }
+            }
+        }
+        for (int c = 0; c < S; ++c)
+            ++ss[c]->pos;
+        return Status::Ok;
+    }
+
+    Status slot_prefill(Glm53Slot &s, const std::vector<int> &ids, int start, std::string &err) {
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        const int M = mhc_mult();
+        if (start < 0)
+            start = 0;
+        if (start >= static_cast<int>(ids.size()))
+            return Status::Ok;
+        const int chunk = rt_.prefill_chunk > 0 ? rt_.prefill_chunk
+                                                : static_cast<int>(ids.size()) - start;
+        for (size_t i = static_cast<size_t>(start); i < ids.size();) {
+            const int C = static_cast<int>(
+                std::min(static_cast<size_t>(chunk), ids.size() - i));
+            std::vector<float> act(static_cast<size_t>(C) * M * H, 0.f);
+            for (int c = 0; c < C; ++c) {
+                int tid = ids[i + static_cast<size_t>(c)];
+                const int raw = tid;
+                if (tid < 0 || tid >= cfg_.vocab)
+                    tid = 0;
+                float *dst = act.data() + static_cast<size_t>(c) * M * H;
+                if (s.nvis > 0 && raw == s.image_tok) {
+                    const float *src =
+                        s.vis.data() + static_cast<size_t>(s.vis_i % s.nvis) * s.vod;
+                    std::memcpy(dst, src,
+                                static_cast<size_t>(std::min(H, s.vod)) * sizeof(float));
+                    if (H > s.vod)
+                        std::memset(dst + s.vod, 0,
+                                    static_cast<size_t>(H - s.vod) * sizeof(float));
+                    ++s.vis_i;
+                } else {
+                    std::memcpy(dst, embed_.data() + static_cast<size_t>(tid) * H,
+                                static_cast<size_t>(H) * sizeof(float));
+                }
+                if (official_hc(0, false)) {
+                    for (int m = 1; m < M; ++m)
+                        std::memcpy(dst + static_cast<size_t>(m) * H, dst,
+                                    static_cast<size_t>(H) * sizeof(float));
+                }
+            }
+            for (int l = 0; l < L; ++l) {
+                for (int c = 0; c < C; ++c) {
+                    float *st = act.data() + static_cast<size_t>(c) * M * H;
+                    if (official_hc(l, false)) {
+                        std::vector<float> collapsed(static_cast<size_t>(H)),
+                            post(static_cast<size_t>(M)), comb(static_cast<size_t>(M) * M),
+                            branch(static_cast<size_t>(H), 0.f);
+                        hc_enter(st, l, false, collapsed.data(), post.data(), comb.data());
+                        attn_one(s, collapsed.data(), s.pos + c, l, branch.data());
+                        mhc_post(st, branch.data(), st, post.data(), comb.data(), M, H);
+                    } else {
+                        apply_mhc(st, l);
+                        attn_one(s, st, s.pos + c, l, nullptr);
+                    }
+                }
+                if (official_hc(l, true)) {
+                    for (int c = 0; c < C; ++c) {
+                        float *st = act.data() + static_cast<size_t>(c) * M * H;
+                        std::vector<float> collapsed(static_cast<size_t>(H)),
+                            post(static_cast<size_t>(M)), comb(static_cast<size_t>(M) * M),
+                            branch(static_cast<size_t>(H), 0.f);
+                        hc_enter(st, l, true, collapsed.data(), post.data(), comb.data());
+                        std::vector<float> n(static_cast<size_t>(H));
+                        quant::rmsnorm(collapsed.data(), out_n_[l].data(), n.data(), H,
+                                       cfg_.rms_eps);
+                        if (l < cfg_.first_dense)
+                            dense_mlp(l, n.data(), branch.data());
+                        else {
+                            Status mst = moe_layer(l, n.data(), branch.data(), err);
+                            if (mst != Status::Ok)
+                                return mst;
+                        }
+                        mhc_post(st, branch.data(), st, post.data(), comb.data(), M, H);
+                    }
+                } else if (l < cfg_.first_dense) {
+                    for (int c = 0; c < C; ++c) {
+                        float *hh = act.data() + static_cast<size_t>(c) * M * H;
+                        std::vector<float> n(static_cast<size_t>(H));
+                        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                        dense_mlp(l, n.data(), hh);
+                    }
+                    for (int c = 0; c < C; ++c)
+                        apply_mhc(act.data() + static_cast<size_t>(c) * M * H, l);
+                } else {
+                    std::vector<float> norms(static_cast<size_t>(C) * H),
+                        s0(static_cast<size_t>(C) * H);
+                    for (int c = 0; c < C; ++c) {
+                        float *hh = act.data() + static_cast<size_t>(c) * M * H;
+                        std::memcpy(s0.data() + static_cast<size_t>(c) * H, hh,
+                                    static_cast<size_t>(H) * sizeof(float));
+                        quant::rmsnorm(hh, out_n_[l].data(),
+                                       norms.data() + static_cast<size_t>(c) * H, H,
+                                       cfg_.rms_eps);
+                    }
+                    Status mst = moe_layer_n(l, norms.data(), s0.data(), C, err);
+                    if (mst != Status::Ok)
+                        return mst;
+                    for (int c = 0; c < C; ++c)
+                        std::memcpy(act.data() + static_cast<size_t>(c) * M * H,
+                                    s0.data() + static_cast<size_t>(c) * H,
+                                    static_cast<size_t>(H) * sizeof(float));
+                    for (int c = 0; c < C; ++c)
+                        apply_mhc(act.data() + static_cast<size_t>(c) * M * H, l);
+                }
+            }
+            std::memcpy(s.streams.data(), act.data() + static_cast<size_t>(C - 1) * M * H,
+                        static_cast<size_t>(M) * H * sizeof(float));
+            s.pos += C;
+            i += static_cast<size_t>(C);
+        }
+        return Status::Ok;
+    }
+
+    int slot_sample(Glm53Slot &s, const GenParams &gp, uint64_t *rng, const uint8_t *allow) {
+        const int H = cfg_.hidden;
+        const int M = mhc_mult();
+        std::vector<float> n(static_cast<size_t>(H)), logits(static_cast<size_t>(cfg_.vocab)),
+            pooled(static_cast<size_t>(H));
+        const float *head_in = s.streams.data();
+        if (official_hc(0, false)) {
+            std::fill(pooled.begin(), pooled.end(), 0.f);
+            for (int m = 0; m < M; ++m)
+                for (int i = 0; i < H; ++i)
+                    pooled[static_cast<size_t>(i)] +=
+                        s.streams[static_cast<size_t>(m) * H + i];
+            for (int i = 0; i < H; ++i)
+                pooled[static_cast<size_t>(i)] /= static_cast<float>(M);
+            head_in = pooled.data();
+        }
+        quant::rmsnorm(head_in, norm_.data(), n.data(), H, cfg_.rms_eps);
+        lm_head_.gemm(logits.data(), n.data(), 1);
+        return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
+                               static_cast<int>(s.history.size()), rng, allow, nullptr,
+                               &s.token_lps, &s.top_lps);
+    }
+
     int64_t expert_bytes() const {
         return make_expert_geom(cfg_.hidden, cfg_.moe.intermediate > 0 ? cfg_.moe.intermediate : 32)
             .slot;
@@ -603,6 +1219,18 @@ private:
                         cfg_.kda.heads, err);
             overlay_f32(files, P + "layers." + std::to_string(i) + ".self_attn.o_norm.weight",
                         on_[i], cfg_.kda.head_dim, err);
+            overlay_f32(files, P + "layers." + std::to_string(i) + ".hc_attn_fn", hc_attn_fn_[i],
+                        0, err);
+            overlay_f32(files, P + "layers." + std::to_string(i) + ".hc_attn_base",
+                        hc_attn_base_[i], 0, err);
+            overlay_f32(files, P + "layers." + std::to_string(i) + ".hc_attn_scale",
+                        hc_attn_scale_[i], 0, err);
+            overlay_f32(files, P + "layers." + std::to_string(i) + ".hc_ffn_fn", hc_ffn_fn_[i], 0,
+                        err);
+            overlay_f32(files, P + "layers." + std::to_string(i) + ".hc_ffn_base", hc_ffn_base_[i],
+                        0, err);
+            overlay_f32(files, P + "layers." + std::to_string(i) + ".hc_ffn_scale",
+                        hc_ffn_scale_[i], 0, err);
             overlay_f32(files, P + "layers." + std::to_string(i) + ".self_attn.q_conv1d.weight",
                         conv_q_[i], 0, err);
             overlay_f32(files, P + "layers." + std::to_string(i) + ".self_attn.k_conv1d.weight",
@@ -663,6 +1291,48 @@ private:
             for (int n = 0; mnames[n]; ++n) {
                 if (overlay_mat(files, mnames[n], vit_proj_, bits, err) == Status::Ok)
                     break;
+            }
+            const char *V = has("model.visual.patch_embed.proj.weight") ? "model.visual."
+                            : has("model.vision.patch_embed.proj.weight") ? "model.vision."
+                                                                         : "visual.";
+            vit_.cfg = cfg_.vision;
+            if (vit_.cfg.heads <= 0)
+                vit_.cfg.heads = 1;
+            if (vit_.cfg.hidden <= 0 && !vit_patch_.empty())
+                vit_.cfg.hidden = vit_patch_.O;
+            if (vit_.cfg.out_hidden <= 0)
+                vit_.cfg.out_hidden = cfg_.hidden;
+            overlay_f32(files, std::string(V) + "patch_embed.proj.weight", vit_.patch_w, 0, err);
+            overlay_f32(files, std::string(V) + "patch_embed.proj.bias", vit_.patch_b, 0, err);
+            overlay_f32(files, std::string(V) + "post_layernorm.weight", vit_.post_norm, 0, err);
+            overlay_f32(files, std::string(V) + "downsample.weight", vit_.down_w, 0, err);
+            overlay_f32(files, std::string(V) + "downsample.bias", vit_.down_b, 0, err);
+            overlay_f32(files, std::string(V) + "merger.proj.weight", vit_.merger_proj, 0, err);
+            overlay_f32(files, std::string(V) + "merger.post_projection_norm.weight",
+                        vit_.merger_norm_w, 0, err);
+            overlay_f32(files, std::string(V) + "merger.post_projection_norm.bias",
+                        vit_.merger_norm_b, 0, err);
+            overlay_f32(files, std::string(V) + "merger.gate_proj.weight", vit_.merger_gate, 0, err);
+            overlay_f32(files, std::string(V) + "merger.up_proj.weight", vit_.merger_up, 0, err);
+            overlay_f32(files, std::string(V) + "merger.down_proj.weight", vit_.merger_down, 0, err);
+            const int depth = cfg_.vision.layers > 0 ? cfg_.vision.layers : 0;
+            vit_.blocks.resize(static_cast<size_t>(depth));
+            for (int b = 0; b < depth; ++b) {
+                const std::string B = std::string(V) + "blocks." + std::to_string(b) + ".";
+                overlay_f32(files, B + "norm1.weight", vit_.blocks[b].norm1, 0, err);
+                overlay_f32(files, B + "norm2.weight", vit_.blocks[b].norm2, 0, err);
+                overlay_f32(files, B + "attn.qkv.weight", vit_.blocks[b].qkv_w, 0, err);
+                overlay_f32(files, B + "attn.qkv.bias", vit_.blocks[b].qkv_b, 0, err);
+                overlay_f32(files, B + "attn.q_norm.weight", vit_.blocks[b].q_norm, 0, err);
+                overlay_f32(files, B + "attn.k_norm.weight", vit_.blocks[b].k_norm, 0, err);
+                overlay_f32(files, B + "attn.proj.weight", vit_.blocks[b].proj_w, 0, err);
+                overlay_f32(files, B + "attn.proj.bias", vit_.blocks[b].proj_b, 0, err);
+                overlay_f32(files, B + "mlp.gate_proj.weight", vit_.blocks[b].gate_w, 0, err);
+                overlay_f32(files, B + "mlp.gate_proj.bias", vit_.blocks[b].gate_b, 0, err);
+                overlay_f32(files, B + "mlp.up_proj.weight", vit_.blocks[b].up_w, 0, err);
+                overlay_f32(files, B + "mlp.up_proj.bias", vit_.blocks[b].up_b, 0, err);
+                overlay_f32(files, B + "mlp.down_proj.weight", vit_.blocks[b].down_w, 0, err);
+                overlay_f32(files, B + "mlp.down_proj.bias", vit_.blocks[b].down_b, 0, err);
             }
         }
         err.clear();
@@ -908,6 +1578,12 @@ private:
         shared_up_.resize(L);
         shared_down_.resize(L);
         mhc_alpha_.resize(L);
+        hc_attn_fn_.resize(L);
+        hc_attn_base_.resize(L);
+        hc_attn_scale_.resize(L);
+        hc_ffn_fn_.resize(L);
+        hc_ffn_base_.resize(L);
+        hc_ffn_scale_.resize(L);
         mla_qa_.resize(L);
         mla_qb_.resize(L);
         mla_kva_.resize(L);
@@ -987,10 +1663,12 @@ private:
     std::vector<float> embed_, norm_;
     quant::QuantMat lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wdt_, alog_, on_, router_, router_bias_,
-        mhc_alpha_, conv_q_, conv_k_, conv_v_;
+        mhc_alpha_, conv_q_, conv_k_, conv_v_, hc_attn_fn_, hc_attn_base_, hc_attn_scale_,
+        hc_ffn_fn_, hc_ffn_base_, hc_ffn_scale_;
     std::vector<quant::QuantMat> wq_, wk_, wv_, wo_, wg_, wgb_, wfa_, wfb_, wb_, mlp_gate_, mlp_up_,
         mlp_down_, shared_gate_, shared_up_, shared_down_;
     quant::QuantMat vit_patch_, vit_proj_;
+    GlmVitTower vit_;
     std::vector<quant::QuantMat> mla_qa_, mla_qb_, mla_kva_, mla_kt_, mla_v_, mla_o_, mla_g_;
     std::vector<std::vector<float>> mla_qa_ln_, mla_kva_ln_;
     std::vector<quant::QuantMat> dsa_wq_, dsa_wk_, dsa_wp_, dsa_kg_;
@@ -1002,6 +1680,7 @@ private:
                !dsa_wk_[l].empty();
     }
     std::vector<std::vector<uint8_t>> experts_;
+    Glm53Slot slots_[kMaxKvSlots];
 };
 
 std::unique_ptr<FamilyEngine> make_glm53() { return std::make_unique<Glm53Engine>(); }

@@ -3,6 +3,9 @@
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
+#include "../serve/session.hpp"
+#include "../tok/decode_post.hpp"
+#include "../tok/gbnf.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +33,8 @@ struct Dense {
     std::vector<quant::QuantMat> lat_down, lat_up;
     std::vector<std::vector<float>> lat_n;
     std::vector<quant::QuantMat> shared_gate, shared_up, shared_down;
-    std::vector<std::vector<float>> res_n, res_p;
+    std::vector<std::vector<float>> res_n, res_p, mlp_res_n, mlp_res_p, attn_sw, mlp_sw;
+    std::vector<float> out_sw;
     std::vector<quant::QuantMat> mlp_gate, mlp_up, mlp_down;
 };
 
@@ -52,6 +56,20 @@ quant::QuantMat qmat_xavier(int O, int I, uint32_t seed, int bits) {
 }
 
 void ones(std::vector<float> &w, int n) { w.assign(n, 1.f); }
+
+void fold_sw(const std::vector<float> &n, const std::vector<float> &p, std::vector<float> &sw,
+             int dim) {
+    sw.assign(static_cast<size_t>(std::max(dim, 1)), 1.f);
+    const int m = std::min(dim, static_cast<int>(std::min(n.size(), p.size())));
+    if (m > 0) {
+        for (int i = 0; i < m; ++i)
+            sw[static_cast<size_t>(i)] = n[static_cast<size_t>(i)] * p[static_cast<size_t>(i)];
+    } else if (!n.empty()) {
+        const int k = std::min(dim, static_cast<int>(n.size()));
+        for (int i = 0; i < k; ++i)
+            sw[static_cast<size_t>(i)] = n[static_cast<size_t>(i)];
+    }
+}
 
 struct K3ExpertGeom {
     int64_t w1p = 0, w1s = 0, w2p = 0, w2s = 0, slot = 0;
@@ -77,12 +95,57 @@ K3ExpertGeom make_k3_geom(int latent, int inter) {
 const char *k3_expert_mats[3] = {"w1", "w2", "w3"};
 const char *k3_expert_half[2] = {"packed", "scale"};
 
+int sample_penalized(const float *logits, int vocab, const GenParams &gp, const int *hist,
+                     int hist_n, uint64_t *rng, const uint8_t *allow, float *lp,
+                     std::vector<float> *token_lps,
+                     std::vector<std::vector<GenLogprob>> *top_lps) {
+    std::vector<float> work(static_cast<size_t>(std::max(vocab, 0)));
+    if (logits && vocab > 0)
+        std::memcpy(work.data(), logits, static_cast<size_t>(vocab) * sizeof(float));
+    apply_penalties(work.data(), vocab, hist, hist_n, gp.frequency_penalty, gp.presence_penalty);
+    apply_logit_bias(work.data(), vocab, gp.logit_bias.empty() ? nullptr : gp.logit_bias.data(),
+                     static_cast<int>(gp.logit_bias.size()));
+    apply_repetition_penalty(work.data(), vocab, hist, hist_n, gp.repetition_penalty);
+    apply_top_k(work.data(), vocab, gp.top_k);
+    apply_min_p(work.data(), vocab, gp.min_p);
+    float local_lp = 0.f;
+    int tok = sample_token(work.data(), vocab, gp.temperature, gp.top_p, rng, allow, &local_lp);
+    if (lp)
+        *lp = local_lp;
+    if (gp.logprobs > 0 && token_lps && top_lps) {
+        token_lps->push_back(local_lp);
+        std::vector<GenLogprob> row(static_cast<size_t>(gp.logprobs));
+        int n = 0;
+        top_logprobs(work.data(), vocab, gp.logprobs, row.data(), &n, allow);
+        row.resize(static_cast<size_t>(std::max(n, 0)));
+        top_lps->push_back(std::move(row));
+    }
+    return tok;
+}
+
 } // namespace
 
 class KimiK3Engine final : public FamilyEngine {
 public:
     Family family() const override { return Family::KimiK3; }
     const ModelConfig &config() const override { return cfg_; }
+
+    struct K3Slot {
+        std::vector<int> history;
+        std::vector<std::vector<float>> S, winq, wink, winv, mla_cache;
+        std::vector<float> h;
+        int pos = 0;
+        bool have = false;
+        bool live = false;
+        GenParams gp;
+        uint64_t rng = 1;
+        int emitted = 0;
+        Gbnf g;
+        std::vector<uint8_t> allow;
+        std::string acc;
+        std::vector<float> token_lps;
+        std::vector<std::vector<GenLogprob>> top_lps;
+    };
 
     Status load(const std::string &model_dir, const RuntimeConfig &rt, std::string &err) override {
         rt_ = rt;
@@ -151,6 +214,31 @@ public:
                 mla_cache[l].assign(static_cast<size_t>(Tmax) * kvStride, 0.f);
         }
         int pos = 0;
+        int reuse = 0;
+        const int cslot = gp.cache_slot;
+        if (cslot >= 0 && cslot < kMaxKvSlots && gp.prefix_reuse > 0) {
+            K3Slot &sl = slots_[cslot];
+            const int match = sl.have ? kv_common_prefix(sl.history, prompt) : 0;
+            const int want = std::min(gp.prefix_reuse, match);
+            if (sl.have && sl.pos > 0 && sl.pos <= want &&
+                sl.pos <= static_cast<int>(prompt.size())) {
+                reuse = sl.pos;
+                S = sl.S;
+                winq = sl.winq;
+                wink = sl.wink;
+                winv = sl.winv;
+                mla_cache = sl.mla_cache;
+                h = sl.h;
+                pos = sl.pos;
+                if (kvStride > 0) {
+                    const size_t need = static_cast<size_t>(Tmax) * kvStride;
+                    for (int l = 0; l < L; ++l) {
+                        if (mla_cache[l].size() < need)
+                            mla_cache[l].resize(need, 0.f);
+                    }
+                }
+            }
+        }
 
         auto embed_tok = [&](int id) {
             int tid = id;
@@ -162,19 +250,30 @@ public:
         std::vector<int> seq = prompt;
         out.prompt_tokens = static_cast<int>(prompt.size());
 
-        auto step = [&](int token, bool snapshot_ok) -> Status {
+        auto sw_attn = [&](int l) -> const float * {
+            return (l < static_cast<int>(d_.attn_sw.size()) && !d_.attn_sw[l].empty())
+                       ? d_.attn_sw[l].data()
+                       : nullptr;
+        };
+        auto sw_mlp = [&](int l) -> const float * {
+            return (l < static_cast<int>(d_.mlp_sw.size()) && !d_.mlp_sw[l].empty())
+                       ? d_.mlp_sw[l].data()
+                       : nullptr;
+        };
+
+        auto step = [&](int token, bool) -> Status {
             embed_tok(token);
             snaps.clear();
             for (int l = 0; l < L; ++l) {
                 const bool attnres = cfg_.attn_res.block_size > 0;
+                const bool snap = attnres && (l % cfg_.attn_res.block_size) == 0;
                 if (attnres) {
                     prefix = h;
-                    if (snapshot_ok && (l % cfg_.attn_res.block_size) == 0)
+                    if (!snaps.empty())
+                        attnres_mix(snaps, prefix.data(), sw_attn(l), nullptr, h.data(), H,
+                                    cfg_.rms_eps);
+                    if (snap)
                         snaps.push_back(prefix);
-                    attnres_mix(snaps, prefix.data(),
-                                l < static_cast<int>(d_.res_n.size()) ? d_.res_n[l].data() : nullptr,
-                                l < static_cast<int>(d_.res_p.size()) ? d_.res_p[l].data() : nullptr,
-                                h.data(), H, cfg_.rms_eps);
                 }
 
                 std::vector<float> n(H), y(H, 0.f);
@@ -208,15 +307,17 @@ public:
                              mla_cache[l].empty() ? nullptr : mla_cache[l].data(), pos, y.data(),
                              cfg_.rms_eps);
                 }
-                for (int i = 0; i < H; ++i)
-                    h[i] += y[i];
                 if (attnres) {
+                    if (snap)
+                        prefix = std::vector<float>(y.begin(), y.end());
+                    else {
+                        for (int i = 0; i < H; ++i)
+                            prefix[i] += y[i];
+                    }
+                    attnres_mix(snaps, prefix.data(), sw_mlp(l), nullptr, h.data(), H, cfg_.rms_eps);
+                } else {
                     for (int i = 0; i < H; ++i)
-                        prefix[i] += y[i];
-                    attnres_mix(snaps, prefix.data(),
-                                l < static_cast<int>(d_.res_n.size()) ? d_.res_n[l].data() : nullptr,
-                                l < static_cast<int>(d_.res_p.size()) ? d_.res_p[l].data() : nullptr,
-                                h.data(), H, cfg_.rms_eps);
+                        h[i] += y[i];
                 }
 
                 quant::rmsnorm(h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
@@ -228,20 +329,23 @@ public:
                     for (int i = 0; i < cfg_.dense_intermediate; ++i)
                         g[i] = quant::situ_glu(g[i], u[i], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
                     d_.mlp_down[l].gemm(down.data(), g.data(), 1);
-                    for (int i = 0; i < H; ++i)
-                        h[i] += down[i];
                     if (attnres) {
                         for (int i = 0; i < H; ++i)
                             prefix[i] += down[i];
+                        h = prefix;
+                    } else {
+                        for (int i = 0; i < H; ++i)
+                            h[i] += down[i];
                     }
                 } else {
                     if (attnres) {
-                        std::vector<float> before = h;
-                        Status mst = moe_layer(l, n.data(), h.data(), err);
+                        std::vector<float> dest(H, 0.f);
+                        Status mst = moe_layer(l, n.data(), dest.data(), err);
                         if (mst != Status::Ok)
                             return mst;
                         for (int i = 0; i < H; ++i)
-                            prefix[i] += h[i] - before[i];
+                            prefix[i] += dest[i];
+                        h = prefix;
                     } else {
                         Status mst = moe_layer(l, n.data(), h.data(), err);
                         if (mst != Status::Ok)
@@ -250,13 +354,14 @@ public:
                 }
             }
             if (cfg_.attn_res.block_size > 0)
-                attnres_mix(snaps, prefix.data(), nullptr, nullptr, h.data(), H, cfg_.rms_eps);
+                attnres_mix(snaps, h.data(), d_.out_sw.empty() ? nullptr : d_.out_sw.data(), nullptr,
+                            h.data(), H, cfg_.rms_eps);
             ++pos;
             return Status::Ok;
         };
 
         const int chunk = rt_.prefill_chunk > 0 ? rt_.prefill_chunk : static_cast<int>(prompt.size());
-        for (size_t i = 0; i < prompt.size();) {
+        for (size_t i = static_cast<size_t>(reuse); i < prompt.size();) {
             const int C = static_cast<int>(
                 std::min(static_cast<size_t>(chunk), prompt.size() - i));
             std::vector<float> act(static_cast<size_t>(C) * H);
@@ -271,16 +376,18 @@ public:
             }
             for (int l = 0; l < L; ++l) {
                 const bool attnres = cfg_.attn_res.block_size > 0;
+                const bool snap = attnres && (l % cfg_.attn_res.block_size) == 0;
                 for (int c = 0; c < C; ++c) {
                     float *hh = act.data() + static_cast<size_t>(c) * H;
                     if (attnres) {
                         prefixes[static_cast<size_t>(c)].assign(hh, hh + H);
-                        if ((l % cfg_.attn_res.block_size) == 0)
-                            psnaps[static_cast<size_t>(c)].push_back(prefixes[static_cast<size_t>(c)]);
-                        attnres_mix(psnaps[static_cast<size_t>(c)], prefixes[static_cast<size_t>(c)].data(),
-                                    l < static_cast<int>(d_.res_n.size()) ? d_.res_n[l].data() : nullptr,
-                                    l < static_cast<int>(d_.res_p.size()) ? d_.res_p[l].data() : nullptr,
-                                    hh, H, cfg_.rms_eps);
+                        if (!psnaps[static_cast<size_t>(c)].empty())
+                            attnres_mix(psnaps[static_cast<size_t>(c)],
+                                        prefixes[static_cast<size_t>(c)].data(), sw_attn(l),
+                                        nullptr, hh, H, cfg_.rms_eps);
+                        if (snap)
+                            psnaps[static_cast<size_t>(c)].push_back(
+                                prefixes[static_cast<size_t>(c)]);
                     }
                     std::vector<float> n(H), y(H, 0.f);
                     quant::rmsnorm(hh, d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
@@ -312,15 +419,19 @@ public:
                                  mla_cache[l].empty() ? nullptr : mla_cache[l].data(), pos + c,
                                  y.data(), cfg_.rms_eps);
                     }
-                    for (int j = 0; j < H; ++j)
-                        hh[j] += y[j];
                     if (attnres) {
+                        if (snap)
+                            prefixes[static_cast<size_t>(c)] = std::vector<float>(y.begin(), y.end());
+                        else {
+                            for (int j = 0; j < H; ++j)
+                                prefixes[static_cast<size_t>(c)][j] += y[j];
+                        }
+                        attnres_mix(psnaps[static_cast<size_t>(c)],
+                                    prefixes[static_cast<size_t>(c)].data(), sw_mlp(l), nullptr, hh,
+                                    H, cfg_.rms_eps);
+                    } else {
                         for (int j = 0; j < H; ++j)
-                            prefixes[static_cast<size_t>(c)][j] += y[j];
-                        attnres_mix(psnaps[static_cast<size_t>(c)], prefixes[static_cast<size_t>(c)].data(),
-                                    l < static_cast<int>(d_.res_n.size()) ? d_.res_n[l].data() : nullptr,
-                                    l < static_cast<int>(d_.res_p.size()) ? d_.res_p[l].data() : nullptr,
-                                    hh, H, cfg_.rms_eps);
+                            hh[j] += y[j];
                     }
                 }
                 if (l < cfg_.first_dense) {
@@ -334,40 +445,48 @@ public:
                         for (int j = 0; j < cfg_.dense_intermediate; ++j)
                             g[j] = quant::situ_glu(g[j], u[j], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
                         d_.mlp_down[l].gemm(down.data(), g.data(), 1);
-                        for (int j = 0; j < H; ++j)
-                            hh[j] += down[j];
                         if (attnres) {
                             for (int j = 0; j < H; ++j)
                                 prefixes[static_cast<size_t>(c)][j] += down[j];
+                            std::memcpy(hh, prefixes[static_cast<size_t>(c)].data(),
+                                        static_cast<size_t>(H) * sizeof(float));
+                        } else {
+                            for (int j = 0; j < H; ++j)
+                                hh[j] += down[j];
                         }
                     }
                 } else {
                     std::vector<float> norms(static_cast<size_t>(C) * H);
                     std::vector<float> before;
                     if (attnres) {
-                        before.assign(act.begin(), act.end());
+                        before.assign(static_cast<size_t>(C) * H, 0.f);
                     }
                     for (int c = 0; c < C; ++c)
                         quant::rmsnorm(act.data() + static_cast<size_t>(c) * H,
                                        d_.attn_out_n[l].data(),
                                        norms.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
-                    Status mst = moe_layer_n(l, norms.data(), act.data(), C, err);
+                    Status mst = moe_layer_n(l, norms.data(), attnres ? before.data() : act.data(),
+                                             C, err);
                     if (mst != Status::Ok)
                         return mst;
                     if (attnres) {
-                        for (int c = 0; c < C; ++c)
+                        for (int c = 0; c < C; ++c) {
                             for (int j = 0; j < H; ++j)
                                 prefixes[static_cast<size_t>(c)][j] +=
-                                    act[static_cast<size_t>(c) * H + j] -
                                     before[static_cast<size_t>(c) * H + j];
+                            std::memcpy(act.data() + static_cast<size_t>(c) * H,
+                                        prefixes[static_cast<size_t>(c)].data(),
+                                        static_cast<size_t>(H) * sizeof(float));
+                        }
                     }
                 }
             }
             if (cfg_.attn_res.block_size > 0) {
                 for (int c = 0; c < C; ++c)
-                    attnres_mix(psnaps[static_cast<size_t>(c)], prefixes[static_cast<size_t>(c)].data(),
-                                nullptr, nullptr, act.data() + static_cast<size_t>(c) * H, H,
-                                cfg_.rms_eps);
+                    attnres_mix(psnaps[static_cast<size_t>(c)],
+                                act.data() + static_cast<size_t>(c) * H,
+                                d_.out_sw.empty() ? nullptr : d_.out_sw.data(), nullptr,
+                                act.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
             }
             std::memcpy(h.data(), act.data() + static_cast<size_t>(C - 1) * H, H * sizeof(float));
             pos += C;
@@ -375,20 +494,65 @@ public:
         }
 
         out.tokens.clear();
+        out.token_logprobs.clear();
+        out.top_logprobs.clear();
         uint64_t rng = gp.seed ? gp.seed : 1ull;
+        std::vector<uint8_t> allow;
+        Gbnf g;
+        if (!gp.grammar.empty()) {
+            std::string e;
+            if (g.compile(gp.grammar, e) == Status::Ok && g.ready() && gp.token_text) {
+                allow.assign(cfg_.vocab, 0);
+                g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+            }
+        }
+        std::string acc;
         for (int n = 0; n < gp.max_new_tokens; ++n) {
             std::vector<float> nrm(H), logits(cfg_.vocab);
             quant::rmsnorm(h.data(), d_.norm.data(), nrm.data(), H, cfg_.rms_eps);
             d_.lm_head.gemm(logits.data(), nrm.data(), 1);
-            int next = sample_token(logits.data(), cfg_.vocab, gp.temperature, gp.top_p, &rng);
+            int next = sample_penalized(logits.data(), cfg_.vocab, gp, seq.data(),
+                                       static_cast<int>(seq.size()), &rng,
+                                       allow.empty() ? nullptr : allow.data(), nullptr,
+                                       &out.token_logprobs, &out.top_logprobs);
             out.tokens.push_back(next);
+            seq.push_back(next);
+            if (g.ready() && gp.token_text)
+                g.accept_bytes(gp.token_text(next));
+            if (gp.on_token)
+                gp.on_token(next);
             if (is_stop_token(next, cfg_, gp.eos))
                 break;
+            if (!gp.stop.empty() && gp.token_text) {
+                acc += gp.token_text(next);
+                if (stop_cut(acc, gp.stop) != std::string::npos) {
+                    out.stopped_by_stop = true;
+                    break;
+                }
+            }
             Status sst = step(next, true);
             if (sst != Status::Ok)
                 return sst;
+            if (g.ready() && gp.token_text) {
+                allow.assign(cfg_.vocab, 0);
+                g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+            }
         }
         out.completion_tokens = static_cast<int>(out.tokens.size());
+        if (cslot >= 0 && cslot < kMaxKvSlots) {
+            K3Slot &sl = slots_[cslot];
+            sl.S = S;
+            sl.winq = winq;
+            sl.wink = wink;
+            sl.winv = winv;
+            sl.mla_cache = mla_cache;
+            sl.h = h;
+            sl.pos = pos;
+            sl.history = prompt;
+            sl.history.insert(sl.history.end(), out.tokens.begin(), out.tokens.end());
+            sl.have = true;
+            sl.live = false;
+        }
         return Status::Ok;
     }
 
@@ -415,7 +579,641 @@ public:
 
     void expert_stats(ExpertStoreStats &out) const override { store_.stats(out); }
 
+    Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
+                          std::string &err) override {
+        if (!loaded_) {
+            err = "kimi_k3 not loaded";
+            return Status::InvalidArgument;
+        }
+        if (slot < 0 || slot >= kMaxKvSlots) {
+            err = "bad cache slot";
+            return Status::InvalidArgument;
+        }
+        if (ids.empty()) {
+            err = "empty prompt";
+            return Status::InvalidArgument;
+        }
+        K3Slot &st = slots_[slot];
+        const int match = st.have ? kv_common_prefix(st.history, ids) : 0;
+        const int want = std::min(std::max(gp.prefix_reuse, 0), match);
+        int applied = 0;
+        int Tmax = std::max(rt_.max_seq, static_cast<int>(ids.size()) + gp.max_new_tokens);
+        if (Tmax <= 0)
+            Tmax = 4096;
+        if (st.have && st.pos > 0 && st.pos <= want && st.pos <= static_cast<int>(ids.size())) {
+            applied = st.pos;
+            slot_ensure_t(st, Tmax);
+        } else {
+            slot_alloc(st, Tmax);
+        }
+        Status pst = slot_prefill(st, ids, applied, err);
+        if (pst != Status::Ok)
+            return pst;
+        st.history = ids;
+        st.live = true;
+        st.have = true;
+        st.gp = gp;
+        st.rng = gp.seed ? gp.seed : 1ull;
+        st.emitted = 0;
+        st.allow.clear();
+        st.acc.clear();
+        st.token_lps.clear();
+        st.top_lps.clear();
+        st.g = Gbnf{};
+        if (!gp.grammar.empty()) {
+            std::string e;
+            if (st.g.compile(gp.grammar, e) == Status::Ok && st.g.ready() && gp.token_text) {
+                st.allow.assign(cfg_.vocab, 0);
+                st.g.allow_mask(gp.token_text, st.allow.data(), cfg_.vocab);
+            }
+        }
+        reuse = applied;
+        return Status::Ok;
+    }
+
+    Status next_token(int slot, int &token, bool &done, std::string &err) override {
+        if (slot < 0 || slot >= kMaxKvSlots) {
+            err = "bad cache slot";
+            return Status::InvalidArgument;
+        }
+        K3Slot &st = slots_[slot];
+        if (!st.live) {
+            err = "no live generate";
+            return Status::InvalidArgument;
+        }
+        done = false;
+        if (st.gp.max_new_tokens <= 0 || st.emitted >= st.gp.max_new_tokens) {
+            done = true;
+            token = -1;
+            return Status::Ok;
+        }
+        const uint8_t *allow = st.allow.empty() ? nullptr : st.allow.data();
+        token = slot_sample(st, &st.rng, allow);
+        ++st.emitted;
+        st.history.push_back(token);
+        if (st.g.ready() && st.gp.token_text)
+            st.g.accept_bytes(st.gp.token_text(token));
+        bool hit_stop = false;
+        if (!st.gp.stop.empty() && st.gp.token_text) {
+            st.acc += st.gp.token_text(token);
+            if (stop_cut(st.acc, st.gp.stop) != std::string::npos)
+                hit_stop = true;
+        }
+        if (is_stop_token(token, cfg_, st.gp.eos) || st.emitted >= st.gp.max_new_tokens ||
+            hit_stop) {
+            done = true;
+        } else {
+            Status sst = slot_step(st, token, err);
+            if (sst != Status::Ok)
+                return sst;
+            done = false;
+        }
+        if (st.g.ready() && st.gp.token_text) {
+            st.allow.assign(cfg_.vocab, 0);
+            st.g.allow_mask(st.gp.token_text, st.allow.data(), cfg_.vocab);
+        }
+        return Status::Ok;
+    }
+
+    Status next_tokens(const int *slots, int n, int *tokens, uint8_t *done,
+                       std::string &err) override {
+        if (n < 1)
+            return Status::Ok;
+        if (!slots || !tokens || !done) {
+            err = "next_tokens bad args";
+            return Status::InvalidArgument;
+        }
+        if (n == 1) {
+            bool d = false;
+            Status st = next_token(slots[0], tokens[0], d, err);
+            done[0] = d ? 1 : 0;
+            return st;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (slots[i] < 0 || slots[i] >= kMaxKvSlots) {
+                err = "bad cache slot";
+                return Status::InvalidArgument;
+            }
+            if (!slots_[slots[i]].live) {
+                err = "no live generate";
+                return Status::InvalidArgument;
+            }
+        }
+        std::vector<K3Slot *> step_s;
+        std::vector<int> step_tok;
+        step_s.reserve(static_cast<size_t>(n));
+        step_tok.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            K3Slot &st = slots_[slots[i]];
+            done[i] = 0;
+            if (st.gp.max_new_tokens <= 0 || st.emitted >= st.gp.max_new_tokens) {
+                done[i] = 1;
+                tokens[i] = -1;
+                continue;
+            }
+            const uint8_t *allow = st.allow.empty() ? nullptr : st.allow.data();
+            tokens[i] = slot_sample(st, &st.rng, allow);
+            ++st.emitted;
+            st.history.push_back(tokens[i]);
+            if (st.g.ready() && st.gp.token_text)
+                st.g.accept_bytes(st.gp.token_text(tokens[i]));
+            bool hit_stop = false;
+            if (!st.gp.stop.empty() && st.gp.token_text) {
+                st.acc += st.gp.token_text(tokens[i]);
+                if (stop_cut(st.acc, st.gp.stop) != std::string::npos)
+                    hit_stop = true;
+            }
+            if (is_stop_token(tokens[i], cfg_, st.gp.eos) || st.emitted >= st.gp.max_new_tokens ||
+                hit_stop)
+                done[i] = 1;
+            else {
+                step_s.push_back(&st);
+                step_tok.push_back(tokens[i]);
+            }
+            if (st.g.ready() && st.gp.token_text) {
+                st.allow.assign(cfg_.vocab, 0);
+                st.g.allow_mask(st.gp.token_text, st.allow.data(), cfg_.vocab);
+            }
+        }
+        if (!step_s.empty()) {
+            Status sst = slot_step_n(step_s.data(), step_tok.data(),
+                                     static_cast<int>(step_s.size()), err);
+            if (sst != Status::Ok)
+                return sst;
+        }
+        return Status::Ok;
+    }
+
+    void end_generate(int slot) override {
+        if (slot < 0 || slot >= kMaxKvSlots)
+            return;
+        slots_[slot].live = false;
+    }
+
 private:
+    const float *sw_attn(int l) const {
+        return (l < static_cast<int>(d_.attn_sw.size()) && !d_.attn_sw[l].empty())
+                   ? d_.attn_sw[l].data()
+                   : nullptr;
+    }
+    const float *sw_mlp(int l) const {
+        return (l < static_cast<int>(d_.mlp_sw.size()) && !d_.mlp_sw[l].empty())
+                   ? d_.mlp_sw[l].data()
+                   : nullptr;
+    }
+
+    int kv_stride() const {
+        return std::max(cfg_.mla.kv_lora, 0) + std::max(cfg_.mla.qk_rope, 0);
+    }
+
+    void slot_alloc(K3Slot &s, int t_max) {
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        const int kd = cfg_.kda.head_dim;
+        const int kh = cfg_.kda.heads;
+        const int P = kh * kd;
+        const int Kc = cfg_.kda.conv_k > 0 ? cfg_.kda.conv_k : 4;
+        const int kvStride = kv_stride();
+        s.h.assign(static_cast<size_t>(H), 0.f);
+        s.S.assign(static_cast<size_t>(L), {});
+        s.winq.assign(static_cast<size_t>(L), {});
+        s.wink.assign(static_cast<size_t>(L), {});
+        s.winv.assign(static_cast<size_t>(L), {});
+        s.mla_cache.assign(static_cast<size_t>(L), {});
+        for (int l = 0; l < L; ++l) {
+            s.S[l].assign(static_cast<size_t>(kh) * kd * kd, 0.f);
+            s.winq[l].assign(static_cast<size_t>(P) * Kc, 0.f);
+            s.wink[l].assign(static_cast<size_t>(P) * Kc, 0.f);
+            s.winv[l].assign(static_cast<size_t>(P) * Kc, 0.f);
+            if (kvStride > 0)
+                s.mla_cache[l].assign(static_cast<size_t>(std::max(t_max, 1)) * kvStride, 0.f);
+        }
+        s.pos = 0;
+        s.have = false;
+        s.live = false;
+        s.history.clear();
+        s.emitted = 0;
+        s.allow.clear();
+        s.acc.clear();
+        s.token_lps.clear();
+        s.top_lps.clear();
+        s.g = Gbnf{};
+    }
+
+    void slot_ensure_t(K3Slot &s, int t_max) {
+        const int L = cfg_.n_layers;
+        const int kvStride = kv_stride();
+        if (kvStride <= 0)
+            return;
+        const size_t need = static_cast<size_t>(std::max(t_max, 1)) * kvStride;
+        if (static_cast<int>(s.mla_cache.size()) < L)
+            s.mla_cache.resize(static_cast<size_t>(L));
+        for (int l = 0; l < L; ++l) {
+            if (s.mla_cache[l].size() < need)
+                s.mla_cache[l].resize(need, 0.f);
+        }
+    }
+
+    Status slot_step(K3Slot &s, int token, std::string &err) {
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        int tid = token;
+        if (tid < 0 || tid >= cfg_.vocab)
+            tid = 0;
+        if (static_cast<int>(s.h.size()) != H)
+            s.h.assign(static_cast<size_t>(H), 0.f);
+        std::memcpy(s.h.data(), d_.embed.data() + static_cast<size_t>(tid) * H,
+                    static_cast<size_t>(H) * sizeof(float));
+        std::vector<float> prefix(static_cast<size_t>(H), 0.f);
+        std::vector<std::vector<float>> snaps;
+        for (int l = 0; l < L; ++l) {
+            const bool attnres = cfg_.attn_res.block_size > 0;
+            const bool snap = attnres && (l % cfg_.attn_res.block_size) == 0;
+            if (attnres) {
+                prefix = s.h;
+                if (!snaps.empty())
+                    attnres_mix(snaps, prefix.data(), sw_attn(l), nullptr, s.h.data(), H,
+                                cfg_.rms_eps);
+                if (snap)
+                    snaps.push_back(prefix);
+            }
+
+            std::vector<float> n(static_cast<size_t>(H)), y(static_cast<size_t>(H), 0.f);
+            quant::rmsnorm(s.h.data(), d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
+
+            bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
+            if (use_kda) {
+                kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
+                         &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
+                         static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
+                         nullptr, &d_.wo[l],
+                         d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
+                         s.S[l].data(), y.data(), cfg_.rms_eps,
+                         l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
+                             ? d_.conv_q[l].data()
+                             : nullptr,
+                         l < static_cast<int>(d_.conv_k.size()) && !d_.conv_k[l].empty()
+                             ? d_.conv_k[l].data()
+                             : nullptr,
+                         l < static_cast<int>(d_.conv_v.size()) && !d_.conv_v[l].empty()
+                             ? d_.conv_v[l].data()
+                             : nullptr,
+                         s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
+            } else {
+                mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
+                         d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
+                         &d_.mla_qb[l], &d_.mla_kva[l],
+                         d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
+                         &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
+                         s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), s.pos,
+                         y.data(), cfg_.rms_eps);
+            }
+            if (attnres) {
+                if (snap)
+                    prefix = std::vector<float>(y.begin(), y.end());
+                else {
+                    for (int i = 0; i < H; ++i)
+                        prefix[i] += y[i];
+                }
+                attnres_mix(snaps, prefix.data(), sw_mlp(l), nullptr, s.h.data(), H, cfg_.rms_eps);
+            } else {
+                for (int i = 0; i < H; ++i)
+                    s.h[i] += y[i];
+            }
+
+            quant::rmsnorm(s.h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
+            if (l < cfg_.first_dense) {
+                std::vector<float> g(cfg_.dense_intermediate), u(cfg_.dense_intermediate),
+                    down(static_cast<size_t>(H));
+                d_.mlp_gate[l].gemm(g.data(), n.data(), 1);
+                d_.mlp_up[l].gemm(u.data(), n.data(), 1);
+                for (int i = 0; i < cfg_.dense_intermediate; ++i)
+                    g[i] = quant::situ_glu(g[i], u[i], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
+                d_.mlp_down[l].gemm(down.data(), g.data(), 1);
+                if (attnres) {
+                    for (int i = 0; i < H; ++i)
+                        prefix[i] += down[i];
+                    s.h = prefix;
+                } else {
+                    for (int i = 0; i < H; ++i)
+                        s.h[i] += down[i];
+                }
+            } else {
+                if (attnres) {
+                    std::vector<float> dest(static_cast<size_t>(H), 0.f);
+                    Status mst = moe_layer(l, n.data(), dest.data(), err);
+                    if (mst != Status::Ok)
+                        return mst;
+                    for (int i = 0; i < H; ++i)
+                        prefix[i] += dest[i];
+                    s.h = prefix;
+                } else {
+                    Status mst = moe_layer(l, n.data(), s.h.data(), err);
+                    if (mst != Status::Ok)
+                        return mst;
+                }
+            }
+        }
+        if (cfg_.attn_res.block_size > 0)
+            attnres_mix(snaps, s.h.data(), d_.out_sw.empty() ? nullptr : d_.out_sw.data(), nullptr,
+                        s.h.data(), H, cfg_.rms_eps);
+        ++s.pos;
+        return Status::Ok;
+    }
+
+    // One decode row per continuing slot. KDA/MLA stay per-slot; MoE is unioned.
+    Status slot_step_n(K3Slot **ss, const int *tokens, int S, std::string &err) {
+        if (S <= 0)
+            return Status::Ok;
+        if (S == 1)
+            return slot_step(*ss[0], tokens[0], err);
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        std::vector<float> act(static_cast<size_t>(S) * H);
+        for (int c = 0; c < S; ++c) {
+            int tid = tokens[c];
+            if (tid < 0 || tid >= cfg_.vocab)
+                tid = 0;
+            std::memcpy(act.data() + static_cast<size_t>(c) * H,
+                        d_.embed.data() + static_cast<size_t>(tid) * H,
+                        static_cast<size_t>(H) * sizeof(float));
+        }
+        std::vector<std::vector<float>> prefixes(static_cast<size_t>(S),
+                                                 std::vector<float>(static_cast<size_t>(H), 0.f));
+        std::vector<std::vector<std::vector<float>>> psnaps(static_cast<size_t>(S));
+        for (int l = 0; l < L; ++l) {
+            const bool attnres = cfg_.attn_res.block_size > 0;
+            const bool snap = attnres && (l % cfg_.attn_res.block_size) == 0;
+            for (int c = 0; c < S; ++c) {
+                K3Slot &s = *ss[c];
+                float *hh = act.data() + static_cast<size_t>(c) * H;
+                if (attnres) {
+                    prefixes[static_cast<size_t>(c)].assign(hh, hh + H);
+                    if (!psnaps[static_cast<size_t>(c)].empty())
+                        attnres_mix(psnaps[static_cast<size_t>(c)],
+                                    prefixes[static_cast<size_t>(c)].data(), sw_attn(l), nullptr,
+                                    hh, H, cfg_.rms_eps);
+                    if (snap)
+                        psnaps[static_cast<size_t>(c)].push_back(prefixes[static_cast<size_t>(c)]);
+                }
+                std::vector<float> n(static_cast<size_t>(H)), y(static_cast<size_t>(H), 0.f);
+                quant::rmsnorm(hh, d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
+                bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
+                if (use_kda) {
+                    kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
+                             &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
+                             static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
+                             nullptr, &d_.wo[l],
+                             d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
+                             s.S[l].data(), y.data(), cfg_.rms_eps,
+                             l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
+                                 ? d_.conv_q[l].data()
+                                 : nullptr,
+                             l < static_cast<int>(d_.conv_k.size()) && !d_.conv_k[l].empty()
+                                 ? d_.conv_k[l].data()
+                                 : nullptr,
+                             l < static_cast<int>(d_.conv_v.size()) && !d_.conv_v[l].empty()
+                                 ? d_.conv_v[l].data()
+                                 : nullptr,
+                             s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
+                } else {
+                    mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
+                             d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
+                             &d_.mla_qb[l], &d_.mla_kva[l],
+                             d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
+                             &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
+                             s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), s.pos,
+                             y.data(), cfg_.rms_eps);
+                }
+                if (attnres) {
+                    if (snap)
+                        prefixes[static_cast<size_t>(c)] = std::vector<float>(y.begin(), y.end());
+                    else {
+                        for (int j = 0; j < H; ++j)
+                            prefixes[static_cast<size_t>(c)][j] += y[j];
+                    }
+                    attnres_mix(psnaps[static_cast<size_t>(c)],
+                                prefixes[static_cast<size_t>(c)].data(), sw_mlp(l), nullptr, hh, H,
+                                cfg_.rms_eps);
+                } else {
+                    for (int j = 0; j < H; ++j)
+                        hh[j] += y[j];
+                }
+            }
+            if (l < cfg_.first_dense) {
+                for (int c = 0; c < S; ++c) {
+                    float *hh = act.data() + static_cast<size_t>(c) * H;
+                    std::vector<float> n(static_cast<size_t>(H)), g(cfg_.dense_intermediate),
+                        u(cfg_.dense_intermediate), down(static_cast<size_t>(H));
+                    quant::rmsnorm(hh, d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
+                    d_.mlp_gate[l].gemm(g.data(), n.data(), 1);
+                    d_.mlp_up[l].gemm(u.data(), n.data(), 1);
+                    for (int j = 0; j < cfg_.dense_intermediate; ++j)
+                        g[j] = quant::situ_glu(g[j], u[j], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
+                    d_.mlp_down[l].gemm(down.data(), g.data(), 1);
+                    if (attnres) {
+                        for (int j = 0; j < H; ++j)
+                            prefixes[static_cast<size_t>(c)][j] += down[j];
+                        std::memcpy(hh, prefixes[static_cast<size_t>(c)].data(),
+                                    static_cast<size_t>(H) * sizeof(float));
+                    } else {
+                        for (int j = 0; j < H; ++j)
+                            hh[j] += down[j];
+                    }
+                }
+            } else {
+                std::vector<float> norms(static_cast<size_t>(S) * H);
+                std::vector<float> before;
+                if (attnres)
+                    before.assign(static_cast<size_t>(S) * H, 0.f);
+                for (int c = 0; c < S; ++c)
+                    quant::rmsnorm(act.data() + static_cast<size_t>(c) * H, d_.attn_out_n[l].data(),
+                                   norms.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
+                Status mst = moe_layer_n(l, norms.data(), attnres ? before.data() : act.data(), S,
+                                         err);
+                if (mst != Status::Ok)
+                    return mst;
+                if (attnres) {
+                    for (int c = 0; c < S; ++c) {
+                        for (int j = 0; j < H; ++j)
+                            prefixes[static_cast<size_t>(c)][j] +=
+                                before[static_cast<size_t>(c) * H + j];
+                        std::memcpy(act.data() + static_cast<size_t>(c) * H,
+                                    prefixes[static_cast<size_t>(c)].data(),
+                                    static_cast<size_t>(H) * sizeof(float));
+                    }
+                }
+            }
+        }
+        for (int c = 0; c < S; ++c) {
+            float *hh = act.data() + static_cast<size_t>(c) * H;
+            if (cfg_.attn_res.block_size > 0)
+                attnres_mix(psnaps[static_cast<size_t>(c)], hh,
+                            d_.out_sw.empty() ? nullptr : d_.out_sw.data(), nullptr, hh, H,
+                            cfg_.rms_eps);
+            K3Slot &s = *ss[c];
+            if (static_cast<int>(s.h.size()) != H)
+                s.h.assign(static_cast<size_t>(H), 0.f);
+            std::memcpy(s.h.data(), hh, static_cast<size_t>(H) * sizeof(float));
+            ++s.pos;
+        }
+        return Status::Ok;
+    }
+
+    Status slot_prefill(K3Slot &s, const std::vector<int> &ids, int start, std::string &err) {
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        if (start < 0)
+            start = 0;
+        if (start >= static_cast<int>(ids.size()))
+            return Status::Ok;
+        const int chunk = rt_.prefill_chunk > 0 ? rt_.prefill_chunk
+                                                : static_cast<int>(ids.size()) - start;
+        for (size_t i = static_cast<size_t>(start); i < ids.size();) {
+            const int C = static_cast<int>(
+                std::min(static_cast<size_t>(chunk), ids.size() - i));
+            std::vector<float> act(static_cast<size_t>(C) * H);
+            std::vector<std::vector<float>> prefixes(static_cast<size_t>(C),
+                                                     std::vector<float>(static_cast<size_t>(H), 0.f));
+            std::vector<std::vector<std::vector<float>>> psnaps(static_cast<size_t>(C));
+            for (int c = 0; c < C; ++c) {
+                int tid = ids[i + static_cast<size_t>(c)];
+                if (tid < 0 || tid >= cfg_.vocab)
+                    tid = 0;
+                std::memcpy(act.data() + static_cast<size_t>(c) * H,
+                            d_.embed.data() + static_cast<size_t>(tid) * H,
+                            static_cast<size_t>(H) * sizeof(float));
+            }
+            for (int l = 0; l < L; ++l) {
+                const bool attnres = cfg_.attn_res.block_size > 0;
+                const bool snap = attnres && (l % cfg_.attn_res.block_size) == 0;
+                for (int c = 0; c < C; ++c) {
+                    float *hh = act.data() + static_cast<size_t>(c) * H;
+                    if (attnres) {
+                        prefixes[static_cast<size_t>(c)].assign(hh, hh + H);
+                        if (!psnaps[static_cast<size_t>(c)].empty())
+                            attnres_mix(psnaps[static_cast<size_t>(c)],
+                                        prefixes[static_cast<size_t>(c)].data(), sw_attn(l),
+                                        nullptr, hh, H, cfg_.rms_eps);
+                        if (snap)
+                            psnaps[static_cast<size_t>(c)].push_back(
+                                prefixes[static_cast<size_t>(c)]);
+                    }
+                    std::vector<float> n(static_cast<size_t>(H)), y(static_cast<size_t>(H), 0.f);
+                    quant::rmsnorm(hh, d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
+                    bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
+                    if (use_kda) {
+                        kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
+                                 &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
+                                 static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
+                                 nullptr, &d_.wo[l],
+                                 d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
+                                 s.S[l].data(), y.data(), cfg_.rms_eps,
+                                 l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
+                                     ? d_.conv_q[l].data()
+                                     : nullptr,
+                                 l < static_cast<int>(d_.conv_k.size()) && !d_.conv_k[l].empty()
+                                     ? d_.conv_k[l].data()
+                                     : nullptr,
+                                 l < static_cast<int>(d_.conv_v.size()) && !d_.conv_v[l].empty()
+                                     ? d_.conv_v[l].data()
+                                     : nullptr,
+                                 s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
+                    } else {
+                        mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
+                                 d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
+                                 &d_.mla_qb[l], &d_.mla_kva[l],
+                                 d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
+                                 &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
+                                 s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(),
+                                 s.pos + c, y.data(), cfg_.rms_eps);
+                    }
+                    if (attnres) {
+                        if (snap)
+                            prefixes[static_cast<size_t>(c)] =
+                                std::vector<float>(y.begin(), y.end());
+                        else {
+                            for (int j = 0; j < H; ++j)
+                                prefixes[static_cast<size_t>(c)][j] += y[j];
+                        }
+                        attnres_mix(psnaps[static_cast<size_t>(c)],
+                                    prefixes[static_cast<size_t>(c)].data(), sw_mlp(l), nullptr,
+                                    hh, H, cfg_.rms_eps);
+                    } else {
+                        for (int j = 0; j < H; ++j)
+                            hh[j] += y[j];
+                    }
+                }
+                if (l < cfg_.first_dense) {
+                    for (int c = 0; c < C; ++c) {
+                        float *hh = act.data() + static_cast<size_t>(c) * H;
+                        std::vector<float> n(static_cast<size_t>(H)), g(cfg_.dense_intermediate),
+                            u(cfg_.dense_intermediate), down(static_cast<size_t>(H));
+                        quant::rmsnorm(hh, d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
+                        d_.mlp_gate[l].gemm(g.data(), n.data(), 1);
+                        d_.mlp_up[l].gemm(u.data(), n.data(), 1);
+                        for (int j = 0; j < cfg_.dense_intermediate; ++j)
+                            g[j] = quant::situ_glu(g[j], u[j], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
+                        d_.mlp_down[l].gemm(down.data(), g.data(), 1);
+                        if (attnres) {
+                            for (int j = 0; j < H; ++j)
+                                prefixes[static_cast<size_t>(c)][j] += down[j];
+                            std::memcpy(hh, prefixes[static_cast<size_t>(c)].data(),
+                                        static_cast<size_t>(H) * sizeof(float));
+                        } else {
+                            for (int j = 0; j < H; ++j)
+                                hh[j] += down[j];
+                        }
+                    }
+                } else {
+                    std::vector<float> norms(static_cast<size_t>(C) * H);
+                    std::vector<float> before;
+                    if (attnres)
+                        before.assign(static_cast<size_t>(C) * H, 0.f);
+                    for (int c = 0; c < C; ++c)
+                        quant::rmsnorm(act.data() + static_cast<size_t>(c) * H,
+                                       d_.attn_out_n[l].data(),
+                                       norms.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
+                    Status mst = moe_layer_n(l, norms.data(), attnres ? before.data() : act.data(),
+                                             C, err);
+                    if (mst != Status::Ok)
+                        return mst;
+                    if (attnres) {
+                        for (int c = 0; c < C; ++c) {
+                            for (int j = 0; j < H; ++j)
+                                prefixes[static_cast<size_t>(c)][j] +=
+                                    before[static_cast<size_t>(c) * H + j];
+                            std::memcpy(act.data() + static_cast<size_t>(c) * H,
+                                        prefixes[static_cast<size_t>(c)].data(),
+                                        static_cast<size_t>(H) * sizeof(float));
+                        }
+                    }
+                }
+            }
+            if (cfg_.attn_res.block_size > 0) {
+                for (int c = 0; c < C; ++c)
+                    attnres_mix(psnaps[static_cast<size_t>(c)],
+                                act.data() + static_cast<size_t>(c) * H,
+                                d_.out_sw.empty() ? nullptr : d_.out_sw.data(), nullptr,
+                                act.data() + static_cast<size_t>(c) * H, H, cfg_.rms_eps);
+            }
+            std::memcpy(s.h.data(), act.data() + static_cast<size_t>(C - 1) * H,
+                        static_cast<size_t>(H) * sizeof(float));
+            s.pos += C;
+            i += static_cast<size_t>(C);
+        }
+        return Status::Ok;
+    }
+
+    int slot_sample(K3Slot &s, uint64_t *rng, const uint8_t *allow) {
+        const int H = cfg_.hidden;
+        std::vector<float> nrm(static_cast<size_t>(H)), logits(static_cast<size_t>(cfg_.vocab));
+        quant::rmsnorm(s.h.data(), d_.norm.data(), nrm.data(), H, cfg_.rms_eps);
+        d_.lm_head.gemm(logits.data(), nrm.data(), 1);
+        return sample_penalized(logits.data(), cfg_.vocab, s.gp, s.history.data(),
+                               static_cast<int>(s.history.size()), rng, allow, nullptr,
+                               &s.token_lps, &s.top_lps);
+    }
     int64_t expert_bytes() const {
         const int I = cfg_.moe.latent > 0 ? cfg_.moe.latent : cfg_.hidden;
         const int O = cfg_.moe.intermediate > 0 ? cfg_.moe.intermediate : 32;
@@ -604,6 +1402,10 @@ private:
             overlay_f32(files, ly + ".self_attn.v_conv1d.weight", d_.conv_v[i], 0, err);
             overlay_f32(files, ly + ".self_attention_res_norm.weight", d_.res_n[i], H, err);
             overlay_f32(files, ly + ".self_attention_res_proj.weight", d_.res_p[i], H, err);
+            overlay_f32(files, ly + ".mlp_res_norm.weight", d_.mlp_res_n[i], H, err);
+            overlay_f32(files, ly + ".mlp_res_proj.weight", d_.mlp_res_p[i], H, err);
+            fold_sw(d_.res_n[i], d_.res_p[i], d_.attn_sw[i], H);
+            fold_sw(d_.mlp_res_n[i], d_.mlp_res_p[i], d_.mlp_sw[i], H);
             if (i < cfg_.first_dense) {
                 overlay_mat(files, ly + ".mlp.gate_proj.weight", d_.mlp_gate[i], bits, err);
                 overlay_mat(files, ly + ".mlp.up_proj.weight", d_.mlp_up[i], bits, err);
@@ -626,6 +1428,12 @@ private:
                 overlay_mat(files, ly + ".block_sparse_moe.shared_experts.down_proj.weight",
                             d_.shared_down[i], bits, err);
             }
+        }
+        {
+            std::vector<float> on, op;
+            overlay_f32(files, P + "model.output_attn_res_norm.weight", on, H, err);
+            overlay_f32(files, P + "model.output_attn_res_proj.weight", op, H, err);
+            fold_sw(on, op, d_.out_sw, H);
         }
         err.clear();
 
@@ -859,6 +1667,10 @@ private:
         d_.shared_down.resize(L);
         d_.res_n.resize(L);
         d_.res_p.resize(L);
+        d_.mlp_res_n.resize(L);
+        d_.mlp_res_p.resize(L);
+        d_.attn_sw.resize(L);
+        d_.mlp_sw.resize(L);
         d_.mlp_gate.resize(L);
         d_.mlp_up.resize(L);
         d_.mlp_down.resize(L);
@@ -908,6 +1720,10 @@ private:
             d_.shared_down[l] = qmat_xavier(H, inter, 140 + l, bits);
             ones(d_.res_n[l], H);
             ones(d_.res_p[l], H);
+            ones(d_.mlp_res_n[l], H);
+            ones(d_.mlp_res_p[l], H);
+            fold_sw(d_.res_n[l], d_.res_p[l], d_.attn_sw[l], H);
+            fold_sw(d_.mlp_res_n[l], d_.mlp_res_p[l], d_.mlp_sw[l], H);
             d_.mlp_gate[l] = qmat_xavier(inter, H, 150 + l, bits);
             d_.mlp_up[l] = qmat_xavier(inter, H, 160 + l, bits);
             d_.mlp_down[l] = qmat_xavier(H, inter, 170 + l, bits);
@@ -925,6 +1741,7 @@ private:
                 ones(d_.mla_kva_ln[l], kv);
             }
         }
+        ones(d_.out_sw, H);
     }
 
     ModelConfig cfg_{};
@@ -935,6 +1752,7 @@ private:
     bool loaded_ = false;
     bool from_checkpoint_ = false;
     std::string prefix_;
+    K3Slot slots_[kMaxKvSlots];
 };
 
 std::unique_ptr<FamilyEngine> make_kimi_k3() { return std::make_unique<KimiK3Engine>(); }

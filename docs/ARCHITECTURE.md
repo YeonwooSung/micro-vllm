@@ -49,9 +49,9 @@ Insufficient fast memory changes speed, not router semantics.
 src/core     types, ModelConfig, RuntimeConfig
 src/io       aligned I/O, O_DIRECT, safetensors
 src/quant    MXFP4, int4-g64, int8-row, SiTU-GLU, clamped SwiGLU
-src/store    ExpertStore (MoE LRU) + BlockStore (DiT 2-slot stream)
+src/store    ExpertStore (MoE LRU) + BlockStore (DiT 2-slot stream) + COLIKV1 persist
 src/tok      whitespace / HF tokenizer.json / raw ids
-src/model    family registry + llama / kimi_k3 / glm53 / h3
+src/model    family registry + llama / kimi_k3 / glm53 / h3 (+ canvas, DiT schedule)
 src/serve    OpenAI HTTP (/v1/chat/completions, /v1/models, /v1/videos)
 src/legacy   original CUDA Llama demo
 ```
@@ -147,12 +147,16 @@ Metal / CUDA expert GEMM and H3 DiT (host engine, not `kernels.cu`):
   GPU is missing. Default device stays CPU so host tests stay deterministic.
 - K3/GLM union-MoE batches tokens that share an expert into one GEMM.
 
-Not absorbed yet:
+`micro-vllm smoke --model DIR` walks shard headers and, when expert / DiT
+tensors exist, `pread`s one expert slot (or a small H3 vector). Counted
+experts must match `config.json`. Empty / fixture dirs stay on the synthetic
+pack path. Live dumps: set `MVLLM_DUMP_K3` / `MVLLM_DUMP_GLM53` / `MVLLM_DUMP_H3`
+and run smoke against those trees. Official GLM FP8 experts need
+`python/convert_glm53.py` first. K3 official MXFP4 loads without `k3_repack.py`.
 
-- Walking a live 1.5 TB / 195 GB dump on this machine (smoke is the dry path)
-- Official 36-block 2048-d VAE without a fixture (synth mix is the host path)
-- Audio VAE
-- K3 K3CHAT1 gateway wire / tool-call XTML (prompt chat uses segmented XTML)
+Not absorbed yet: none from the host-migration plan
+(`/health` running/queued, smoke `format_shard_report_json`, Anthropic
+SSE `usage` also in).
 
 Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise.
 A K3 HF dir with only `tiktoken.model` (+ optional `tokenizer_config.json`)
@@ -170,3 +174,15 @@ each routed expert once for the chunk (`prefill=layer`). Decode stays C=1.
 
 DSA (GLM full-attn): k-pool indexer + top-k slots into absorbed MLA. Missing
 indexer tensors keep dense MLA.
+
+H3 host canvas (h3.c `h3_adapt_canvas`): snap to a 32-multiple, 768 short-edge
+nominal, cap `768*1344`. Ref2VA images are down-only; ref video never enlarges.
+PCG + Box-Muller seeds DiT noise. Independent video/audio sigma grids
+(`h3_schedule_build` / serving linear base), timestep row maps (shared row when
+`1-σ_v == 1-σ_a`, plus condition rows at 0.999/1.0), sinusoidal 256-d time
+features, AdaLN `row_map` by segment kind, and official RES multistep
+(`h3_res_step`; Euler when `next==0` or no previous denoised).
+
+K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R
+rows, optional DSA index). `nrec` is fsynced last. Mismatched geometry is
+ignored (empty reopen). Host F32 only (no KV8/TQ).
