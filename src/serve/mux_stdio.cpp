@@ -158,7 +158,8 @@ static void emit_done(Engine &engine, uint64_t id, int emitted, int prompt_token
     fflush(stdout);
 }
 
-static void emit_turn_telem(Engine &engine, uint64_t id, double t0) {
+static void emit_turn_telem(Engine &engine, uint64_t id, double t0, int prompt_tokens,
+                            int completion_tokens) {
     const HwInfo hw = hw_probe();
     std::string hwline = mux_format_hwinfo(hw.cores, hw.ram_total_gb, hw.ram_avail_gb, hw.ngpu,
                                            hw.vram_total_gb, hw.cpu, hw.gpu);
@@ -178,6 +179,10 @@ static void emit_turn_telem(Engine &engine, uint64_t id, double t0) {
         rt.emap.empty() ? nullptr : rt.emap.data(), rt.rows, rt.cols,
         rt.hits.empty() ? nullptr : rt.hits.data());
     fwrite(block.data(), 1, block.size(), stdout);
+    const std::string prof =
+        mux_format_prof(dt, prompt_tokens, completion_tokens, pf.t_edisk, pf.t_ewait, pf.t_emm,
+                        pf.t_attn, pf.t_head, static_cast<uint64_t>(std::max(completion_tokens, 0)));
+    fwrite(prof.data(), 1, prof.size(), stdout);
     fflush(stdout);
 }
 
@@ -757,7 +762,7 @@ struct Mux {
         const int emitted = live ? live->emitted : static_cast<int>(out.tokens.size());
         const int limited = length_limited_of(out.tokens, max_tokens, engine.config(), gp.eos);
         const double t0 = live ? live->t0 : 0;
-        emit_turn_telem(engine, id, t0);
+        emit_turn_telem(engine, id, t0, prompt_tokens, emitted);
         const double dt = (t0 == 0.0) ? 0.0 : (mono_now() - t0);
         emit_done(engine, id, emitted, prompt_tokens, limited,
                   stop_kind_of(out.stopped_by_stop, limited), dt);
@@ -789,7 +794,7 @@ struct Mux {
                 const int emitted = static_cast<int>(job->out.tokens.size());
                 const int limited = length_limited_of(job->out.tokens, fl->max_tokens,
                                                       engine.config(), job->gp.eos);
-                emit_turn_telem(engine, fl->id, fl->t0);
+                emit_turn_telem(engine, fl->id, fl->t0, fl->prompt_tokens, emitted);
                 const double dt = (fl->t0 == 0.0) ? 0.0 : (mono_now() - fl->t0);
                 emit_done(engine, fl->id, emitted, fl->prompt_tokens, limited,
                           stop_kind_of(job->out.stopped_by_stop, limited), dt);

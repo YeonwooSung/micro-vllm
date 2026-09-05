@@ -248,6 +248,37 @@ std::string mux_format_entropy(const float *h, int n) {
     return out;
 }
 
+std::string mux_format_gpus(int n, const double *used_gb, const double *total_gb,
+                            const int *experts) {
+    if (n <= 0 || !used_gb || !total_gb || !experts)
+        return "GPUS 0\n";
+    std::string out = "GPUS ";
+    out.append(std::to_string(n));
+    for (int i = 0; i < n; ++i) {
+        char buf[80];
+        std::snprintf(buf, sizeof(buf), " %.2f %.2f %d", used_gb[i], total_gb[i], experts[i]);
+        out.append(buf);
+    }
+    out.push_back('\n');
+    return out;
+}
+
+std::string mux_format_repin(int layer, int eid, int old_tier, int gpu) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "REPIN %d %d %d %d\n", layer, eid, old_tier, gpu);
+    return buf;
+}
+
+std::string mux_format_prof(double wall_s, int prompt_tokens, int completion_tokens,
+                            double t_edisk, double t_ewait, double t_emm, double t_attn,
+                            double t_head, uint64_t n_fw) {
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n", wall_s,
+                  prompt_tokens, completion_tokens, t_edisk, t_ewait, t_emm, t_attn, t_head,
+                  static_cast<unsigned long long>(n_fw));
+    return buf;
+}
+
 std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, double dt,
                                   double t_edisk, double t_ewait, double t_emm, double t_attn,
                                   double t_kvb, double t_head, const float *entropy, int n_entropy,
@@ -263,6 +294,7 @@ std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, d
     out.append(mux_format_perf(id, dt, t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head));
     if (n_entropy > 0)
         out.append(mux_format_entropy(entropy, n_entropy));
+    out.append(mux_format_gpus(0, nullptr, nullptr, nullptr));
     out.append(mux_format_tiers(vram, ram, disk, vram_gb, ram_gb));
     if (emap_rows > 0 && emap)
         out.append(mux_format_emap(emap_rows, emap_cols, emap));

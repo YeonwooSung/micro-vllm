@@ -5,6 +5,8 @@
 #include "tok/k3_chat1.hpp"
 #include "tok/stop_set.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <sstream>
 
 namespace mvllm {
@@ -250,7 +252,10 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
         g2.prefix_reuse = 0;
     g2.cache_slot = slot;
 
+    const auto t0 = std::chrono::steady_clock::now();
     Status st = impl_->generate(ids, g2, out, err);
+    const double wall_s =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (st == Status::Ok) {
         std::vector<int> hist;
         hist.reserve(ids.size() + out.tokens.size());
@@ -268,8 +273,29 @@ Status Engine::generate_ids(const std::vector<int> &ids, const GenParams &gp, Ge
             if (ast != Status::Ok)
                 err.clear();
         }
+        ProfileTurn pt;
+        pt.wall_s = wall_s;
+        pt.prompt_tokens = out.prompt_tokens ? out.prompt_tokens : static_cast<int>(ids.size());
+        pt.completion_tokens =
+            out.completion_tokens ? out.completion_tokens : static_cast<int>(out.tokens.size());
+        TurnPerf pf;
+        turn_perf(pf, false); // mux emit still needs the accumulators
+        pt.expert_disk_s = pf.t_edisk;
+        pt.expert_wait_s = pf.t_ewait;
+        pt.expert_matmul_s = pf.t_emm;
+        pt.attention_s = pf.t_attn;
+        pt.lm_head_s = pf.t_head;
+        pt.forwards = static_cast<uint64_t>(std::max(pt.completion_tokens, 0));
+        record_profile(pt);
     }
     return st;
+}
+
+void Engine::record_profile(const ProfileTurn &turn) {
+    profile_.push_back(turn);
+    if (profile_.size() > 120)
+        profile_.erase(profile_.begin());
+    ++profile_seq_;
 }
 
 KvPersistConfig Engine::make_persist_cfg() const {

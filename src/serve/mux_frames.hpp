@@ -50,10 +50,27 @@ std::string mux_format_perf(uint64_t id, double dt, double t_edisk, double t_ewa
 // ENTROPY h0 h1 …  — per-sparse-layer routing entropy (bits)
 std::string mux_format_entropy(const float *h, int n);
 
+// GPUS n (used_gb total_gb experts)×n
+// n<=0 or null arrays → "GPUS 0\n"
+// used/total use %.2f. Host has no VRAM: callers pass n=0.
+std::string mux_format_gpus(int n, const double *used_gb, const double *total_gb,
+                            const int *experts);
+
+// REPIN layer eid old_tier gpu
+std::string mux_format_repin(int layer, int eid, int old_tier, int gpu);
+
+// PROF wall_s prompt completion edisk ewait emm attn head n_fw
+// Official colibri.c mux_done: "PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n"
+std::string mux_format_prof(double wall_s, int prompt_tokens, int completion_tokens,
+                            double t_edisk, double t_ewait, double t_emm, double t_attn,
+                            double t_head, uint64_t n_fw);
+
 // Concatenate official turn telemetry lines (each formatter already has \n).
+// Order before DONE: HWINFO, PERF, ENTROPY, GPUS, TIERS, EMAP, HITS.
 // hwinfo may be empty (skip). entropy n<=0 skips ENTROPY.
 // emap/hits: rows<=0 or null bytes skips that line.
-// PERF always emitted (zeros ok). TIERS always emitted.
+// PERF always emitted (zeros ok). GPUS always "GPUS 0" (host has no VRAM).
+// TIERS always emitted.
 std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, double dt,
                                   double t_edisk, double t_ewait, double t_emm, double t_attn,
                                   double t_kvb, double t_head, const float *entropy, int n_entropy,

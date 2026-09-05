@@ -149,6 +149,19 @@ struct TurnPerf {
     double t_head = 0;
 };
 
+// Official /profile turn (openai_server.py PROF snapshot). Rolling window of 120.
+struct ProfileTurn {
+    double wall_s = 0;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+    double expert_disk_s = 0;
+    double expert_wait_s = 0;
+    double expert_matmul_s = 0;
+    double attention_s = 0;
+    double lm_head_s = 0;
+    uint64_t forwards = 0;
+};
+
 class FamilyEngine {
 public:
     virtual ~FamilyEngine() = default;

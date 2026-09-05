@@ -1081,6 +1081,17 @@ static void test_offload_generate() {
         ek.turn_perf(pf, true);
         ek.turn_perf(pf, false);
         CHECK(pf.t_attn == 0.0 && pf.t_emm == 0.0 && pf.t_head == 0.0);
+        CHECK(ek.profile_seq() >= 1);
+        std::vector<ProfileTurn> pturns;
+        ek.profile_turns(pturns);
+        CHECK(!pturns.empty());
+        CHECK(pturns.back().completion_tokens > 0);
+        std::string pj = profile_json(&ek, true);
+        CHECK(pj.find("\"seq\":") != std::string::npos);
+        CHECK(pj.find("\"turns\":[") != std::string::npos);
+        CHECK(pj.find("\"wall_s\":") != std::string::npos);
+        CHECK(profile_json(&ek, false) == "{\"seq\":0,\"turns\":[]}");
+        CHECK(profile_json(nullptr) == "{\"seq\":0,\"turns\":[]}");
     }
 
     std::string gdir = tmpdir();
@@ -3786,10 +3797,18 @@ int main() {
         CHECK(perf.back() == '\n');
         float ent[2] = {1.5f, 2.f};
         CHECK(mux_format_entropy(ent, 2) == "ENTROPY 1.5 2\n");
+        CHECK(mux_format_gpus(0, nullptr, nullptr, nullptr) == "GPUS 0\n");
+        double ug[1] = {1.5}, tg[1] = {8.0};
+        int ex[1] = {3};
+        CHECK(mux_format_gpus(1, ug, tg, ex) == "GPUS 1 1.50 8.00 3\n");
+        CHECK(mux_format_repin(2, 7, 1, 0) == "REPIN 2 7 1 0\n");
+        CHECK(mux_format_prof(0.5, 3, 2, 0.1, 0, 0.2, 0.05, 0.01, 2) ==
+              "PROF 0.500 3 2 0.100 0.000 0.200 0.050 0.010 2\n");
         std::string turn = mux_format_turn_telem("HWINFO 1 1.00 1.00 0 0.00 cpu|none", 3, 0.1, 0,
                                                  0, 0, 0, 0, 0, ent, 2, 0, 0, 4, 0.0, 1.0, 1, 2,
                                                  em, 1, 3, hit);
         CHECK(turn.find("HWINFO 1") == 0);
+        CHECK(turn.find("GPUS 0\n") != std::string::npos);
         CHECK(turn.find("PERF 3 ") != std::string::npos);
         CHECK(turn.find("ENTROPY 1.5 2\n") != std::string::npos);
         CHECK(turn.find("TIERS 0 0 4 ") != std::string::npos);

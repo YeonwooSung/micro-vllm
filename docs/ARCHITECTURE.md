@@ -52,7 +52,7 @@ src/quant    MXFP4, int4-g64, int8-row, SiTU-GLU, clamped SwiGLU
 src/store    ExpertStore (MoE LRU + RAM/disk tiers) + BlockStore + COLIKV1 + .coli_usage
 src/tok      whitespace / HF tokenizer.json / raw ids
 src/model    family registry + llama / kimi_k3 / glm53 / h3 (+ canvas, DiT schedule)
-src/serve    OpenAI HTTP + GET /experts + mux TOOL/TOPK/HITS/EMAP telemetry frames
+src/serve    OpenAI HTTP + GET /experts /profile + mux TOOL/TOPK/HITS/EMAP/GPUS/PROF
 src/legacy   original CUDA Llama demo
 ```
 
@@ -256,8 +256,11 @@ ENTROPY. Mux emits mid-turn `HITS` every 6 tokens. PERF `dt` is wall
 seconds since ACCEPT; `t_edisk`/`t_ewait` come from ExpertStore I/O,
 `t_attn`/`t_emm`/`t_head` from K3/GLM phase timers (`turn_perf`).
 DONE STAT fills `tok_s`, cache `hit_pct`, and `rss_gb`.
+Turn telem includes host `GPUS 0` and a `PROF` line (wall/tokens/phases).
 `GET /experts` returns `{rows,cols,map,hits,seq}`
 (`mux_format_experts_json`; empty unless authed).
+`GET /profile` returns a rolling 120-turn PROF window
+(`profile_json`; empty unless authed). `mux_format_repin` is the REPIN line.
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.

@@ -661,6 +661,41 @@ std::string experts_json(Engine *engine, bool authed) {
                                   static_cast<int>(rt.entropy.size()));
 }
 
+std::string profile_json(Engine *engine, bool authed) {
+    if (!engine || !authed)
+        return "{\"seq\":0,\"turns\":[]}";
+    std::vector<ProfileTurn> turns;
+    engine->profile_turns(turns);
+    std::ostringstream os;
+    os << "{\"seq\":" << engine->profile_seq() << ",\"turns\":[";
+    char fbuf[32];
+    auto append_f = [&](double v) {
+        std::snprintf(fbuf, sizeof(fbuf), "%.3f", v);
+        os << fbuf;
+    };
+    for (size_t i = 0; i < turns.size(); ++i) {
+        if (i)
+            os << ',';
+        const ProfileTurn &t = turns[i];
+        os << "{\"wall_s\":";
+        append_f(t.wall_s);
+        os << ",\"prompt_tokens\":" << t.prompt_tokens << ",\"completion_tokens\":"
+           << t.completion_tokens << ",\"expert_disk_s\":";
+        append_f(t.expert_disk_s);
+        os << ",\"expert_wait_s\":";
+        append_f(t.expert_wait_s);
+        os << ",\"expert_matmul_s\":";
+        append_f(t.expert_matmul_s);
+        os << ",\"attention_s\":";
+        append_f(t.attention_s);
+        os << ",\"lm_head_s\":";
+        append_f(t.lm_head_s);
+        os << ",\"forwards\":" << static_cast<unsigned long long>(t.forwards) << '}';
+    }
+    os << "]}";
+    return os.str();
+}
+
 std::string openai_model_object(const std::string &id) {
     return "{\"id\":\"" + json_escape(id) +
            "\",\"object\":\"model\",\"created\":0,\"owned_by\":\"micro-vllm\"}";
@@ -835,7 +870,8 @@ void HttpServer::handle_client(int cfd) {
 
         const bool v1 = path.size() >= 4 && path.compare(0, 4, "/v1/") == 0;
         if (method == "OPTIONS" &&
-            (path == "/health" || path == "/experts" || path == "/metrics" || v1)) {
+            (path == "/health" || path == "/experts" || path == "/profile" || path == "/metrics" ||
+             v1)) {
             http_options(cfd);
             ::close(cfd);
             return;
@@ -851,6 +887,9 @@ void HttpServer::handle_client(int cfd) {
             http_reply(cfd, 200, "OK", health_json(engine_), request_id);
         } else if (method == "GET" && path == "/experts") {
             http_reply(cfd, 200, "OK", experts_json(engine_, api_key_ok(authorization, x_api_key)),
+                       request_id);
+        } else if (method == "GET" && path == "/profile") {
+            http_reply(cfd, 200, "OK", profile_json(engine_, api_key_ok(authorization, x_api_key)),
                        request_id);
         } else if (method == "GET" && (path == "/metrics" || path == "/v1/metrics")) {
             uint64_t requests = 0;
