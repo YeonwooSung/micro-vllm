@@ -890,6 +890,18 @@ std::string metrics_json(uint64_t requests, uint64_t tokens_out, int kv_slots, i
     return os.str();
 }
 
+std::string tokenize_response(const std::vector<int> &ids) {
+    std::ostringstream os;
+    os << "{\"count\":" << ids.size() << ",\"tokens\":[";
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (i)
+            os << ',';
+        os << ids[i];
+    }
+    os << "]}";
+    return os.str();
+}
+
 HttpServer::HttpServer() = default;
 
 HttpServer::~HttpServer() {
@@ -1063,7 +1075,7 @@ void HttpServer::handle_client(int cfd) {
         const bool v1 = path.size() >= 4 && path.compare(0, 4, "/v1/") == 0;
         if (method == "OPTIONS" &&
             (path == "/health" || path == "/experts" || path == "/profile" || path == "/metrics" ||
-             v1)) {
+             path == "/tokenize" || v1)) {
             http_options(cfd);
             ::close(cfd);
             return;
@@ -1117,6 +1129,49 @@ void HttpServer::handle_client(int cfd) {
                 http_reply(cfd, 200, "OK", openai_model_object(id), request_id);
             else
                 http_reply(cfd, 404, "Not Found", "{\"error\":\"not found\"}", request_id);
+        } else if (method == "POST" && (path == "/tokenize" || path == "/v1/tokenize")) {
+            if (!engine_) {
+                http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",
+                           request_id);
+                ::close(cfd);
+                return;
+            }
+            std::string prompt;
+            std::vector<ChatMessage> msgs;
+            extract_json_string(body, "prompt", prompt);
+            extract_chat_messages(body, msgs);
+            if (prompt.empty() && msgs.empty()) {
+                http_reply(cfd, 400, "Bad Request",
+                           "{\"error\":\"prompt or messages required\"}", request_id);
+                ::close(cfd);
+                return;
+            }
+            GenParams gp;
+            extract_json_string(body, "reasoning_effort", gp.reasoning_effort);
+            bool enable_thinking = false;
+            if (!msgs.empty() && engine_->family() == Family::Glm53)
+                enable_thinking = true;
+            bool parsed_think = false;
+            if (extract_json_bool(body, "enable_thinking", enable_thinking))
+                parsed_think = true;
+            if (gp.reasoning_effort == "none")
+                enable_thinking = false;
+            else if (!parsed_think && !gp.reasoning_effort.empty() &&
+                     gp.reasoning_effort != "none")
+                enable_thinking = true;
+            gp.think = enable_thinking;
+            if (gp.tools.empty())
+                k3_extract_tools_json(body, gp.tools);
+            std::vector<int> ids;
+            std::string gerr;
+            const bool chat = !msgs.empty();
+            if (!tokenize_request(engine_, msgs, prompt, chat, gp, ids, gerr)) {
+                http_reply(cfd, 400, "Bad Request",
+                           "{\"error\":\"" + json_escape(gerr) + "\"}", request_id);
+                ::close(cfd);
+                return;
+            }
+            http_reply(cfd, 200, "OK", tokenize_response(ids), request_id);
         } else if (method == "POST" && path == "/v1/messages") {
             if (!engine_) {
                 http_reply(cfd, 503, "Service Unavailable", "{\"error\":\"no engine\"}",

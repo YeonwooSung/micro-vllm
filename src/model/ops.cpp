@@ -4,6 +4,7 @@
 #include "../tok/sample_nuc.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -26,6 +27,16 @@ void l2_normalize(float *x, int n, float eps) {
     for (int i = 0; i < n; ++i)
         x[i] *= inv;
 }
+
+struct AccTimer {
+    double *acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit AccTimer(double *a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~AccTimer() {
+        if (acc)
+            *acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 } // namespace
 
@@ -952,7 +963,7 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
               const float *qa_ln, const quant::QuantMat *w_qb, const quant::QuantMat *w_kva,
               const float *kva_ln, const quant::QuantMat *w_kt, const quant::QuantMat *w_v,
               const quant::QuantMat *w_o, const quant::QuantMat *w_g, float *cache, int pos,
-              float *y, float eps, const int *selected, int n_sel) {
+              float *y, float eps, const int *selected, int n_sel, double *t_kvb) {
     if (!x || !y || hidden <= 0 || pos < 0)
         return;
     const int H = mla.n_heads > 0 ? mla.n_heads : 1;
@@ -995,12 +1006,15 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
     else if (w_qa && !w_qa->empty())
         std::memcpy(q.data(), qa.data(), std::min(q.size(), qa.size()) * sizeof(float));
 
-    float *crow = cache + static_cast<size_t>(pos) * stride;
-    w_kva->gemm(crow, x, 1);
-    if (kva_ln)
-        quant::rmsnorm(crow, kva_ln, crow, L, eps);
-    if (R > 0 && !mla.nope && mla.rope_theta > 0.f)
-        apply_rope(crow + L, R, pos, mla.rope_theta);
+    {
+        AccTimer t(t_kvb);
+        float *crow = cache + static_cast<size_t>(pos) * stride;
+        w_kva->gemm(crow, x, 1);
+        if (kva_ln)
+            quant::rmsnorm(crow, kva_ln, crow, L, eps);
+        if (R > 0 && !mla.nope && mla.rope_theta > 0.f)
+            apply_rope(crow + L, R, pos, mla.rope_theta);
+    }
     if (R > 0 && !mla.nope && mla.rope_theta > 0.f) {
         for (int h = 0; h < H; ++h)
             apply_rope(q.data() + static_cast<size_t>(h) * QH + QK, R, pos, mla.rope_theta);

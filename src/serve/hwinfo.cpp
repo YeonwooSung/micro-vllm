@@ -12,6 +12,8 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <sys/sysctl.h>
+#else
+#include <dirent.h>
 #endif
 
 namespace mvllm {
@@ -46,6 +48,17 @@ void probe_ram(HwInfo &info) {
     const double pages =
         static_cast<double>(vs.free_count + vs.inactive_count + vs.purgeable_count);
     info.ram_avail_gb = pages * static_cast<double>(page) / 1e9;
+}
+
+void probe_gpu(HwInfo &info) {
+    char brand[256] = {};
+    std::size_t n = sizeof(brand);
+    if (sysctlbyname("machdep.gpu.brand_string", brand, &n, nullptr, 0) == 0 && brand[0])
+        info.gpu = brand;
+    else
+        info.gpu = "apple";
+    info.ngpu = 1;
+    // unified memory: leave vram_total_gb at 0
 }
 
 #else
@@ -83,6 +96,49 @@ void probe_ram(HwInfo &info) {
     }
 }
 
+void probe_gpu(HwInfo &info) {
+    if (DIR *d = ::opendir("/proc/driver/nvidia/gpus")) {
+        int n = 0;
+        while (const dirent *e = ::readdir(d)) {
+            if (e->d_name[0] == '.')
+                continue;
+            ++n;
+            if (!info.gpu.empty())
+                continue;
+            std::ifstream in(std::string("/proc/driver/nvidia/gpus/") + e->d_name +
+                             "/information");
+            std::string line;
+            while (in && std::getline(in, line)) {
+                if (line.compare(0, 6, "Model:") != 0)
+                    continue;
+                std::size_t i = 6;
+                while (i < line.size() && line[i] == ' ')
+                    ++i;
+                if (i < line.size())
+                    info.gpu = line.substr(i);
+                break;
+            }
+        }
+        ::closedir(d);
+        info.ngpu = n > 0 ? n : 1;
+        if (info.gpu.empty())
+            info.gpu = "nvidia";
+        return;
+    }
+    if (access("/sys/class/drm/card0", F_OK) != 0)
+        return;
+    info.ngpu = 1;
+    std::ifstream in("/sys/class/drm/card0/device/product_name");
+    std::string name;
+    if (in && std::getline(in, name)) {
+        std::size_t i = 0;
+        while (i < name.size() && name[i] == ' ')
+            ++i;
+        if (i < name.size())
+            info.gpu = name.substr(i);
+    }
+}
+
 #endif
 
 void probe_cores(HwInfo &info) {
@@ -101,6 +157,7 @@ HwInfo hw_probe() {
     probe_cpu(info);
     probe_cores(info);
     probe_ram(info);
+    probe_gpu(info);
     return info;
 }
 

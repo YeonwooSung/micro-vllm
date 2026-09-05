@@ -936,6 +936,14 @@ static void test_config_and_families() {
     hp.output_path = hdir + "/out.txt";
     H3GenResult hr;
     CHECK(eh.generate_video(hp, hr, err) == Status::Ok);
+    {
+        TurnPerf hpf;
+        eh.turn_perf(hpf, false);
+        CHECK(hpf.t_attn > 0.0 || hpf.t_emm > 0.0);
+        eh.turn_perf(hpf, true);
+        eh.turn_perf(hpf, false);
+        CHECK(hpf.t_attn == 0.0 && hpf.t_emm == 0.0);
+    }
     CHECK(hr.blocks_streamed == 8); // 2 evals * 4 layers
     CHECK(!hr.output_path.empty());
     CHECK(hr.audio_used);
@@ -3152,6 +3160,13 @@ int main() {
         GenResult lout;
         CHECK(le->generate({1, 2}, lgp, lout, lerr) == Status::Ok);
         CHECK(static_cast<int>(lout.tokens.size()) == 2);
+        TurnPerf lpf;
+        le->turn_perf(lpf, false);
+        CHECK(lpf.t_attn > 0.0);
+        CHECK(lpf.t_head > 0.0);
+        le->turn_perf(lpf, true);
+        le->turn_perf(lpf, false);
+        CHECK(lpf.t_attn == 0.0 && lpf.t_head == 0.0);
     }
     {
         using namespace mvllm;
@@ -3857,7 +3872,7 @@ int main() {
                                                  0, 0, 0, 0, 0, ent, 2, 0, 0, 4, 0.0, 1.0, 1, 2,
                                                  em, 1, 3, hit);
         CHECK(turn.find("HWINFO 1") == 0);
-        CHECK(turn.find("GPUS 0\n") != std::string::npos);
+        CHECK(turn.find("GPUS ") != std::string::npos);
         CHECK(turn.find("PERF 3 ") != std::string::npos);
         CHECK(turn.find("ENTROPY 1.5 2\n") != std::string::npos);
         CHECK(turn.find("TIERS 0 0 4 ") != std::string::npos);
@@ -4064,8 +4079,10 @@ int main() {
         HwInfo hi = hw_probe();
         CHECK(hi.cores > 0);
         CHECK(hi.ram_total_gb > 0.0);
-        CHECK(hi.ngpu == 0);
-        CHECK(hi.vram_total_gb == 0.0);
+        CHECK(hi.ngpu >= 0);
+        CHECK(hi.vram_total_gb >= 0.0);
+        if (hi.ngpu > 0)
+            CHECK(!hi.gpu.empty());
         CHECK(!hi.cpu.empty());
         CHECK(rss_gb() >= 0.0);
         std::string line = mux_format_hwinfo(hi.cores, hi.ram_total_gb, hi.ram_avail_gb, hi.ngpu,
@@ -4583,6 +4600,16 @@ int main() {
         uint32_t cps[8];
         CHECK(utf8_decode_all(e, 2, cps, 8) == 1 && cps[0] == 0xE9);
         CHECK(utf8_next(A, 1, 5, &cp) == 0);
+        CHECK(uni_is_L('A') && uni_is_L('z') && uni_is_L(0x4E00) && uni_is_L(0xAC00));
+        CHECK(!uni_is_L('0') && !uni_is_L(' ') && !uni_is_L(0x3000));
+        CHECK(uni_is_N('0') && uni_is_N(0xFF10) && !uni_is_N('A'));
+        CHECK(uni_is_S(' ') && uni_is_S(0x3000) && !uni_is_S('A'));
+        std::string tokj = tokenize_response({1, 2, 3});
+        CHECK(tokj.find("\"count\":3") != std::string::npos);
+        CHECK(tokj.find("1,2,3") != std::string::npos);
+        std::string ping = anthropic_sse_ping();
+        CHECK(ping.find("event: ping") != std::string::npos);
+        CHECK(ping.find("\"type\":\"ping\"") != std::string::npos);
     }
     {
         using namespace mvllm;

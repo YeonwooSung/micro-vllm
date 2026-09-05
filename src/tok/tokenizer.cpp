@@ -1,5 +1,6 @@
 #include "tokenizer.hpp"
 #include "glm_tools.hpp"
+#include "utf8.hpp"
 
 #define JSON_USE_IMPLICIT_CONVERSIONS 0
 #include "json.hpp"
@@ -134,11 +135,11 @@ bool is_han(uint32_t c) {
 bool is_nl(uint32_t c) { return c == '\r' || c == '\n'; }
 
 bool is_num(uint32_t c) {
-    return (c >= '0' && c <= '9') || (c >= 0xff10 && c <= 0xff19);
+    return uni_is_N(c);
 }
 
 bool is_space(uint32_t c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == 0xa0 || c == 0x3000;
+    return uni_is_S(c);
 }
 
 bool is_cjk_punct(uint32_t c) {
@@ -157,21 +158,7 @@ bool is_cjk_punct(uint32_t c) {
 bool is_letter(uint32_t c, bool exclude_han) {
     if (exclude_han && is_han(c))
         return false;
-    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))
-        return true;
-    if (c >= 0xff21 && c <= 0xff3a)
-        return true;
-    if (c >= 0xff41 && c <= 0xff5a)
-        return true;
-    if (c < 0xc0)
-        return false;
-    if (is_num(c) || is_space(c) || is_nl(c) || is_cjk_punct(c))
-        return false;
-    if (c == 0xd7 || c == 0xf7)
-        return false;
-    if (is_han(c))
-        return !exclude_han;
-    return c >= 0xc0;
+    return uni_is_L(c);
 }
 
 bool is_upper(uint32_t c) {

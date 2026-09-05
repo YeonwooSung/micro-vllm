@@ -292,7 +292,8 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
               const float *qa_ln, const quant::QuantMat *w_qb, const quant::QuantMat *w_kva,
               const float *kva_ln, const quant::QuantMat *w_kt, const quant::QuantMat *w_v,
               const quant::QuantMat *w_o, const quant::QuantMat *w_g, float *cache, int pos,
-              float *y, float eps, const int *selected = nullptr, int n_sel = 0);
+              float *y, float eps, const int *selected = nullptr, int n_sel = 0,
+              double *t_kvb = nullptr);
 
 int dsa_index_width(const DsaConfig &dsa);
 // Score k-pool groups with ReLU(q·k), take top-k pools, optional tail. Unused slots = -1.

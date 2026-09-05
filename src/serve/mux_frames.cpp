@@ -1,4 +1,5 @@
 #include "mux_frames.hpp"
+#include "hwinfo.hpp"
 
 #include <cstdio>
 #include <string>
@@ -294,7 +295,18 @@ std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, d
     out.append(mux_format_perf(id, dt, t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head));
     if (n_entropy > 0)
         out.append(mux_format_entropy(entropy, n_entropy));
-    out.append(mux_format_gpus(0, nullptr, nullptr, nullptr));
+    {
+        const HwInfo h = hw_probe();
+        if (h.ngpu > 0) {
+            const int n = h.ngpu;
+            std::vector<double> used(static_cast<size_t>(n), 0.0);
+            std::vector<double> total(static_cast<size_t>(n), h.vram_total_gb);
+            std::vector<int> experts(static_cast<size_t>(n), 0);
+            out.append(mux_format_gpus(n, used.data(), total.data(), experts.data()));
+        } else {
+            out.append(mux_format_gpus(0, nullptr, nullptr, nullptr));
+        }
+    }
     out.append(mux_format_tiers(vram, ram, disk, vram_gb, ram_gb));
     if (emap_rows > 0 && emap)
         out.append(mux_format_emap(emap_rows, emap_cols, emap));

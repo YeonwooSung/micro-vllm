@@ -155,8 +155,7 @@ and run smoke against those trees. Official GLM FP8 experts need
 `python/convert_glm53.py` first. K3 official MXFP4 loads without `k3_repack.py`.
 
 Not absorbed yet: none from the host-migration plan
-(`/health` running/queued, smoke `format_shard_report_json`, Anthropic
-SSE `usage` also in).
+(hwinfo GPU probe, mux `GPUS` from probe, POST `/tokenize` also in).
 
 Tokenizer: rank-BPE when `merges` is empty (Kimi tiktoken), cl100k BPE otherwise.
 A K3 HF dir with only `tiktoken.model` (+ optional `tokenizer_config.json`)

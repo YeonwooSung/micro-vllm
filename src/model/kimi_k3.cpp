@@ -345,7 +345,7 @@ public:
                              d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
                              &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
                              mla_cache[l].empty() ? nullptr : mla_cache[l].data(), pos, y.data(),
-                             cfg_.rms_eps);
+                             cfg_.rms_eps, nullptr, 0, &t_kvb_);
                 }
                 if (attnres) {
                     if (snap)
@@ -459,7 +459,7 @@ public:
                                  d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
                                  &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
                                  mla_cache[l].empty() ? nullptr : mla_cache[l].data(), pos + c,
-                                 y.data(), cfg_.rms_eps);
+                                 y.data(), cfg_.rms_eps, nullptr, 0, &t_kvb_);
                     }
                     if (attnres) {
                         if (snap)
@@ -721,10 +721,10 @@ public:
         store_.take_io_perf(out.t_edisk, out.t_ewait, reset);
         out.t_emm = t_emm_;
         out.t_attn = t_attn_;
-        out.t_kvb = 0;
+        out.t_kvb = t_kvb_;
         out.t_head = t_head_;
         if (reset)
-            t_emm_ = t_attn_ = t_head_ = 0;
+            t_emm_ = t_attn_ = t_kvb_ = t_head_ = 0;
     }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
@@ -1132,7 +1132,7 @@ private:
                          d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
                          &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
                          s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), s.pos,
-                         y.data(), cfg_.rms_eps);
+                         y.data(), cfg_.rms_eps, nullptr, 0, &t_kvb_);
             }
             if (attnres) {
                 if (snap)
@@ -1251,7 +1251,7 @@ private:
                              d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
                              &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
                              s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), s.pos,
-                             y.data(), cfg_.rms_eps);
+                             y.data(), cfg_.rms_eps, nullptr, 0, &t_kvb_);
                 }
                 if (attnres) {
                     if (snap)
@@ -1396,7 +1396,7 @@ private:
                                  d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
                                  &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
                                  s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(),
-                                 s.pos + c, y.data(), cfg_.rms_eps);
+                                 s.pos + c, y.data(), cfg_.rms_eps, nullptr, 0, &t_kvb_);
                     }
                     if (attnres) {
                         if (snap)
@@ -2058,7 +2058,7 @@ private:
     RouteTrace trace_;
     std::vector<uint8_t> ehit_;
     std::vector<uint32_t> turn_c_;
-    double t_attn_ = 0, t_emm_ = 0, t_head_ = 0;
+    double t_attn_ = 0, t_emm_ = 0, t_kvb_ = 0, t_head_ = 0;
 };
 
 std::unique_ptr<FamilyEngine> make_kimi_k3() { return std::make_unique<KimiK3Engine>(); }

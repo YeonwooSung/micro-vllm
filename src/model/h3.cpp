@@ -12,6 +12,7 @@
 #include "../quant/quant.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -125,6 +126,15 @@ void expand_patch_rows(const float *rows, int tokens, int patch, int hidden, flo
             out[static_cast<size_t>(i) * hidden + d] =
                 rows[static_cast<size_t>(i) * patch + (d % patch)];
 }
+
+struct AccTimer {
+    double &acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit AccTimer(double &a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~AccTimer() {
+        acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 } // namespace
 
@@ -284,35 +294,40 @@ public:
         const int patch = 96;
         int tokens = 0;
         std::vector<float> rows;
-        if (can_patch) {
-            tokens = vg.latent_t * (vg.latent_h / 2) * (vg.latent_w / 2);
-            rows.assign(static_cast<size_t>(tokens) * patch, 0.f);
-            h3_dit_patchify(z.data(), C, vg.latent_t, vg.latent_h, vg.latent_w, rows.data());
-        } else {
-            tokens = std::max(nlat, 1);
-            rows.assign(static_cast<size_t>(tokens) * patch, 0.f);
-            for (int i = 0; i < tokens; ++i)
-                for (int d = 0; d < patch; ++d)
-                    rows[static_cast<size_t>(i) * patch + d] = z[static_cast<size_t>(d % C) * nlat + i];
-        }
-        const int cap = 256;
-        if (tokens > cap) {
-            const int keep = cap;
-            std::vector<float> slim(static_cast<size_t>(keep) * patch);
-            for (int i = 0; i < keep; ++i) {
-                int src = i * tokens / keep;
-                std::memcpy(slim.data() + static_cast<size_t>(i) * patch,
-                            rows.data() + static_cast<size_t>(src) * patch,
-                            static_cast<size_t>(patch) * sizeof(float));
+        std::vector<float> latent;
+        {
+            AccTimer t(t_emm_);
+            if (can_patch) {
+                tokens = vg.latent_t * (vg.latent_h / 2) * (vg.latent_w / 2);
+                rows.assign(static_cast<size_t>(tokens) * patch, 0.f);
+                h3_dit_patchify(z.data(), C, vg.latent_t, vg.latent_h, vg.latent_w, rows.data());
+            } else {
+                tokens = std::max(nlat, 1);
+                rows.assign(static_cast<size_t>(tokens) * patch, 0.f);
+                for (int i = 0; i < tokens; ++i)
+                    for (int d = 0; d < patch; ++d)
+                        rows[static_cast<size_t>(i) * patch + d] =
+                            z[static_cast<size_t>(d % C) * nlat + i];
             }
-            rows.swap(slim);
-            tokens = keep;
+            const int cap = 256;
+            if (tokens > cap) {
+                const int keep = cap;
+                std::vector<float> slim(static_cast<size_t>(keep) * patch);
+                for (int i = 0; i < keep; ++i) {
+                    int src = i * tokens / keep;
+                    std::memcpy(slim.data() + static_cast<size_t>(i) * patch,
+                                rows.data() + static_cast<size_t>(src) * patch,
+                                static_cast<size_t>(patch) * sizeof(float));
+                }
+                rows.swap(slim);
+                tokens = keep;
+            }
+            latent.assign(static_cast<size_t>(tokens) * hidden, 0.f);
+            for (int i = 0; i < tokens; ++i)
+                for (int d = 0; d < hidden; ++d)
+                    latent[static_cast<size_t>(i) * hidden + d] =
+                        rows[static_cast<size_t>(i) * patch + (d % patch)];
         }
-        std::vector<float> latent(static_cast<size_t>(tokens) * hidden, 0.f);
-        for (int i = 0; i < tokens; ++i)
-            for (int d = 0; d < hidden; ++d)
-                latent[static_cast<size_t>(i) * hidden + d] =
-                    rows[static_cast<size_t>(i) * patch + (d % patch)];
 
         const int audio_t = h3_audio_t(vg.frames);
         const int AC = kH3AudioChannels;
@@ -339,12 +354,15 @@ public:
         }
         int audio_rows = audio_t * kH3AudioStereo;
         std::vector<float> arows(static_cast<size_t>(audio_rows) * AC, 0.f);
-        h3_dit_pack_audio(az.data(), AC, audio_t, arows.data());
         std::vector<float> alatent(static_cast<size_t>(audio_rows) * hidden, 0.f);
-        for (int i = 0; i < audio_rows; ++i)
-            for (int d = 0; d < hidden; ++d)
-                alatent[static_cast<size_t>(i) * hidden + d] =
-                    arows[static_cast<size_t>(i) * AC + (d % AC)];
+        {
+            AccTimer t(t_emm_);
+            h3_dit_pack_audio(az.data(), AC, audio_t, arows.data());
+            for (int i = 0; i < audio_rows; ++i)
+                for (int d = 0; d < hidden; ++d)
+                    alatent[static_cast<size_t>(i) * hidden + d] =
+                        arows[static_cast<size_t>(i) * AC + (d % AC)];
+        }
 
         int text_tokens = 0;
         std::vector<float> tproj;
@@ -398,6 +416,7 @@ public:
                 if (text_tokens > 16)
                     text_tokens = 16;
                 tproj.assign(static_cast<size_t>(text_tokens) * hidden, 0.f);
+                AccTimer tm(t_emm_);
                 if (!cond_w_.empty() && static_cast<int>(cond_w_.size()) >= hidden * thid) {
                     quant::matmul_f32(tproj.data(), th.data(), cond_w_.data(), text_tokens, thid,
                                       hidden);
@@ -484,6 +503,7 @@ public:
                 std::vector<float> zc(static_cast<size_t>(C) * lh * lw, 0.f);
                 vae_.encode(ergb.data(), eg, zc.data());
                 std::vector<float> prows(static_cast<size_t>(cells) * patch, 0.f);
+                AccTimer t(t_emm_);
                 if (h3_dit_patchify(zc.data(), C, 1, lh, lw, prows.data()) != cells * patch) {
                     pack_ok = false;
                     break;
@@ -492,6 +512,7 @@ public:
                 packed_rows += cells;
             }
             if (pack_ok && packed_rows == layout.img_cond_rows && packed_rows > 0) {
+                AccTimer t(t_emm_);
                 cond_rows = packed_rows;
                 clatent.assign(static_cast<size_t>(cond_rows) * hidden, 0.f);
                 expand_patch_rows(packed_cond.data(), cond_rows, patch, hidden, clatent.data());
@@ -499,6 +520,7 @@ public:
         }
 
         if (text_tokens > 0 || cond_rows > 0) {
+            AccTimer t(t_emm_);
             std::vector<float> packed(
                 static_cast<size_t>(text_tokens + cond_rows + audio_rows + tokens) * hidden);
             float *dst = packed.data();
@@ -520,6 +542,7 @@ public:
             std::memcpy(dst, latent.data(), static_cast<size_t>(tokens) * hidden * sizeof(float));
             latent.swap(packed);
         } else if (audio_rows > 0) {
+            AccTimer t(t_emm_);
             std::vector<float> packed(static_cast<size_t>(audio_rows + tokens) * hidden);
             std::memcpy(packed.data(), alatent.data(),
                         static_cast<size_t>(audio_rows) * hidden * sizeof(float));
@@ -638,12 +661,15 @@ public:
                         }
                     }
                     if (!mod.empty() || r_cos) {
+                        AccTimer t(t_attn_);
                         h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
                                          latent.data(), seq, 1e-6f,
                                          mod.empty() ? nullptr : mod.data(), qn, kn, r_cos, r_sin);
-                    } else
+                    } else {
+                        AccTimer t(t_attn_);
                         gpu::dit_block(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
                                        latent.data(), seq, 1e-6f);
+                    }
                     ++computed;
                 }
                 if (hp.ssd_streaming) {
@@ -680,21 +706,24 @@ public:
                 }
             }
         }
-        unpack_z();
-        if (audio_rows > 0) {
-            const float *aud = latent.data() + static_cast<size_t>(audio_off) * hidden;
-            for (int i = 0; i < audio_rows; ++i)
-                for (int d = 0; d < AC; ++d) {
-                    float acc = 0.f;
-                    int n = 0;
-                    for (int h = d; h < hidden; h += AC) {
-                        acc += aud[static_cast<size_t>(i) * hidden + h];
-                        ++n;
+        {
+            AccTimer t(t_emm_);
+            unpack_z();
+            if (audio_rows > 0) {
+                const float *aud = latent.data() + static_cast<size_t>(audio_off) * hidden;
+                for (int i = 0; i < audio_rows; ++i)
+                    for (int d = 0; d < AC; ++d) {
+                        float acc = 0.f;
+                        int n = 0;
+                        for (int h = d; h < hidden; h += AC) {
+                            acc += aud[static_cast<size_t>(i) * hidden + h];
+                            ++n;
+                        }
+                        arows[static_cast<size_t>(i) * AC + d] =
+                            n > 0 ? acc / static_cast<float>(n) : 0.f;
                     }
-                    arows[static_cast<size_t>(i) * AC + d] =
-                        n > 0 ? acc / static_cast<float>(n) : 0.f;
-                }
-            h3_dit_unpack_audio(arows.data(), AC, audio_t, az.data());
+                h3_dit_unpack_audio(arows.data(), AC, audio_t, az.data());
+            }
         }
         float checksum = 0.f;
         for (float v : latent)
@@ -826,6 +855,14 @@ public:
             out.note += " mux=skip";
         err.clear();
         return Status::Ok;
+    }
+
+    void turn_perf(TurnPerf &out, bool reset) override {
+        out = {};
+        out.t_attn = t_attn_;
+        out.t_emm = t_emm_;
+        if (reset)
+            t_attn_ = t_emm_ = 0;
     }
 
     std::string describe() const override {
@@ -1066,6 +1103,7 @@ private:
     std::vector<std::vector<float>> adaln_w_, adaln_b_, q_norm_, k_norm_;
     H3TextEncoder text_;
     H3VisionEncoder vision_;
+    double t_attn_ = 0, t_emm_ = 0;
 };
 
 std::unique_ptr<FamilyEngine> make_h3() { return std::make_unique<H3Engine>(); }

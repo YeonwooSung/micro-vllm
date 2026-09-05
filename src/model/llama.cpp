@@ -6,6 +6,7 @@
 #include "../tok/gbnf.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -56,6 +57,15 @@ int sample_penalized(const float *logits, int vocab, const GenParams &gp, const 
     }
     return tok;
 }
+
+struct AccTimer {
+    double &acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit AccTimer(double &a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~AccTimer() {
+        acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 } // namespace
 
@@ -152,63 +162,67 @@ public:
             for (int l = 0; l < cfg_.n_layers; ++l) {
                 quant::rmsnorm(h.data(), in_n_[static_cast<size_t>(l)].data(), nrm.data(), H,
                                cfg_.rms_eps);
-                if (layer_gqa(l) && tpos < Tmax) {
-                    quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
-                                      qd);
-                    quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(), 1, H,
-                                      kvd);
-                    quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(), 1, H,
-                                      kvd);
-                    for (int hh = 0; hh < nq; ++hh)
-                        apply_rope(q.data() + hh * hd, hd, tpos, theta);
-                    for (int hh = 0; hh < nkv; ++hh)
-                        apply_rope(k.data() + hh * hd, hd, tpos, theta);
-                    std::memcpy(k_cache[static_cast<size_t>(l)].data() +
-                                    static_cast<size_t>(tpos) * kvd,
-                                k.data(), static_cast<size_t>(kvd) * sizeof(float));
-                    std::memcpy(v_cache[static_cast<size_t>(l)].data() +
-                                    static_cast<size_t>(tpos) * kvd,
-                                v.data(), static_cast<size_t>(kvd) * sizeof(float));
-                    std::fill(ctx.begin(), ctx.end(), 0.f);
-                    const int past = tpos + 1;
-                    std::vector<float> sc(static_cast<size_t>(past));
-                    for (int hh = 0; hh < nq; ++hh) {
-                        const int kh = std::min(hh / group, nkv - 1);
-                        const float *qh = q.data() + hh * hd;
-                        float mx = -1e30f;
-                        for (int s = 0; s < past; ++s) {
-                            const float *kk = k_cache[static_cast<size_t>(l)].data() +
-                                              static_cast<size_t>(s) * kvd + kh * hd;
-                            float acc = 0.f;
-                            for (int d0 = 0; d0 < hd; ++d0)
-                                acc += qh[d0] * kk[d0];
-                            sc[static_cast<size_t>(s)] = acc * scale;
-                            if (sc[static_cast<size_t>(s)] > mx)
-                                mx = sc[static_cast<size_t>(s)];
+                {
+                    AccTimer t(t_attn_);
+                    if (layer_gqa(l) && tpos < Tmax) {
+                        quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(),
+                                          1, H, qd);
+                        quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(),
+                                          1, H, kvd);
+                        quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(),
+                                          1, H, kvd);
+                        for (int hh = 0; hh < nq; ++hh)
+                            apply_rope(q.data() + hh * hd, hd, tpos, theta);
+                        for (int hh = 0; hh < nkv; ++hh)
+                            apply_rope(k.data() + hh * hd, hd, tpos, theta);
+                        std::memcpy(k_cache[static_cast<size_t>(l)].data() +
+                                        static_cast<size_t>(tpos) * kvd,
+                                    k.data(), static_cast<size_t>(kvd) * sizeof(float));
+                        std::memcpy(v_cache[static_cast<size_t>(l)].data() +
+                                        static_cast<size_t>(tpos) * kvd,
+                                    v.data(), static_cast<size_t>(kvd) * sizeof(float));
+                        std::fill(ctx.begin(), ctx.end(), 0.f);
+                        const int past = tpos + 1;
+                        std::vector<float> sc(static_cast<size_t>(past));
+                        for (int hh = 0; hh < nq; ++hh) {
+                            const int kh = std::min(hh / group, nkv - 1);
+                            const float *qh = q.data() + hh * hd;
+                            float mx = -1e30f;
+                            for (int s = 0; s < past; ++s) {
+                                const float *kk = k_cache[static_cast<size_t>(l)].data() +
+                                                  static_cast<size_t>(s) * kvd + kh * hd;
+                                float acc = 0.f;
+                                for (int d0 = 0; d0 < hd; ++d0)
+                                    acc += qh[d0] * kk[d0];
+                                sc[static_cast<size_t>(s)] = acc * scale;
+                                if (sc[static_cast<size_t>(s)] > mx)
+                                    mx = sc[static_cast<size_t>(s)];
+                            }
+                            float z = 0.f;
+                            for (int s = 0; s < past; ++s) {
+                                sc[static_cast<size_t>(s)] =
+                                    std::exp(sc[static_cast<size_t>(s)] - mx);
+                                z += sc[static_cast<size_t>(s)];
+                            }
+                            if (z <= 0.f)
+                                z = 1.f;
+                            float *oh = ctx.data() + hh * hd;
+                            for (int s = 0; s < past; ++s) {
+                                const float *vv = v_cache[static_cast<size_t>(l)].data() +
+                                                  static_cast<size_t>(s) * kvd + kh * hd;
+                                const float a = sc[static_cast<size_t>(s)] / z;
+                                for (int d0 = 0; d0 < hd; ++d0)
+                                    oh[d0] += a * vv[d0];
+                            }
                         }
-                        float z = 0.f;
-                        for (int s = 0; s < past; ++s) {
-                            sc[static_cast<size_t>(s)] = std::exp(sc[static_cast<size_t>(s)] - mx);
-                            z += sc[static_cast<size_t>(s)];
-                        }
-                        if (z <= 0.f)
-                            z = 1.f;
-                        float *oh = ctx.data() + hh * hd;
-                        for (int s = 0; s < past; ++s) {
-                            const float *vv = v_cache[static_cast<size_t>(l)].data() +
-                                              static_cast<size_t>(s) * kvd + kh * hd;
-                            const float a = sc[static_cast<size_t>(s)] / z;
-                            for (int d0 = 0; d0 < hd; ++d0)
-                                oh[d0] += a * vv[d0];
-                        }
+                        quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(),
+                                          1, qd, H);
+                    } else {
+                        quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(),
+                                          1, H, H);
+                        quant::matmul_f32(d.data(), q.data(), wo_[static_cast<size_t>(l)].data(), 1,
+                                          H, H);
                     }
-                    quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(), 1,
-                                      qd, H);
-                } else {
-                    quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
-                                      H);
-                    quant::matmul_f32(d.data(), q.data(), wo_[static_cast<size_t>(l)].data(), 1, H,
-                                      H);
                 }
                 for (int i = 0; i < H; ++i)
                     h[i] += d[i];
@@ -244,8 +258,11 @@ public:
         std::vector<int> hist = prompt;
         for (int k = 0; k < gp.max_new_tokens; ++k) {
             std::vector<float> logits(cfg_.vocab);
-            quant::rmsnorm(h.data(), norm_.data(), nrm.data(), H, cfg_.rms_eps);
-            quant::matmul_f32(logits.data(), nrm.data(), lm_head_.data(), 1, H, cfg_.vocab);
+            {
+                AccTimer t(t_head_);
+                quant::rmsnorm(h.data(), norm_.data(), nrm.data(), H, cfg_.rms_eps);
+                quant::matmul_f32(logits.data(), nrm.data(), lm_head_.data(), 1, H, cfg_.vocab);
+            }
             int next = sample_penalized(logits.data(), cfg_.vocab, gp, hist.data(),
                                        static_cast<int>(hist.size()), &rng,
                                        allow.empty() ? nullptr : allow.data(), nullptr,
@@ -282,6 +299,14 @@ public:
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
            << (has_gqa() ? "GQA" : "stand-in") << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
+    }
+
+    void turn_perf(TurnPerf &out, bool reset) override {
+        out = {};
+        out.t_attn = t_attn_;
+        out.t_head = t_head_;
+        if (reset)
+            t_attn_ = t_head_ = 0;
     }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
@@ -711,65 +736,70 @@ private:
         for (int l = 0; l < cfg_.n_layers; ++l) {
             quant::rmsnorm(s.h.data(), in_n_[static_cast<size_t>(l)].data(), nrm.data(), H,
                            cfg_.rms_eps);
-            if (layer_gqa(l) && tpos < Tmax &&
-                l < static_cast<int>(s.k_cache.size()) && l < static_cast<int>(s.v_cache.size()) &&
-                !s.k_cache[static_cast<size_t>(l)].empty() &&
-                !s.v_cache[static_cast<size_t>(l)].empty()) {
-                quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
-                                  qd);
-                quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(), 1, H,
-                                  kvd);
-                quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(), 1, H,
-                                  kvd);
-                for (int hh = 0; hh < nq; ++hh)
-                    apply_rope(q.data() + hh * hd, hd, tpos, theta);
-                for (int hh = 0; hh < nkv; ++hh)
-                    apply_rope(k.data() + hh * hd, hd, tpos, theta);
-                std::memcpy(s.k_cache[static_cast<size_t>(l)].data() +
-                                static_cast<size_t>(tpos) * kvd,
-                            k.data(), static_cast<size_t>(kvd) * sizeof(float));
-                std::memcpy(s.v_cache[static_cast<size_t>(l)].data() +
-                                static_cast<size_t>(tpos) * kvd,
-                            v.data(), static_cast<size_t>(kvd) * sizeof(float));
-                std::fill(ctx.begin(), ctx.end(), 0.f);
-                const int past = tpos + 1;
-                std::vector<float> sc(static_cast<size_t>(past));
-                for (int hh = 0; hh < nq; ++hh) {
-                    const int kh = std::min(hh / group, nkv - 1);
-                    const float *qh = q.data() + hh * hd;
-                    float mx = -1e30f;
-                    for (int t = 0; t < past; ++t) {
-                        const float *kk = s.k_cache[static_cast<size_t>(l)].data() +
-                                          static_cast<size_t>(t) * kvd + kh * hd;
-                        float acc = 0.f;
-                        for (int d0 = 0; d0 < hd; ++d0)
-                            acc += qh[d0] * kk[d0];
-                        sc[static_cast<size_t>(t)] = acc * scale;
-                        if (sc[static_cast<size_t>(t)] > mx)
-                            mx = sc[static_cast<size_t>(t)];
+            {
+                AccTimer t(t_attn_);
+                if (layer_gqa(l) && tpos < Tmax &&
+                    l < static_cast<int>(s.k_cache.size()) &&
+                    l < static_cast<int>(s.v_cache.size()) &&
+                    !s.k_cache[static_cast<size_t>(l)].empty() &&
+                    !s.v_cache[static_cast<size_t>(l)].empty()) {
+                    quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
+                                      qd);
+                    quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(), 1, H,
+                                      kvd);
+                    quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(), 1, H,
+                                      kvd);
+                    for (int hh = 0; hh < nq; ++hh)
+                        apply_rope(q.data() + hh * hd, hd, tpos, theta);
+                    for (int hh = 0; hh < nkv; ++hh)
+                        apply_rope(k.data() + hh * hd, hd, tpos, theta);
+                    std::memcpy(s.k_cache[static_cast<size_t>(l)].data() +
+                                    static_cast<size_t>(tpos) * kvd,
+                                k.data(), static_cast<size_t>(kvd) * sizeof(float));
+                    std::memcpy(s.v_cache[static_cast<size_t>(l)].data() +
+                                    static_cast<size_t>(tpos) * kvd,
+                                v.data(), static_cast<size_t>(kvd) * sizeof(float));
+                    std::fill(ctx.begin(), ctx.end(), 0.f);
+                    const int past = tpos + 1;
+                    std::vector<float> sc(static_cast<size_t>(past));
+                    for (int hh = 0; hh < nq; ++hh) {
+                        const int kh = std::min(hh / group, nkv - 1);
+                        const float *qh = q.data() + hh * hd;
+                        float mx = -1e30f;
+                        for (int t = 0; t < past; ++t) {
+                            const float *kk = s.k_cache[static_cast<size_t>(l)].data() +
+                                              static_cast<size_t>(t) * kvd + kh * hd;
+                            float acc = 0.f;
+                            for (int d0 = 0; d0 < hd; ++d0)
+                                acc += qh[d0] * kk[d0];
+                            sc[static_cast<size_t>(t)] = acc * scale;
+                            if (sc[static_cast<size_t>(t)] > mx)
+                                mx = sc[static_cast<size_t>(t)];
+                        }
+                        float z = 0.f;
+                        for (int t = 0; t < past; ++t) {
+                            sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
+                            z += sc[static_cast<size_t>(t)];
+                        }
+                        if (z <= 0.f)
+                            z = 1.f;
+                        float *oh = ctx.data() + hh * hd;
+                        for (int t = 0; t < past; ++t) {
+                            const float *vv = s.v_cache[static_cast<size_t>(l)].data() +
+                                              static_cast<size_t>(t) * kvd + kh * hd;
+                            const float a = sc[static_cast<size_t>(t)] / z;
+                            for (int d0 = 0; d0 < hd; ++d0)
+                                oh[d0] += a * vv[d0];
+                        }
                     }
-                    float z = 0.f;
-                    for (int t = 0; t < past; ++t) {
-                        sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
-                        z += sc[static_cast<size_t>(t)];
-                    }
-                    if (z <= 0.f)
-                        z = 1.f;
-                    float *oh = ctx.data() + hh * hd;
-                    for (int t = 0; t < past; ++t) {
-                        const float *vv = s.v_cache[static_cast<size_t>(l)].data() +
-                                          static_cast<size_t>(t) * kvd + kh * hd;
-                        const float a = sc[static_cast<size_t>(t)] / z;
-                        for (int d0 = 0; d0 < hd; ++d0)
-                            oh[d0] += a * vv[d0];
-                    }
+                    quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(), 1,
+                                      qd, H);
+                } else {
+                    quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
+                                      H);
+                    quant::matmul_f32(d.data(), q.data(), wo_[static_cast<size_t>(l)].data(), 1, H,
+                                      H);
                 }
-                quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(), 1, qd,
-                                  H);
-            } else {
-                quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
-                                  H);
-                quant::matmul_f32(d.data(), q.data(), wo_[static_cast<size_t>(l)].data(), 1, H, H);
             }
             for (int i = 0; i < H; ++i)
                 s.h[static_cast<size_t>(i)] += d[static_cast<size_t>(i)];
@@ -798,8 +828,11 @@ private:
         const int H = std::max(cfg_.hidden, 1);
         std::vector<float> nrm(static_cast<size_t>(H)),
             logits(static_cast<size_t>(std::max(cfg_.vocab, 1)));
-        quant::rmsnorm(s.h.data(), norm_.data(), nrm.data(), H, cfg_.rms_eps);
-        quant::matmul_f32(logits.data(), nrm.data(), lm_head_.data(), 1, H, cfg_.vocab);
+        {
+            AccTimer t(t_head_);
+            quant::rmsnorm(s.h.data(), norm_.data(), nrm.data(), H, cfg_.rms_eps);
+            quant::matmul_f32(logits.data(), nrm.data(), lm_head_.data(), 1, H, cfg_.vocab);
+        }
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
@@ -1021,6 +1054,7 @@ private:
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
     LlamaSlot slots_[kMaxKvSlots];
+    double t_attn_ = 0, t_head_ = 0;
 };
 
 std::unique_ptr<FamilyEngine> make_llama() { return std::make_unique<LlamaEngine>(); }

@@ -397,10 +397,10 @@ public:
         store_.take_io_perf(out.t_edisk, out.t_ewait, reset);
         out.t_emm = t_emm_;
         out.t_attn = t_attn_;
-        out.t_kvb = 0;
+        out.t_kvb = t_kvb_;
         out.t_head = t_head_;
         if (reset)
-            t_emm_ = t_attn_ = t_head_ = 0;
+            t_emm_ = t_attn_ = t_kvb_ = t_head_ = 0;
     }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
@@ -911,7 +911,7 @@ private:
                          &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
                          &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
                          s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at, y.data(),
-                         cfg_.rms_eps, sel, nsel);
+                         cfg_.rms_eps, sel, nsel, &t_kvb_);
             }
         }
         if (branch)
@@ -1979,7 +1979,7 @@ private:
 
     ModelConfig cfg_{};
     RuntimeConfig rt_{};
-    double t_attn_ = 0, t_emm_ = 0, t_head_ = 0;
+    double t_attn_ = 0, t_emm_ = 0, t_kvb_ = 0, t_head_ = 0;
     ExpertStore store_;
     RouteUsage usage_;
     std::vector<uint8_t> ehit_;

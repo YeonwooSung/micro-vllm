@@ -69,7 +69,8 @@ std::string mux_format_prof(double wall_s, int prompt_tokens, int completion_tok
 // Order before DONE: HWINFO, PERF, ENTROPY, GPUS, TIERS, EMAP, HITS.
 // hwinfo may be empty (skip). entropy n<=0 skips ENTROPY.
 // emap/hits: rows<=0 or null bytes skips that line.
-// PERF always emitted (zeros ok). GPUS always "GPUS 0" (host has no VRAM).
+// PERF always emitted (zeros ok). GPUS from hw_probe(): ngpu<=0 → "GPUS 0";
+// else n devices used_gb=0, total_gb=vram_total_gb, experts=0.
 // TIERS always emitted.
 std::string mux_format_turn_telem(const std::string &hwinfo_line, uint64_t id, double dt,
                                   double t_edisk, double t_ewait, double t_emm, double t_attn,
