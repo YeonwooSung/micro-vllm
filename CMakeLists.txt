@@ -57,6 +57,7 @@ set(MVLLM_HOST_SOURCES
     src/store/kv_persist_v3.cpp
     src/store/route_usage.cpp
     src/store/route_trace.cpp
+    src/store/kv_prefix.cpp
     src/tok/tokenizer.cpp
     src/tok/k3_tools.cpp
     src/tok/k3_chat1.cpp
@@ -64,6 +65,7 @@ set(MVLLM_HOST_SOURCES
     src/tok/gbnf_forced.cpp
     src/tok/sample_nuc.cpp
     src/tok/stop_set.cpp
+    src/tok/logprob.cpp
     src/tok/json_schema.cpp
     src/tok/decode_post.cpp
     src/tok/glm_tools.cpp
@@ -80,6 +82,7 @@ set(MVLLM_HOST_SOURCES
     src/model/glm53.cpp
     src/model/h3.cpp
     src/model/h3_layout.cpp
+    src/model/h3_seg.cpp
     src/model/h3_text.cpp
     src/model/h3_vision.cpp
     src/model/h3_mm.cpp

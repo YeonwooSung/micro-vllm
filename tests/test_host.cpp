@@ -17,6 +17,7 @@
 #include "model/h3_text.hpp"
 #include "model/h3_audio_vae.hpp"
 #include "model/h3_layout.hpp"
+#include "model/h3_seg.hpp"
 #include "model/h3_vision.hpp"
 #include "model/h3_mm.hpp"
 #include "model/h3_dit_schedule.hpp"
@@ -32,6 +33,7 @@
 #include "store/kv_persist_v3.hpp"
 #include "store/route_usage.hpp"
 #include "store/route_trace.hpp"
+#include "store/kv_prefix.hpp"
 #include "quant/int8_dyn.hpp"
 #include "quant/native_act.hpp"
 #include "quant/bf16.hpp"
@@ -41,6 +43,7 @@
 #include "tok/gbnf_forced.hpp"
 #include "tok/sample_nuc.hpp"
 #include "tok/stop_set.hpp"
+#include "tok/logprob.hpp"
 #include "tok/json_schema.hpp"
 #include "tok/k3_chat1.hpp"
 #include "tok/decode_post.hpp"
@@ -4210,6 +4213,70 @@ int main() {
         CHECK(toks[0] == 1 && toks[1] == 2 && toks[2] == 3);
         Gbnf dead;
         CHECK(gbnf_forced_bytes(dead, buf, 8) == 0);
+    }
+    {
+        using namespace mvllm;
+        KvPrefix p;
+        CHECK(p.alloc(16));
+        const int turn1[] = {5, 6, 7};
+        const int turn2[] = {5, 6, 7, 8, 9};
+        const int other[] = {5, 6, 99, 8, 9};
+        CHECK(p.reuse(turn2, 5) == 0);
+        p.record(turn1, 0, 3);
+        CHECK(p.len() == 3);
+        CHECK(p.reuse(turn2, 5) == 3);
+        CHECK(p.reuse(other, 5) == 0);
+        CHECK(p.reuse(turn1, 3) == 0);
+        const int shorter[] = {5, 6};
+        CHECK(p.reuse(shorter, 2) == 0);
+        const int gen[] = {8, 9};
+        p.record(gen, 3, 2);
+        CHECK(p.len() == 5);
+        const int turn3[] = {5, 6, 7, 8, 9, 10};
+        CHECK(p.reuse(turn3, 6) == 5);
+        p.taint();
+        CHECK(p.reuse(turn3, 6) == 0);
+        p.clear();
+        CHECK(p.len() == 0 && !p.tainted());
+        CHECK(p.alloc(4));
+        p.record(turn1, 0, 3);
+        const int spill[] = {1, 2, 3};
+        p.record(spill, 3, 3);
+        CHECK(p.len() == 0);
+    }
+    {
+        using namespace mvllm;
+        const float lo[] = {0.f, 1.f, 0.f};
+        int am = 0;
+        const double got = logprob_target(lo, 3, 1, &am);
+        const double want = -std::log(1.0 + 2.0 / std::exp(1.0));
+        CHECK(am == 1);
+        CHECK(std::fabs(got - want) < 1e-12);
+        CHECK(logprob_target(lo, 3, 0, &am) < got);
+        CHECK(am == 0);
+        CHECK(model_type_is_glm("GlmForCausalLM"));
+        CHECK(model_type_is_glm("foo_GLM_bar"));
+        CHECK(!model_type_is_glm("llama"));
+        CHECK(!model_type_is_glm(nullptr));
+    }
+    {
+        using namespace mvllm;
+        CHECK(std::string(h3_segment_name(H3SegKind::Text)) == "text");
+        CHECK(std::string(h3_segment_name(H3SegKind::Cond)) == "cond");
+        CHECK(std::string(h3_segment_name(H3SegKind::RefImage)) == "ref_img");
+        CHECK(std::string(h3_segment_name(H3SegKind::RefAudio)) == "ref_audio");
+        CHECK(std::string(h3_segment_name(H3SegKind::Audio)) == "audio");
+        CHECK(std::string(h3_segment_name(H3SegKind::Video)) == "video");
+        H3SegKind k = H3SegKind::Text;
+        CHECK(h3_seg_kind_from_name("ref_img", &k) && k == H3SegKind::RefImage);
+        CHECK(!h3_seg_kind_from_name("unknown", &k));
+        int sig[kH3SigN], sig2[kH3SigN];
+        h3_layout_sig_pack(12, 2, 2, 2, 8, sig);
+        CHECK(sig[0] == 12 && sig[4] == 8);
+        h3_layout_sig_pack(12, 2, 2, 2, 8, sig2);
+        CHECK(h3_layout_sig_equal(sig, sig2));
+        sig2[1] = 9;
+        CHECK(!h3_layout_sig_equal(sig, sig2));
     }
     std::cout << "passed=" << g_pass << " failed=" << g_fail << "\n";
     return g_fail ? 1 : 0;
