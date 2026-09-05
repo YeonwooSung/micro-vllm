@@ -33,9 +33,10 @@ Status mux_decode_image(const uint8_t *data, size_t n, int hint_h, int hint_w,
                         std::vector<float> &rgb, int &width, int &height, std::string &err);
 
 // DONE line. stop_kind: 0 = eos, 1 = length, 2 = stop string.
-// Prefix: DONE id STAT emitted 0.00 0.0 0.00 prompt_tokens length_limited
+// Official: DONE id STAT emitted tok_s hit_pct rss_gb prompt_tokens length_limited [stop_kind]
 std::string mux_format_done(uint64_t id, int emitted, int prompt_tokens, int length_limited,
-                            int stop_kind = 0);
+                            int stop_kind = 0, double tok_s = 0, double hit_pct = 0,
+                            double rss_gb = 0);
 // STAT n_live tps tpot load. After READY (0), after SUBMIT ACCEPT, and after
 // DONE/ERROR that forgets a flight. IMAGE stash is not counted.
 std::string mux_format_stat(int n_live, double tps = 0, double tpot = 0, double load = 0);

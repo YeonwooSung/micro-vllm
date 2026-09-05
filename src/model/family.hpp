@@ -137,6 +137,18 @@ struct RouteTelem {
     double ram_gb = 0;
 };
 
+// Official PERF phases (seconds). t_edisk = expert disk I/O wall;
+// t_ewait = compute-thread stall on a miss; t_emm = expert matmul;
+// t_attn / t_kvb / t_head = attention / KV bind / lm-head.
+struct TurnPerf {
+    double t_edisk = 0;
+    double t_ewait = 0;
+    double t_emm = 0;
+    double t_attn = 0;
+    double t_kvb = 0;
+    double t_head = 0;
+};
+
 class FamilyEngine {
 public:
     virtual ~FamilyEngine() = default;
@@ -158,6 +170,11 @@ public:
     // turn-hit bitmap after copy (hits_emit). Default: empty (no MoE).
     virtual void route_telem(RouteTelem &out, bool consume_hits = true) {
         (void)consume_hits;
+        out = {};
+    }
+    // Snapshot PERF phases. reset clears the accumulators (turn window).
+    virtual void turn_perf(TurnPerf &out, bool reset = false) {
+        (void)reset;
         out = {};
     }
 

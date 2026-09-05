@@ -11,6 +11,7 @@
 #include "../tok/gbnf.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -126,6 +127,15 @@ int sample_penalized(const float *logits, int vocab, const GenParams &gp, const 
     }
     return tok;
 }
+
+struct AccTimer {
+    double &acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit AccTimer(double &a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~AccTimer() {
+        acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 } // namespace
 
@@ -309,6 +319,7 @@ public:
 
                 bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
                 if (use_kda) {
+                    AccTimer t(t_attn_);
                     kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                              &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                              static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
@@ -327,6 +338,7 @@ public:
                                  : nullptr,
                              winq[l].data(), wink[l].data(), winv[l].data());
                 } else {
+                    AccTimer t(t_attn_);
                     mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
                              d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
                              &d_.mla_qb[l], &d_.mla_kva[l],
@@ -421,6 +433,7 @@ public:
                     quant::rmsnorm(hh, d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
                     bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
                     if (use_kda) {
+                        AccTimer t(t_attn_);
                         kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                                  &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                                  static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
@@ -439,6 +452,7 @@ public:
                                      : nullptr,
                                  winq[l].data(), wink[l].data(), winv[l].data());
                     } else {
+                        AccTimer t(t_attn_);
                         mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
                                  d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
                                  &d_.mla_qb[l], &d_.mla_kva[l],
@@ -538,7 +552,10 @@ public:
         for (int n = 0; n < gp.max_new_tokens; ++n) {
             std::vector<float> nrm(H), logits(cfg_.vocab);
             quant::rmsnorm(h.data(), d_.norm.data(), nrm.data(), H, cfg_.rms_eps);
-            d_.lm_head.gemm(logits.data(), nrm.data(), 1);
+            {
+                AccTimer t(t_head_);
+                d_.lm_head.gemm(logits.data(), nrm.data(), 1);
+            }
             int next = sample_penalized(logits.data(), cfg_.vocab, gp, seq.data(),
                                        static_cast<int>(seq.size()), &rng,
                                        allow.empty() ? nullptr : allow.data(), nullptr,
@@ -696,6 +713,17 @@ public:
 
         if (consume_hits)
             std::fill(ehit_.begin(), ehit_.end(), static_cast<uint8_t>(0));
+    }
+
+    void turn_perf(TurnPerf &out, bool reset) override {
+        out = {};
+        store_.take_io_perf(out.t_edisk, out.t_ewait, reset);
+        out.t_emm = t_emm_;
+        out.t_attn = t_attn_;
+        out.t_kvb = 0;
+        out.t_head = t_head_;
+        if (reset)
+            t_emm_ = t_attn_ = t_head_ = 0;
     }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
@@ -1078,6 +1106,7 @@ private:
 
             bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
             if (use_kda) {
+                AccTimer t(t_attn_);
                 kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                          &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                          static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
@@ -1095,6 +1124,7 @@ private:
                              : nullptr,
                          s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
             } else {
+                AccTimer t(t_attn_);
                 mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
                          d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
                          &d_.mla_qb[l], &d_.mla_kva[l],
@@ -1195,6 +1225,7 @@ private:
                 quant::rmsnorm(hh, d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
                 bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
                 if (use_kda) {
+                    AccTimer t(t_attn_);
                     kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                              &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                              static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
@@ -1212,6 +1243,7 @@ private:
                                  : nullptr,
                              s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
                 } else {
+                    AccTimer t(t_attn_);
                     mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
                              d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
                              &d_.mla_qb[l], &d_.mla_kva[l],
@@ -1338,6 +1370,7 @@ private:
                     quant::rmsnorm(hh, d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
                     bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
                     if (use_kda) {
+                        AccTimer t(t_attn_);
                         kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
                                  &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
                                  static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
@@ -1355,6 +1388,7 @@ private:
                                      : nullptr,
                                  s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
                     } else {
+                        AccTimer t(t_attn_);
                         mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
                                  d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
                                  &d_.mla_qb[l], &d_.mla_kva[l],
@@ -1444,7 +1478,10 @@ private:
         const int H = cfg_.hidden;
         std::vector<float> nrm(static_cast<size_t>(H)), logits(static_cast<size_t>(cfg_.vocab));
         quant::rmsnorm(s.h.data(), d_.norm.data(), nrm.data(), H, cfg_.rms_eps);
-        d_.lm_head.gemm(logits.data(), nrm.data(), 1);
+        {
+            AccTimer t(t_head_);
+            d_.lm_head.gemm(logits.data(), nrm.data(), 1);
+        }
         return sample_penalized(logits.data(), cfg_.vocab, s.gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
@@ -1764,6 +1801,7 @@ private:
     }
 
     Status moe_layer_n(int layer, const float *xs, float *hs, int C, std::string &err) {
+        AccTimer t(t_emm_);
         if (C <= 0)
             return Status::Ok;
         const int H = cfg_.hidden;
@@ -2019,6 +2057,7 @@ private:
     RouteTrace trace_;
     std::vector<uint8_t> ehit_;
     std::vector<uint32_t> turn_c_;
+    double t_attn_ = 0, t_emm_ = 0, t_head_ = 0;
 };
 
 std::unique_ptr<FamilyEngine> make_kimi_k3() { return std::make_unique<KimiK3Engine>(); }

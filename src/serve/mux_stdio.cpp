@@ -144,9 +144,16 @@ static int stop_kind_of(bool stopped_by_stop, int length_limited) {
     return 0;
 }
 
-static void emit_done(uint64_t id, int emitted, int prompt_tokens, int length_limited,
-                      int stop_kind) {
-    const std::string line = mux_format_done(id, emitted, prompt_tokens, length_limited, stop_kind);
+static void emit_done(Engine &engine, uint64_t id, int emitted, int prompt_tokens,
+                      int length_limited, int stop_kind, double dt) {
+    const double tok_s = (dt > 1e-6) ? static_cast<double>(emitted) / dt : 0.0;
+    ExpertStoreStats st{};
+    engine.expert_stats(st);
+    const uint64_t tot = st.hits + st.misses;
+    const double hit_pct =
+        tot ? 100.0 * static_cast<double>(st.hits) / static_cast<double>(tot) : 0.0;
+    const std::string line = mux_format_done(id, emitted, prompt_tokens, length_limited, stop_kind,
+                                             tok_s, hit_pct, rss_gb());
     fwrite(line.data(), 1, line.size(), stdout);
     fflush(stdout);
 }
@@ -162,10 +169,13 @@ static void emit_turn_telem(Engine &engine, uint64_t id, double t0) {
                                                                      : 0);
     const double ram_gb = rt.ram_gb > 0.0 ? rt.ram_gb : rss_gb();
     const double dt = (t0 == 0.0) ? 0.0 : (mono_now() - t0);
+    TurnPerf pf;
+    engine.turn_perf(pf, true);
     const std::string block = mux_format_turn_telem(
-        hwline, id, dt, 0, 0, 0, 0, 0, 0, rt.entropy.empty() ? nullptr : rt.entropy.data(),
-        static_cast<int>(rt.entropy.size()), rt.vram, rt.ram, disk, rt.vram_gb, ram_gb, rt.rows,
-        rt.cols, rt.emap.empty() ? nullptr : rt.emap.data(), rt.rows, rt.cols,
+        hwline, id, dt, pf.t_edisk, pf.t_ewait, pf.t_emm, pf.t_attn, pf.t_kvb, pf.t_head,
+        rt.entropy.empty() ? nullptr : rt.entropy.data(), static_cast<int>(rt.entropy.size()),
+        rt.vram, rt.ram, disk, rt.vram_gb, ram_gb, rt.rows, rt.cols,
+        rt.emap.empty() ? nullptr : rt.emap.data(), rt.rows, rt.cols,
         rt.hits.empty() ? nullptr : rt.hits.data());
     fwrite(block.data(), 1, block.size(), stdout);
     fflush(stdout);
@@ -746,8 +756,11 @@ struct Mux {
             emit_topk_rows(engine, id, out);
         const int emitted = live ? live->emitted : static_cast<int>(out.tokens.size());
         const int limited = length_limited_of(out.tokens, max_tokens, engine.config(), gp.eos);
-        emit_turn_telem(engine, id, live ? live->t0 : 0);
-        emit_done(id, emitted, prompt_tokens, limited, stop_kind_of(out.stopped_by_stop, limited));
+        const double t0 = live ? live->t0 : 0;
+        emit_turn_telem(engine, id, t0);
+        const double dt = (t0 == 0.0) ? 0.0 : (mono_now() - t0);
+        emit_done(engine, id, emitted, prompt_tokens, limited,
+                  stop_kind_of(out.stopped_by_stop, limited), dt);
         forget(id);
     }
 
@@ -777,8 +790,9 @@ struct Mux {
                 const int limited = length_limited_of(job->out.tokens, fl->max_tokens,
                                                       engine.config(), job->gp.eos);
                 emit_turn_telem(engine, fl->id, fl->t0);
-                emit_done(fl->id, emitted, fl->prompt_tokens, limited,
-                          stop_kind_of(job->out.stopped_by_stop, limited));
+                const double dt = (fl->t0 == 0.0) ? 0.0 : (mono_now() - fl->t0);
+                emit_done(engine, fl->id, emitted, fl->prompt_tokens, limited,
+                          stop_kind_of(job->out.stopped_by_stop, limited), dt);
             }
             forget(id);
         }
@@ -1034,11 +1048,11 @@ Status mux_decode_image(const uint8_t *data, size_t n, int hint_h, int hint_w,
 }
 
 std::string mux_format_done(uint64_t id, int emitted, int prompt_tokens, int length_limited,
-                            int stop_kind) {
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "DONE %llu STAT %d 0.00 0.0 0.00 %d %d %d\n",
-                  static_cast<unsigned long long>(id), emitted, prompt_tokens, length_limited,
-                  stop_kind);
+                            int stop_kind, double tok_s, double hit_pct, double rss) {
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "DONE %llu STAT %d %.2f %.1f %.2f %d %d %d\n",
+                  static_cast<unsigned long long>(id), emitted, tok_s, hit_pct, rss, prompt_tokens,
+                  length_limited, stop_kind);
     return buf;
 }
 

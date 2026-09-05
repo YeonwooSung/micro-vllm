@@ -3,6 +3,7 @@
 #include "../io/file_io.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 
 namespace mvllm {
@@ -134,6 +135,8 @@ void ExpertStore::close() {
     slots_per_layer_ = 0;
     clock_ = 1;
     stats_ = {};
+    t_edisk_ = 0;
+    t_ewait_ = 0;
     open_ = false;
 }
 
@@ -371,8 +374,12 @@ Status ExpertStore::lookup(ExpertKey key, ExpertView &view, std::string &err) {
     }
     ++slot->pins; // sticky during unlocked I/O
     lock.unlock();
+    const auto t0 = std::chrono::steady_clock::now();
     const Status st = load_into(key.layer, key.expert, *slot, err);
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     lock.lock();
+    t_edisk_ += dt;
+    t_ewait_ += dt;
     if (st != Status::Ok) {
         if (slot->pins > 0)
             --slot->pins;
@@ -422,8 +429,11 @@ Status ExpertStore::prefetch(const ExpertKey *keys, size_t count, std::string &e
             continue;
         ++slot->pins;
         lock.unlock();
+        const auto t0 = std::chrono::steady_clock::now();
         const Status st = load_into(key.layer, key.expert, *slot, err);
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         lock.lock();
+        t_edisk_ += dt;
         if (slot->pins > 0)
             --slot->pins;
         if (st != Status::Ok)
@@ -481,6 +491,22 @@ void ExpertStore::count_tiers(int &ram, int &disk) const {
         }
     }
     disk = n_layers_ * n_experts_ - ram;
+}
+
+void ExpertStore::io_perf(double &edisk, double &ewait) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    edisk = t_edisk_;
+    ewait = t_ewait_;
+}
+
+void ExpertStore::take_io_perf(double &edisk, double &ewait, bool reset) {
+    std::lock_guard<std::mutex> lock(mu_);
+    edisk = t_edisk_;
+    ewait = t_ewait_;
+    if (reset) {
+        t_edisk_ = 0;
+        t_ewait_ = 0;
+    }
 }
 
 void ExpertStore::stats(ExpertStoreStats &out) const {

@@ -295,6 +295,13 @@ static void test_expert_store() {
     store.count_tiers(ram, disk);
     CHECK(ram >= 1 && ram + disk == nL * nE);
     CHECK(store.fill_tiers(nullptr, 8) == 0);
+    double edisk = 0, ewait = 0;
+    store.io_perf(edisk, ewait);
+    CHECK(edisk > 0.0);
+    CHECK(ewait > 0.0);
+    store.take_io_perf(edisk, ewait, true);
+    store.io_perf(edisk, ewait);
+    CHECK(edisk == 0.0 && ewait == 0.0);
     store.close();
     CHECK(!store.resident(0, 2));
     store.count_tiers(ram, disk);
@@ -1064,6 +1071,16 @@ static void test_offload_generate() {
             after += h ? 1 : 0;
         CHECK(after == 0);
         CHECK(b.entropy.size() == a.entropy.size()); // consume clears hits only
+        TurnPerf pf;
+        ek.turn_perf(pf, false);
+        CHECK(pf.t_attn > 0.0);
+        CHECK(pf.t_emm > 0.0);
+        CHECK(pf.t_head > 0.0);
+        CHECK(pf.t_edisk >= 0.0);
+        CHECK(pf.t_ewait >= 0.0);
+        ek.turn_perf(pf, true);
+        ek.turn_perf(pf, false);
+        CHECK(pf.t_attn == 0.0 && pf.t_emm == 0.0 && pf.t_head == 0.0);
     }
 
     std::string gdir = tmpdir();
@@ -1119,6 +1136,11 @@ static void test_offload_generate() {
         for (uint8_t h : cleared.hits)
             after += h ? 1 : 0;
         CHECK(after == 0);
+        TurnPerf pf;
+        eg.turn_perf(pf, false);
+        CHECK(pf.t_attn > 0.0);
+        CHECK(pf.t_emm > 0.0);
+        CHECK(pf.t_head > 0.0);
     }
 
     std::string hdir = tmpdir();
@@ -3452,6 +3474,8 @@ int main() {
         std::string done = mux_format_done(7, 3, 10, 0, 2);
         CHECK(done.find("DONE 7 STAT 3") != std::string::npos);
         CHECK(done.find("10 0 2") != std::string::npos);
+        CHECK(mux_format_done(7, 3, 10, 0, 2, 12.5, 80.0, 1.25).find("12.50 80.0 1.25 10 0 2") !=
+              std::string::npos);
         std::string rtoks =
             openai_chat_response("id1", "kimi", "hello", 3, 2, "plan", "stop", 0, 4);
         CHECK(rtoks.find("\"reasoning_tokens\":4") != std::string::npos);

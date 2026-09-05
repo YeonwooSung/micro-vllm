@@ -11,6 +11,7 @@
 #include "../tok/gbnf.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,15 @@ void xavier(std::vector<float> &w, int rows, int cols, uint32_t seed) {
         v = dist(rng);
 }
 void ones(std::vector<float> &w, int n) { w.assign(n, 1.f); }
+
+struct AccTimer {
+    double &acc;
+    std::chrono::steady_clock::time_point t0;
+    explicit AccTimer(double &a) : acc(a), t0(std::chrono::steady_clock::now()) {}
+    ~AccTimer() {
+        acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 quant::QuantMat qmat_xavier(int O, int I, uint32_t seed, int bits) {
     std::vector<float> t;
@@ -379,6 +389,17 @@ public:
         out.ram_gb = static_cast<double>(store_.expert_bytes()) * static_cast<double>(ram) / 1e9;
         if (consume_hits)
             std::fill(ehit_.begin(), ehit_.end(), 0);
+    }
+
+    void turn_perf(TurnPerf &out, bool reset) override {
+        out = {};
+        store_.take_io_perf(out.t_edisk, out.t_ewait, reset);
+        out.t_emm = t_emm_;
+        out.t_attn = t_attn_;
+        out.t_kvb = 0;
+        out.t_head = t_head_;
+        if (reset)
+            t_emm_ = t_attn_ = t_head_ = 0;
     }
 
     Status begin_generate(int slot, const std::vector<int> &ids, const GenParams &gp, int &reuse,
@@ -813,6 +834,7 @@ private:
         quant::rmsnorm(hh, in_n_[l].data(), n.data(), H, cfg_.rms_eps);
         bool full = (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
         if (!full && cfg_.kda.heads > 0) {
+            AccTimer t(t_attn_);
             kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l], &wfb_[l],
                      wdt_[l].data(), static_cast<int>(wdt_[l].size()), alog_[l].data(), &wg_[l],
                      (l < static_cast<int>(wgb_.size()) && !wgb_[l].empty()) ? &wgb_[l] : nullptr,
@@ -881,12 +903,15 @@ private:
                                cfg_.dsa);
                 sel = selbuf.data();
             }
-            mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],
-                     mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
-                     &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
-                     &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
-                     s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at, y.data(),
-                     cfg_.rms_eps, sel, nsel);
+            {
+                AccTimer t(t_attn_);
+                mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],
+                         mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
+                         &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
+                         &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
+                         s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at, y.data(),
+                         cfg_.rms_eps, sel, nsel);
+            }
         }
         if (branch)
             std::memcpy(branch, y.data(), static_cast<size_t>(H) * sizeof(float));
@@ -1255,7 +1280,10 @@ private:
             head_in = pooled.data();
         }
         quant::rmsnorm(head_in, norm_.data(), n.data(), H, cfg_.rms_eps);
-        lm_head_.gemm(logits.data(), n.data(), 1);
+        {
+            AccTimer t(t_head_);
+            lm_head_.gemm(logits.data(), n.data(), 1);
+        }
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
@@ -1699,6 +1727,7 @@ private:
     }
 
     Status moe_layer_n(int layer, const float *xs, float *hs, int C, std::string &err) {
+        AccTimer t(t_emm_);
         if (C <= 0)
             return Status::Ok;
         const int H = cfg_.hidden;
@@ -1949,6 +1978,7 @@ private:
 
     ModelConfig cfg_{};
     RuntimeConfig rt_{};
+    double t_attn_ = 0, t_emm_ = 0, t_head_ = 0;
     ExpertStore store_;
     RouteUsage usage_;
     std::vector<uint8_t> ehit_;

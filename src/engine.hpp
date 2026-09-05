@@ -52,6 +52,12 @@ public:
             ++hits_seq_;
     }
     int hits_seq() const { return hits_seq_; }
+    void turn_perf(TurnPerf &out, bool reset = false) {
+        if (impl_)
+            impl_->turn_perf(out, reset);
+        else
+            out = {};
+    }
     uint64_t block_hits() const { return impl_ ? impl_->block_hits() : 0; }
     uint64_t block_misses() const { return impl_ ? impl_->block_misses() : 0; }
     SessionStore &sessions() { return sessions_; }

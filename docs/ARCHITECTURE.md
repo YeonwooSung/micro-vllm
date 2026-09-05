@@ -253,7 +253,10 @@ Immediately before DONE: HWINFO, PERF, ENTROPY (if any), TIERS, EMAP, HITS
 `.coli_usage` heat + ExpertStore RAM/disk tiers, HITS from this-turn
 routes (cleared on consume; turn entropy stays), and per-sparse-row Shannon
 ENTROPY. Mux emits mid-turn `HITS` every 6 tokens. PERF `dt` is wall
-seconds since ACCEPT. `GET /experts` returns `{rows,cols,map,hits,seq}`
+seconds since ACCEPT; `t_edisk`/`t_ewait` come from ExpertStore I/O,
+`t_attn`/`t_emm`/`t_head` from K3/GLM phase timers (`turn_perf`).
+DONE STAT fills `tok_s`, cache `hit_pct`, and `rss_gb`.
+`GET /experts` returns `{rows,cols,map,hits,seq}`
 (`mux_format_experts_json`; empty unless authed).
 
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on

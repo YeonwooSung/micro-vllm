@@ -90,6 +90,10 @@ public:
     }
 
     void stats(ExpertStoreStats &out) const;
+    // Seconds accumulated since last take/clear. Thread-safe (same mu_).
+    void io_perf(double &edisk, double &ewait) const;
+    // Copy then optionally zero the accumulators.
+    void take_io_perf(double &edisk, double &ewait, bool reset);
     int64_t expert_bytes() const { return expert_bytes_; }
     int n_layers() const { return n_layers_; }
 
@@ -147,6 +151,8 @@ private:
     std::vector<Layer> layers_;
     std::vector<Meta> meta_; // [layer * n_experts + eid]
     ExpertStoreStats stats_{};
+    double t_edisk_ = 0;
+    double t_ewait_ = 0;
     bool open_ = false;
     bool use_direct_ = true;
     mutable std::mutex mu_;
