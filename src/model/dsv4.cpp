@@ -11,13 +11,18 @@
 #include "../tok/gbnf.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <random>
 #include <sstream>
+#include <sys/stat.h>
 
 namespace mvllm {
 namespace {
@@ -172,6 +177,62 @@ bool collect_pieces(const std::vector<io::StFile> &files, const std::string name
     return true;
 }
 
+const char *ckpt_env_raw(const char *suffix) {
+    const std::string mv = std::string("MVLLM_PREFIX_CKPT") + suffix;
+    if (const char *s = std::getenv(mv.c_str()); s && s[0])
+        return s;
+    const std::string v4 = std::string("V4_PREFIX_CKPT") + suffix;
+    if (const char *s = std::getenv(v4.c_str()); s && s[0])
+        return s;
+    return nullptr;
+}
+
+int ckpt_env_int(const char *suffix, int def) {
+    const char *s = ckpt_env_raw(suffix);
+    if (!s)
+        return def;
+    return std::atoi(s);
+}
+
+bool wr_bytes(std::ostream &o, const void *p, size_t n) {
+    if (n == 0)
+        return true;
+    o.write(reinterpret_cast<const char *>(p), static_cast<std::streamsize>(n));
+    return static_cast<bool>(o);
+}
+
+bool rd_bytes(std::istream &in, void *p, size_t n) {
+    if (n == 0)
+        return true;
+    in.read(reinterpret_cast<char *>(p), static_cast<std::streamsize>(n));
+    return static_cast<bool>(in) && in.gcount() == static_cast<std::streamsize>(n);
+}
+
+template <class T> bool wr_pod(std::ostream &o, T v) { return wr_bytes(o, &v, sizeof(v)); }
+
+template <class T> bool rd_pod(std::istream &in, T &v) { return rd_bytes(in, &v, sizeof(v)); }
+
+uint64_t fnv1a64(uint64_t h, uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+    return h;
+}
+
+uint64_t fnv1a64_bytes(uint64_t h, const void *p, size_t n) {
+    const auto *b = static_cast<const uint8_t *>(p);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::string hex64(uint64_t x) {
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(x));
+    return buf;
+}
+
 } // namespace
 
 class Dsv4Engine final : public FamilyEngine {
@@ -196,8 +257,19 @@ public:
         std::vector<std::vector<GenLogprob>> top_lps;
     };
 
+    struct PrefixCkpt {
+        std::vector<int> ids;
+        std::vector<std::vector<float>> kv, dsa_ikeys, dsa_igates;
+        std::vector<float> streams;
+        int pos = 0;
+        bool prompt_end = false;
+        uint64_t tick = 0;
+    };
+
     Status load(const std::string &model_dir, const RuntimeConfig &rt, std::string &err) override {
         rt_ = rt;
+        if (rt_.model_dir.empty())
+            rt_.model_dir = model_dir;
         Status st = load_model_config(model_dir, cfg_, err);
         if (st != Status::Ok)
             return st;
@@ -263,20 +335,19 @@ public:
         int Tmax = std::max(rt_.max_seq, static_cast<int>(prompt.size()) + gp.max_new_tokens + 256);
         if (Tmax <= 0)
             Tmax = 4096;
-        int reuse = 0;
+        int kv_reuse = 0;
         if (use_slot && gp.prefix_reuse > 0) {
             Slot &sl = slots_[cslot];
             const int match = sl.have ? kv_common_prefix(sl.history, prompt) : 0;
             const int want = std::min(gp.prefix_reuse, match);
             if (sl.have && sl.pos > 0 && sl.pos <= want &&
                 sl.pos <= static_cast<int>(prompt.size())) {
-                reuse = sl.pos;
+                kv_reuse = sl.pos;
                 slot_ensure_t(sl, Tmax);
             }
         }
-        if (reuse == 0)
-            slot_alloc(*work, Tmax);
-        Status pst = slot_prefill(*work, prompt, reuse, err);
+        int reuse = kv_reuse;
+        Status pst = ckpt_run_prefill(*work, prompt, gp, kv_reuse, Tmax, reuse, err);
         if (pst != Status::Ok)
             return pst;
 
@@ -347,7 +418,8 @@ public:
            << " q_lora=" << cfg_.mla.q_lora << " o_lora=" << cfg_.o_lora
            << " window=" << cfg_.sliding_window << " dsa=" << (cfg_.dsa.topk > 0 ? cfg_.dsa.topk : 0)
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic")
-           << " bits=" << rt_.dense_bits << " prefix=" << (prefix_.empty() ? "-" : prefix_);
+           << " bits=" << rt_.dense_bits << " prefix=" << (prefix_.empty() ? "-" : prefix_)
+           << " ckpt=" << ckpts_.size() << " hits=" << ckpt_hits_;
         return os.str();
     }
 
@@ -443,17 +515,16 @@ public:
         Slot &st = slots_[slot];
         const int match = st.have ? kv_common_prefix(st.history, ids) : 0;
         const int want = std::min(std::max(gp.prefix_reuse, 0), match);
-        int applied = 0;
+        int kv_reuse = 0;
         int Tmax = std::max(rt_.max_seq, static_cast<int>(ids.size()) + gp.max_new_tokens + 256);
         if (Tmax <= 0)
             Tmax = 4096;
         if (st.have && st.pos > 0 && st.pos <= want && st.pos <= static_cast<int>(ids.size())) {
-            applied = st.pos;
+            kv_reuse = st.pos;
             slot_ensure_t(st, Tmax);
-        } else {
-            slot_alloc(st, Tmax);
         }
-        Status pst = slot_prefill(st, ids, applied, err);
+        int applied = kv_reuse;
+        Status pst = ckpt_run_prefill(st, ids, gp, kv_reuse, Tmax, applied, err);
         if (pst != Status::Ok)
             return pst;
         st.history = ids;
@@ -520,10 +591,237 @@ public:
         return Status::Ok;
     }
 
+    Status next_tokens(const int *slots, int n, int *tokens, uint8_t *done,
+                       std::string &err) override {
+        if (n < 1)
+            return Status::Ok;
+        if (!slots || !tokens || !done) {
+            err = "next_tokens bad args";
+            return Status::InvalidArgument;
+        }
+        if (n == 1) {
+            bool d = false;
+            Status st = next_token(slots[0], tokens[0], d, err);
+            done[0] = d ? 1 : 0;
+            return st;
+        }
+        for (int i = 0; i < n; ++i) {
+            if (slots[i] < 0 || slots[i] >= kMaxKvSlots) {
+                err = "bad cache slot";
+                return Status::InvalidArgument;
+            }
+            if (!slots_[slots[i]].live) {
+                err = "no live generate";
+                return Status::InvalidArgument;
+            }
+        }
+        std::vector<Slot *> step_s;
+        std::vector<int> step_tok;
+        step_s.reserve(static_cast<size_t>(n));
+        step_tok.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            Slot &st = slots_[slots[i]];
+            done[i] = 0;
+            if (st.gp.max_new_tokens <= 0 || st.emitted >= st.gp.max_new_tokens) {
+                done[i] = 1;
+                tokens[i] = -1;
+                continue;
+            }
+            const uint8_t *allow = st.allow.empty() ? nullptr : st.allow.data();
+            tokens[i] = slot_sample(st, st.gp, &st.rng, allow);
+            ++st.emitted;
+            st.history.push_back(tokens[i]);
+            if (st.g.ready() && st.gp.token_text)
+                st.g.accept_bytes(st.gp.token_text(tokens[i]));
+            bool stop = gen_stop_id(tokens[i], cfg_, st.gp) || st.emitted >= st.gp.max_new_tokens;
+            if (!stop && st.gp.token_text) {
+                st.decoded += st.gp.token_text(tokens[i]);
+                if (stop_cut(st.decoded, st.gp.stop) != std::string::npos)
+                    stop = true;
+            }
+            if (stop)
+                done[i] = 1;
+            else {
+                step_s.push_back(&st);
+                step_tok.push_back(tokens[i]);
+            }
+            if (st.g.ready() && st.gp.token_text) {
+                st.allow.assign(static_cast<size_t>(cfg_.vocab), 0);
+                st.g.allow_mask(st.gp.token_text, st.allow.data(), cfg_.vocab);
+            }
+        }
+        if (!step_s.empty()) {
+            Status sst = slot_step_n(step_s.data(), step_tok.data(),
+                                     static_cast<int>(step_s.size()), err);
+            if (sst != Status::Ok)
+                return sst;
+        }
+        return Status::Ok;
+    }
+
     void end_generate(int slot) override {
         if (slot < 0 || slot >= kMaxKvSlots)
             return;
         slots_[slot].live = false;
+    }
+
+    // Official COLIKV: L = first kv_lora of each layer row, R = next qk_rope,
+    // I = concatenated DSA keys for layers that have dsa_ikeys.
+    int export_kv_rows(int slot, int pos0, int n, KvPersistRecord *rows) const override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        const Slot &sl = slots_[slot];
+        if (!sl.have)
+            return 0;
+        const int width = kv_width();
+        const int kvL = std::max(cfg_.mla.kv_lora, 0);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const int ID = std::max(cfg_.dsa.head_dim, 0);
+        const int nL = cfg_.n_layers;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0 || pos >= sl.pos)
+                return t;
+            KvPersistRecord &rec = rows[t];
+            if (width > 0) {
+                for (int l = 0; l < nL; ++l) {
+                    if (l >= static_cast<int>(sl.kv.size()) || sl.kv[l].empty())
+                        continue;
+                    const size_t src = static_cast<size_t>(pos) * static_cast<size_t>(width);
+                    if (src + static_cast<size_t>(width) > sl.kv[l].size())
+                        continue;
+                    const float *row = sl.kv[l].data() + src;
+                    if (kvL > 0) {
+                        const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(kvL);
+                        if (dst < rec.L.size()) {
+                            const int ncopy =
+                                std::min(kvL, std::min(width, static_cast<int>(rec.L.size() - dst)));
+                            if (ncopy > 0)
+                                std::memcpy(rec.L.data() + dst, row,
+                                            static_cast<size_t>(ncopy) * sizeof(float));
+                        }
+                    }
+                    if (qr > 0) {
+                        const int off = std::min(kvL, width);
+                        const int room = width - off;
+                        const size_t dst = static_cast<size_t>(l) * static_cast<size_t>(qr);
+                        if (dst < rec.R.size() && room > 0) {
+                            const int ncopy =
+                                std::min(qr, std::min(room, static_cast<int>(rec.R.size() - dst)));
+                            if (ncopy > 0)
+                                std::memcpy(rec.R.data() + dst, row + off,
+                                            static_cast<size_t>(ncopy) * sizeof(float));
+                        }
+                    }
+                }
+            }
+            if (ID > 0) {
+                size_t ioff = 0;
+                for (int l = 0; l < nL; ++l) {
+                    if (l >= static_cast<int>(sl.dsa_ikeys.size()) || sl.dsa_ikeys[l].empty())
+                        continue;
+                    const std::vector<float> &ik = sl.dsa_ikeys[l];
+                    const size_t koff = static_cast<size_t>(pos) * static_cast<size_t>(ID);
+                    if (ioff + static_cast<size_t>(ID) <= rec.I.size() &&
+                        koff + static_cast<size_t>(ID) <= ik.size())
+                        std::memcpy(rec.I.data() + ioff, ik.data() + koff,
+                                    static_cast<size_t>(ID) * sizeof(float));
+                    ioff += static_cast<size_t>(ID);
+                }
+            }
+        }
+        return n;
+    }
+
+    int import_kv_rows(int slot, int pos0, int n, const KvPersistRecord *rows) override {
+        if (!rows || n <= 0 || slot < 0 || slot >= kMaxKvSlots)
+            return 0;
+        Slot &sl = slots_[slot];
+        const int width = kv_width();
+        const int kvL = std::max(cfg_.mla.kv_lora, 0);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const int ID = std::max(cfg_.dsa.head_dim, 0);
+        const int nL = cfg_.n_layers;
+        const int headroom = std::max(rt_.max_seq, 256);
+        const int t_max = std::max(std::max(pos0 + n, sl.pos), 1) + headroom;
+        bool caches_small = static_cast<int>(sl.kv.size()) < nL;
+        if (!caches_small && width > 0) {
+            const size_t need =
+                static_cast<size_t>(std::max(pos0 + n, 1)) * static_cast<size_t>(width);
+            for (int l = 0; l < nL; ++l) {
+                if (sl.kv[l].size() < need) {
+                    caches_small = true;
+                    break;
+                }
+            }
+        }
+        if (ID > 0 && cfg_.dsa.topk > 0 && static_cast<int>(sl.dsa_ikeys.size()) < nL)
+            caches_small = true;
+        if (!sl.have || caches_small)
+            slot_alloc(sl, t_max);
+        else
+            slot_ensure_t(sl, t_max);
+
+        int written = 0;
+        for (int t = 0; t < n; ++t) {
+            const int pos = pos0 + t;
+            if (pos < 0)
+                return t;
+            const KvPersistRecord &rec = rows[t];
+            if (width > 0) {
+                for (int l = 0; l < nL; ++l) {
+                    if (l >= static_cast<int>(sl.kv.size()) || sl.kv[l].empty())
+                        continue;
+                    const size_t dst0 = static_cast<size_t>(pos) * static_cast<size_t>(width);
+                    if (dst0 + static_cast<size_t>(width) > sl.kv[l].size())
+                        continue;
+                    float *dst = sl.kv[l].data() + dst0;
+                    if (kvL > 0) {
+                        const size_t src = static_cast<size_t>(l) * static_cast<size_t>(kvL);
+                        if (src < rec.L.size()) {
+                            const int ncopy = std::min(
+                                kvL, std::min(width, static_cast<int>(rec.L.size() - src)));
+                            if (ncopy > 0)
+                                std::memcpy(dst, rec.L.data() + src,
+                                            static_cast<size_t>(ncopy) * sizeof(float));
+                        }
+                    }
+                    if (qr > 0) {
+                        const int off = std::min(kvL, width);
+                        const int room = width - off;
+                        const size_t src = static_cast<size_t>(l) * static_cast<size_t>(qr);
+                        if (src < rec.R.size() && room > 0) {
+                            const int ncopy = std::min(
+                                qr, std::min(room, static_cast<int>(rec.R.size() - src)));
+                            if (ncopy > 0)
+                                std::memcpy(dst + off, rec.R.data() + src,
+                                            static_cast<size_t>(ncopy) * sizeof(float));
+                        }
+                    }
+                }
+            }
+            if (ID > 0) {
+                size_t ioff = 0;
+                for (int l = 0; l < nL; ++l) {
+                    if (l >= static_cast<int>(sl.dsa_ikeys.size()) || sl.dsa_ikeys[l].empty())
+                        continue;
+                    std::vector<float> &ik = sl.dsa_ikeys[l];
+                    const size_t koff = static_cast<size_t>(pos) * static_cast<size_t>(ID);
+                    if (ioff + static_cast<size_t>(ID) <= rec.I.size() &&
+                        koff + static_cast<size_t>(ID) <= ik.size())
+                        std::memcpy(ik.data() + koff, rec.I.data() + ioff,
+                                    static_cast<size_t>(ID) * sizeof(float));
+                    ioff += static_cast<size_t>(ID);
+                }
+            }
+            if (static_cast<int>(sl.history.size()) <= pos)
+                sl.history.resize(static_cast<size_t>(pos) + 1);
+            sl.history[static_cast<size_t>(pos)] = rec.token;
+            written = t + 1;
+        }
+        sl.pos = std::max(sl.pos, pos0 + written);
+        sl.have = sl.pos > 0;
+        return written;
     }
 
 private:
@@ -855,6 +1153,17 @@ private:
         return Status::Ok;
     }
 
+    Status slot_step_n(Slot **ss, const int *tokens, int S, std::string &err) {
+        if (S <= 0)
+            return Status::Ok;
+        for (int i = 0; i < S; ++i) {
+            Status st = slot_step(*ss[i], tokens[i], err);
+            if (st != Status::Ok)
+                return st;
+        }
+        return Status::Ok;
+    }
+
     Status slot_prefill(Slot &s, const std::vector<int> &ids, int start, std::string &err) {
         if (start < 0)
             start = 0;
@@ -863,6 +1172,429 @@ private:
             if (st != Status::Ok)
                 return st;
         }
+        return Status::Ok;
+    }
+
+    bool ckpt_enabled() const { return ckpt_env_int("", 1) != 0; }
+    int ckpt_min() const { return std::max(ckpt_env_int("_MIN", 512), 1); }
+    int ckpt_slots() const { return std::max(ckpt_env_int("_SLOTS", 4), 1); }
+    int ckpt_disk() const {
+        const int d = ckpt_env_int("_DISK", 1);
+        return d < 0 ? 0 : (d > 2 ? 2 : d);
+    }
+    bool ckpt_log() const {
+        if (const char *s = std::getenv("MVLLM_PREFIX_CKPT_LOG"); s && s[0])
+            return std::atoi(s) != 0;
+        if (const char *s = std::getenv("V4_PREFIX_LOG"); s && s[0])
+            return std::atoi(s) != 0;
+        if (const char *s = std::getenv("V4_PREFIX_CKPT_LOG"); s && s[0])
+            return std::atoi(s) != 0;
+        return false;
+    }
+
+    uint64_t ckpt_fp() const {
+        uint64_t h = 14695981039346656037ull;
+        h = fnv1a64(h, static_cast<uint64_t>(cfg_.hidden));
+        h = fnv1a64(h, static_cast<uint64_t>(cfg_.n_layers));
+        h = fnv1a64(h, static_cast<uint64_t>(cfg_.moe.n_experts));
+        h = fnv1a64(h, static_cast<uint64_t>(cfg_.moe.topk));
+        h = fnv1a64(h, static_cast<uint64_t>(cfg_.vocab));
+        h = fnv1a64(h, static_cast<uint64_t>(kv_width()));
+        h = fnv1a64(h, static_cast<uint64_t>(cfg_.dsa.head_dim));
+        h = fnv1a64(h, static_cast<uint64_t>(mhc_mult()));
+        return h;
+    }
+
+    std::string ckpt_dir() const {
+        if (rt_.model_dir.empty())
+            return {};
+        return rt_.model_dir + "/.coli_ckpt";
+    }
+
+    int ckpt_gateway_p(const std::vector<int> &prompt, const GenParams &gp) const {
+        const int n = static_cast<int>(prompt.size());
+        if (gp.prefix_reuse > 0)
+            return std::min(gp.prefix_reuse, n);
+        if (gp.prefix_bytes > 0)
+            return std::min(gp.prefix_bytes, n);
+        return 0;
+    }
+
+    int ckpt_capture_point(const std::vector<int> &prompt, const GenParams &gp) const {
+        const int mn = ckpt_min();
+        const int P = ckpt_gateway_p(prompt, gp);
+        if (P >= mn)
+            return P;
+        if (!last_fresh_prompt_.empty()) {
+            const int lcp = kv_common_prefix(last_fresh_prompt_, prompt);
+            if (lcp >= mn)
+                return lcp;
+        }
+        return 0;
+    }
+
+    PrefixCkpt ckpt_clone_from_slot(const Slot &s, int n) const {
+        PrefixCkpt ck;
+        const int L = cfg_.n_layers;
+        const int hd = kv_width();
+        const int ID = cfg_.dsa.head_dim;
+        const int take = std::max(n, 0);
+        ck.pos = take;
+        if (take > 0 && take <= static_cast<int>(s.history.size()))
+            ck.ids.assign(s.history.begin(), s.history.begin() + take);
+        ck.streams = s.streams;
+        ck.kv.resize(static_cast<size_t>(L));
+        ck.dsa_ikeys.resize(static_cast<size_t>(L));
+        ck.dsa_igates.resize(static_cast<size_t>(L));
+        const size_t kvn = static_cast<size_t>(take) * static_cast<size_t>(std::max(hd, 0));
+        const size_t dn = static_cast<size_t>(take) * static_cast<size_t>(std::max(ID, 0));
+        for (int l = 0; l < L; ++l) {
+            if (l < static_cast<int>(s.kv.size()) && s.kv[l].size() >= kvn)
+                ck.kv[static_cast<size_t>(l)].assign(s.kv[l].begin(), s.kv[l].begin() +
+                                                                        static_cast<std::ptrdiff_t>(kvn));
+            if (ID > 0 && cfg_.dsa.topk > 0) {
+                if (l < static_cast<int>(s.dsa_ikeys.size()) && s.dsa_ikeys[l].size() >= dn)
+                    ck.dsa_ikeys[static_cast<size_t>(l)].assign(
+                        s.dsa_ikeys[l].begin(),
+                        s.dsa_ikeys[l].begin() + static_cast<std::ptrdiff_t>(dn));
+                if (l < static_cast<int>(s.dsa_igates.size()) && s.dsa_igates[l].size() >= dn)
+                    ck.dsa_igates[static_cast<size_t>(l)].assign(
+                        s.dsa_igates[l].begin(),
+                        s.dsa_igates[l].begin() + static_cast<std::ptrdiff_t>(dn));
+            }
+        }
+        return ck;
+    }
+
+    void ckpt_apply(Slot &s, const PrefixCkpt &ck, int Tmax) {
+        const int n = std::max(ck.pos, 0);
+        slot_ensure_t(s, std::max(Tmax, n));
+        const int H = cfg_.hidden;
+        const int M = mhc_mult();
+        const size_t need_st = static_cast<size_t>(std::max(M, 1)) * static_cast<size_t>(std::max(H, 1));
+        if (s.streams.size() < need_st)
+            s.streams.assign(need_st, 0.f);
+        if (!ck.streams.empty()) {
+            const size_t sc = std::min(s.streams.size(), ck.streams.size());
+            std::memcpy(s.streams.data(), ck.streams.data(), sc * sizeof(float));
+        }
+        const int L = cfg_.n_layers;
+        const int hd = kv_width();
+        const int ID = cfg_.dsa.head_dim;
+        const size_t kvn = static_cast<size_t>(n) * static_cast<size_t>(std::max(hd, 0));
+        const size_t dn = static_cast<size_t>(n) * static_cast<size_t>(std::max(ID, 0));
+        for (int l = 0; l < L; ++l) {
+            if (l < static_cast<int>(ck.kv.size()) && l < static_cast<int>(s.kv.size()) &&
+                ck.kv[static_cast<size_t>(l)].size() >= kvn && s.kv[l].size() >= kvn && kvn > 0)
+                std::memcpy(s.kv[l].data(), ck.kv[static_cast<size_t>(l)].data(),
+                            kvn * sizeof(float));
+            if (ID > 0 && cfg_.dsa.topk > 0) {
+                if (l < static_cast<int>(ck.dsa_ikeys.size()) &&
+                    l < static_cast<int>(s.dsa_ikeys.size()) &&
+                    ck.dsa_ikeys[static_cast<size_t>(l)].size() >= dn &&
+                    s.dsa_ikeys[l].size() >= dn && dn > 0)
+                    std::memcpy(s.dsa_ikeys[l].data(), ck.dsa_ikeys[static_cast<size_t>(l)].data(),
+                                dn * sizeof(float));
+                if (l < static_cast<int>(ck.dsa_igates.size()) &&
+                    l < static_cast<int>(s.dsa_igates.size()) &&
+                    ck.dsa_igates[static_cast<size_t>(l)].size() >= dn &&
+                    s.dsa_igates[l].size() >= dn && dn > 0)
+                    std::memcpy(s.dsa_igates[l].data(), ck.dsa_igates[static_cast<size_t>(l)].data(),
+                                dn * sizeof(float));
+            }
+        }
+        s.history = ck.ids;
+        if (static_cast<int>(s.history.size()) > n)
+            s.history.resize(static_cast<size_t>(n));
+        s.pos = n;
+        s.have = n > 0;
+    }
+
+    const PrefixCkpt *ckpt_lookup(const std::vector<int> &prompt) {
+        const int mn = ckpt_min();
+        const PrefixCkpt *best = nullptr;
+        size_t best_i = 0;
+        for (size_t i = 0; i < ckpts_.size(); ++i) {
+            const PrefixCkpt &c = ckpts_[i];
+            const int n = static_cast<int>(c.ids.size());
+            if (n < mn || n > static_cast<int>(prompt.size()))
+                continue;
+            if (!std::equal(c.ids.begin(), c.ids.end(), prompt.begin()))
+                continue;
+            if (!best || n > static_cast<int>(best->ids.size())) {
+                best = &c;
+                best_i = i;
+            }
+        }
+        if (!best)
+            return nullptr;
+        ckpts_[best_i].tick = ++ckpt_tick_;
+        ++ckpt_hits_;
+        if (ckpt_log())
+            std::fprintf(stderr, "v4_ckpt hit prefix=%d\n", static_cast<int>(best->ids.size()));
+        return &ckpts_[best_i];
+    }
+
+    void ckpt_insert(PrefixCkpt ck) {
+        if (ck.ids.empty() || ck.pos <= 0)
+            return;
+        for (auto &ex : ckpts_) {
+            if (ex.ids == ck.ids) {
+                const bool keep_prefix = !ex.prompt_end || !ck.prompt_end;
+                ex.kv = std::move(ck.kv);
+                ex.dsa_ikeys = std::move(ck.dsa_ikeys);
+                ex.dsa_igates = std::move(ck.dsa_igates);
+                ex.streams = std::move(ck.streams);
+                ex.pos = ck.pos;
+                if (keep_prefix)
+                    ex.prompt_end = false;
+                else
+                    ex.prompt_end = ck.prompt_end;
+                ex.tick = ++ckpt_tick_;
+                return;
+            }
+        }
+        const int cap = ckpt_slots();
+        while (static_cast<int>(ckpts_.size()) >= cap && !ckpts_.empty()) {
+            size_t evict = 0;
+            bool have_pe = false;
+            uint64_t oldest = ~uint64_t{0};
+            for (size_t i = 0; i < ckpts_.size(); ++i) {
+                if (!ckpts_[i].prompt_end)
+                    continue;
+                if (!have_pe || ckpts_[i].tick < oldest) {
+                    evict = i;
+                    oldest = ckpts_[i].tick;
+                    have_pe = true;
+                }
+            }
+            if (!have_pe) {
+                oldest = ~uint64_t{0};
+                for (size_t i = 0; i < ckpts_.size(); ++i) {
+                    if (ckpts_[i].tick < oldest) {
+                        evict = i;
+                        oldest = ckpts_[i].tick;
+                    }
+                }
+            }
+            ckpts_.erase(ckpts_.begin() + static_cast<std::ptrdiff_t>(evict));
+        }
+        ck.tick = ++ckpt_tick_;
+        ckpts_.push_back(std::move(ck));
+    }
+
+    void ckpt_store(const std::vector<int> &ids, const Slot &slot, bool prompt_end) {
+        if (!ckpt_enabled())
+            return;
+        const int n = static_cast<int>(ids.size());
+        if (n < ckpt_min() || slot.pos < n)
+            return;
+        PrefixCkpt ck = ckpt_clone_from_slot(slot, n);
+        ck.ids = ids;
+        ck.pos = n;
+        ck.prompt_end = prompt_end;
+        if (ckpt_log())
+            std::fprintf(stderr, "v4_ckpt store %s=%d\n", prompt_end ? "prompt_end" : "prefix", n);
+        const int disk = ckpt_disk();
+        const bool persist = disk == 2 || (disk == 1 && !prompt_end);
+        if (persist) {
+            PrefixCkpt disk_ck = ck;
+            ckpt_insert(std::move(ck));
+            ckpt_save_disk(disk_ck);
+        } else {
+            ckpt_insert(std::move(ck));
+        }
+    }
+
+    bool ckpt_write_blob(std::ostream &o, const PrefixCkpt &ck) const {
+        static const char kMagic[8] = {'D', 'S', 'V', '4', 'C', 'K', '1', '\0'};
+        if (!wr_bytes(o, kMagic, 8))
+            return false;
+        if (!wr_pod<uint64_t>(o, ckpt_fp()))
+            return false;
+        const int32_t n = static_cast<int32_t>(ck.ids.size());
+        if (!wr_pod<int32_t>(o, n))
+            return false;
+        if (n > 0 && !wr_bytes(o, ck.ids.data(), static_cast<size_t>(n) * sizeof(int)))
+            return false;
+        if (!wr_pod<int32_t>(o, static_cast<int32_t>(ck.pos)))
+            return false;
+        if (!wr_pod<int32_t>(o, ck.prompt_end ? 1 : 0))
+            return false;
+        const int32_t nL = cfg_.n_layers;
+        const int32_t hd = kv_width();
+        const int32_t idh = cfg_.dsa.head_dim;
+        const int32_t sn = static_cast<int32_t>(ck.streams.size());
+        if (!wr_pod<int32_t>(o, nL) || !wr_pod<int32_t>(o, hd) || !wr_pod<int32_t>(o, idh) ||
+            !wr_pod<int32_t>(o, sn))
+            return false;
+        auto wr_vec = [&](const std::vector<float> &v) {
+            const int32_t m = static_cast<int32_t>(v.size());
+            if (!wr_pod<int32_t>(o, m))
+                return false;
+            return m <= 0 || wr_bytes(o, v.data(), static_cast<size_t>(m) * sizeof(float));
+        };
+        for (int l = 0; l < nL; ++l) {
+            const std::vector<float> empty;
+            const std::vector<float> &kv =
+                l < static_cast<int>(ck.kv.size()) ? ck.kv[static_cast<size_t>(l)] : empty;
+            const std::vector<float> &ik =
+                l < static_cast<int>(ck.dsa_ikeys.size()) ? ck.dsa_ikeys[static_cast<size_t>(l)]
+                                                          : empty;
+            const std::vector<float> &ig =
+                l < static_cast<int>(ck.dsa_igates.size()) ? ck.dsa_igates[static_cast<size_t>(l)]
+                                                           : empty;
+            if (!wr_vec(kv) || !wr_vec(ik) || !wr_vec(ig))
+                return false;
+        }
+        return sn <= 0 || wr_bytes(o, ck.streams.data(), static_cast<size_t>(sn) * sizeof(float));
+    }
+
+    bool ckpt_read_blob(std::istream &in, PrefixCkpt &ck) const {
+        char magic[8];
+        if (!rd_bytes(in, magic, 8) || std::memcmp(magic, "DSV4CK1", 8) != 0)
+            return false;
+        uint64_t fp = 0;
+        if (!rd_pod<uint64_t>(in, fp) || fp != ckpt_fp())
+            return false;
+        int32_t n = 0;
+        if (!rd_pod<int32_t>(in, n) || n < 0 || n > (1 << 24))
+            return false;
+        ck.ids.resize(static_cast<size_t>(n));
+        if (n > 0 && !rd_bytes(in, ck.ids.data(), static_cast<size_t>(n) * sizeof(int)))
+            return false;
+        int32_t pos = 0, pe = 0;
+        if (!rd_pod<int32_t>(in, pos) || !rd_pod<int32_t>(in, pe))
+            return false;
+        ck.pos = pos;
+        ck.prompt_end = pe != 0;
+        int32_t nL = 0, hd = 0, idh = 0, sn = 0;
+        if (!rd_pod<int32_t>(in, nL) || !rd_pod<int32_t>(in, hd) || !rd_pod<int32_t>(in, idh) ||
+            !rd_pod<int32_t>(in, sn))
+            return false;
+        if (nL != cfg_.n_layers || hd != kv_width() || idh != cfg_.dsa.head_dim || sn < 0 ||
+            sn > (1 << 24))
+            return false;
+        auto rd_vec = [&](std::vector<float> &v) {
+            int32_t m = 0;
+            if (!rd_pod<int32_t>(in, m) || m < 0 || m > (1 << 26))
+                return false;
+            v.resize(static_cast<size_t>(m));
+            return m <= 0 || rd_bytes(in, v.data(), static_cast<size_t>(m) * sizeof(float));
+        };
+        ck.kv.assign(static_cast<size_t>(nL), {});
+        ck.dsa_ikeys.assign(static_cast<size_t>(nL), {});
+        ck.dsa_igates.assign(static_cast<size_t>(nL), {});
+        for (int l = 0; l < nL; ++l) {
+            if (!rd_vec(ck.kv[static_cast<size_t>(l)]) ||
+                !rd_vec(ck.dsa_ikeys[static_cast<size_t>(l)]) ||
+                !rd_vec(ck.dsa_igates[static_cast<size_t>(l)]))
+                return false;
+        }
+        ck.streams.resize(static_cast<size_t>(sn));
+        if (sn > 0 && !rd_bytes(in, ck.streams.data(), static_cast<size_t>(sn) * sizeof(float)))
+            return false;
+        if (ck.pos <= 0)
+            ck.pos = n;
+        return true;
+    }
+
+    uint64_t ckpt_ids_hash(const std::vector<int> &ids) const {
+        uint64_t h = 14695981039346656037ull;
+        return fnv1a64_bytes(h, ids.data(), ids.size() * sizeof(int));
+    }
+
+    void ckpt_save_disk(const PrefixCkpt &ck) {
+        const std::string dir = ckpt_dir();
+        if (dir.empty() || ck.ids.empty())
+            return;
+        if (::mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST)
+            return;
+        const std::string name = "ck_" + hex64(ckpt_fp()) + "_" + std::to_string(ck.ids.size()) +
+                                 "_" + hex64(ckpt_ids_hash(ck.ids)) + ".bin";
+        const std::string path = dir + "/" + name;
+        const std::string tmp = path + ".tmp";
+        {
+            std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+            if (!o || !ckpt_write_blob(o, ck)) {
+                o.close();
+                std::remove(tmp.c_str());
+                return;
+            }
+        }
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+            std::remove(tmp.c_str());
+            return;
+        }
+    }
+
+    void ckpt_load_disk() {
+        if (ckpt_disk_loaded_)
+            return;
+        ckpt_disk_loaded_ = true;
+        if (!ckpt_enabled() || ckpt_disk() == 0)
+            return;
+        const std::string dir = ckpt_dir();
+        if (dir.empty())
+            return;
+        DIR *d = ::opendir(dir.c_str());
+        if (!d)
+            return;
+        while (dirent *ent = ::readdir(d)) {
+            if (!ent->d_name[0] || ent->d_name[0] == '.')
+                continue;
+            const std::string path = dir + "/" + ent->d_name;
+            std::ifstream in(path, std::ios::binary);
+            if (!in)
+                continue;
+            PrefixCkpt ck;
+            if (!ckpt_read_blob(in, ck))
+                continue;
+            ckpt_insert(std::move(ck));
+        }
+        ::closedir(d);
+    }
+
+    Status ckpt_run_prefill(Slot &s, const std::vector<int> &prompt, const GenParams &gp,
+                            int kv_reuse, int Tmax, int &reuse, std::string &err) {
+        reuse = std::max(kv_reuse, 0);
+        if (ckpt_enabled()) {
+            ckpt_load_disk();
+            if (const PrefixCkpt *hit = ckpt_lookup(prompt)) {
+                if (hit->pos > reuse && hit->pos <= static_cast<int>(prompt.size())) {
+                    if (reuse == 0)
+                        slot_alloc(s, Tmax);
+                    PrefixCkpt ck = *hit;
+                    ckpt_apply(s, ck, Tmax);
+                    reuse = ck.pos;
+                }
+            }
+        }
+        if (reuse == 0)
+            slot_alloc(s, Tmax);
+        else
+            slot_ensure_t(s, Tmax);
+
+        const int snap = ckpt_enabled() ? ckpt_capture_point(prompt, gp) : 0;
+        if (snap >= ckpt_min() && snap <= static_cast<int>(prompt.size())) {
+            if (s.pos < snap) {
+                const std::vector<int> pref(prompt.begin(), prompt.begin() + snap);
+                Status st = slot_prefill(s, pref, s.pos, err);
+                if (st != Status::Ok)
+                    return st;
+            }
+            if (s.pos == snap) {
+                const std::vector<int> pref(prompt.begin(), prompt.begin() + snap);
+                ckpt_store(pref, s, false);
+            }
+        }
+        Status st = slot_prefill(s, prompt, s.pos, err);
+        if (st != Status::Ok)
+            return st;
+        if (ckpt_enabled() && static_cast<int>(prompt.size()) >= ckpt_min())
+            ckpt_store(prompt, s, true);
+        if (ckpt_enabled() && kv_reuse == 0)
+            last_fresh_prompt_ = prompt;
         return Status::Ok;
     }
 
@@ -1498,6 +2230,11 @@ private:
         mlp_down_, shared_gate_, shared_up_, shared_down_, dsa_wq_, dsa_wk_, dsa_wp_, dsa_kg_;
     std::vector<std::vector<uint8_t>> experts_;
     Slot slots_[kMaxKvSlots];
+    std::vector<PrefixCkpt> ckpts_;
+    uint64_t ckpt_tick_ = 1;
+    uint64_t ckpt_hits_ = 0;
+    std::vector<int> last_fresh_prompt_;
+    bool ckpt_disk_loaded_ = false;
 };
 
 std::unique_ptr<FamilyEngine> make_dsv4() { return std::make_unique<Dsv4Engine>(); }

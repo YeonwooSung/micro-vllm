@@ -201,7 +201,7 @@ void apply_family_defaults(ModelConfig &cfg) {
             cfg.mla.qk_nope = cfg.head_dim - cfg.mla.qk_rope;
         if (!cfg.mla.v_head)
             cfg.mla.v_head = cfg.head_dim;
-        if (!cfg.mla.kv_lora && full)
+        if (!cfg.mla.kv_lora)
             cfg.mla.kv_lora = cfg.head_dim;
         if (!cfg.o_lora && full)
             cfg.o_lora = 1024;
@@ -382,6 +382,8 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
     }
     out.dense_intermediate = jnum(text, "intermediate_size", 0);
     out.max_position = jnum(text, "max_position_embeddings", 0);
+    if (!out.max_position)
+        out.max_position = jnum(text, "original_max_position_embeddings", 0);
     out.rms_eps = jfloat(text, "rms_norm_eps", 1e-5f);
     out.rope_theta = jfloat(text, "rope_theta", 10000.f);
     if (text.contains("rope_parameters") && text["rope_parameters"].is_object())
@@ -430,7 +432,7 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
 
     out.mla.n_heads = jnum(text, "num_attention_heads", 0);
     out.mla.q_lora = jnum(text, "q_lora_rank", 0);
-    out.mla.kv_lora = jnum(text, "kv_lora_rank", 0);
+    out.mla.kv_lora = jnum(text, "kv_lora_rank", jnum(text, "kv_lora", 0));
     out.mla.qk_nope = jnum(text, "qk_nope_head_dim", 0);
     out.mla.qk_rope = jnum(text, "qk_rope_head_dim", 0);
     out.mla.v_head = jnum(text, "v_head_dim", 0);
@@ -568,6 +570,52 @@ Status load_model_config(const std::string &model_dir, ModelConfig &out, std::st
 
     if (out.family == Family::Unknown)
         out.family = sniff_family(model_dir, nullptr);
+
+    // Official HF / coli names for DSV4 when the generic keys left a field empty.
+    if (out.family == Family::Dsv4) {
+        if (!out.moe.n_experts)
+            out.moe.n_experts = jnum(text, "n_routed_experts", 0);
+        if (!out.moe.topk)
+            out.moe.topk = jnum(text, "num_experts_per_tok", 0);
+        if (!out.moe.n_shared)
+            out.moe.n_shared = jnum(text, "n_shared_experts", 0);
+        if (!out.mla.q_lora)
+            out.mla.q_lora = jnum(text, "q_lora_rank", 0);
+        if (!out.mla.qk_rope)
+            out.mla.qk_rope = jnum(text, "qk_rope_head_dim", 0);
+        if (!out.mla.kv_lora)
+            out.mla.kv_lora = jnum(text, "kv_lora_rank", jnum(text, "kv_lora", 0));
+        if (!out.dsa.topk)
+            out.dsa.topk = jnum(text, "index_topk", 0);
+        if (!out.dsa.n_heads)
+            out.dsa.n_heads = jnum(text, "index_n_heads", 0);
+        if (!out.dsa.head_dim)
+            out.dsa.head_dim = jnum(text, "index_head_dim", 0);
+        if (!out.sliding_window)
+            out.sliding_window = jnum(text, "sliding_window", 0);
+        if (!out.o_lora)
+            out.o_lora = jnum(text, "o_lora_rank", 0);
+        if (!out.o_groups)
+            out.o_groups = jnum(text, "o_groups", 0);
+        if (!out.max_position)
+            out.max_position = jnum(text, "original_max_position_embeddings",
+                                    jnum(text, "max_position_embeddings", 0));
+        if (!out.moe.intermediate)
+            out.moe.intermediate = jnum(text, "moe_intermediate_size", 0);
+        if (out.moe.routed_scale == 1.f)
+            out.moe.routed_scale = jfloat(text, "routed_scaling_factor", 1.f);
+        if (!out.moe.swiglu_limit)
+            out.moe.swiglu_limit = jfloat(text, "swiglu_limit", 0.f);
+        if (!out.mhc.mult)
+            out.mhc.mult = jnum(text, "hc_mult", 0);
+        out.mhc.iters = jnum(text, "hc_sinkhorn_iters", out.mhc.iters);
+        out.mhc.eps = jfloat(text, "hc_eps", out.mhc.eps);
+        if (out.rms_eps == 1e-5f)
+            out.rms_eps = jfloat(text, "rms_norm_eps", out.rms_eps);
+        if (out.rope_theta == 10000.f)
+            out.rope_theta = jfloat(text, "rope_theta", out.rope_theta);
+    }
+
     apply_family_defaults(out);
     if (out.family == Family::Unknown) {
         err = "could not detect model family in " + model_dir;

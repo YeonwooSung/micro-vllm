@@ -26,3 +26,6 @@ void softmaxDecode(__nv_bfloat16 *input, int seq_len);
 
 // pagedattn
 void pagedAttention(int layer, int num_active_slots, __nv_bfloat16 *q_proj, __nv_bfloat16 *kv_cache, int *block_table_gpu, int *gpu_seq_lens, int *gpu_active_slots, __nv_bfloat16 *output);
+
+// For each of `n` rows of `logits` (row-major, vocab columns), write argmax index to `out_ids`.
+void argmaxRows(const __nv_bfloat16 *logits, int *out_ids, int n, int vocab);

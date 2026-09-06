@@ -112,7 +112,7 @@ struct ModelConfig {
     int vocab = 0;
     int first_dense = 0;
     int dense_intermediate = 0;
-    int max_position = 0;
+    int max_position = 0; // max_position_embeddings / original_max_position_embeddings
     float rms_eps = 1e-5f;
     float rope_theta = 10000.f;
     int bos = 0;

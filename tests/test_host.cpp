@@ -71,6 +71,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -1065,9 +1066,66 @@ static void test_dsv4_tiny() {
     CHECK(tcfg.n_layers == 2);
     CHECK(tcfg.moe.n_experts == 4);
     CHECK(tcfg.moe.topk == 2);
+    CHECK(tcfg.moe.n_shared == 1);
     CHECK(tcfg.head_dim == 16);
+    CHECK(tcfg.mla.kv_lora == 16);
     CHECK(tcfg.o_lora == 16);
     CHECK(tcfg.sliding_window == 8);
+    CHECK(tcfg.dsa.topk == 2);
+    CHECK(tcfg.dsa.n_heads == 2);
+    CHECK(tcfg.dsa.head_dim == 16);
+
+    std::string official = tmpdir();
+    write_file(official + "/config.json", R"({
+      "model_type": "deepseek_v4",
+      "architectures": ["DeepseekV4ForCausalLM"],
+      "hidden_size": 32,
+      "num_hidden_layers": 1,
+      "vocab_size": 16,
+      "n_routed_experts": 3,
+      "num_experts_per_tok": 2,
+      "n_shared_experts": 1,
+      "index_topk": 4,
+      "index_n_heads": 2,
+      "index_head_dim": 8,
+      "q_lora_rank": 8,
+      "kv_lora": 12,
+      "qk_rope_head_dim": 4,
+      "o_lora_rank": 8,
+      "o_groups": 2,
+      "sliding_window": 7,
+      "moe_intermediate_size": 16,
+      "routed_scaling_factor": 1.25,
+      "swiglu_limit": 7.0,
+      "hc_mult": 3,
+      "hc_sinkhorn_iters": 5,
+      "hc_eps": 1e-4,
+      "rope_theta": 50000,
+      "rms_norm_eps": 1e-6,
+      "original_max_position_embeddings": 4096
+    })");
+    CHECK(sniff_family(official) == Family::Dsv4);
+    ModelConfig ocfg;
+    CHECK(load_model_config(official, ocfg, err) == Status::Ok);
+    CHECK(ocfg.family == Family::Dsv4);
+    CHECK(ocfg.moe.n_experts == 3);
+    CHECK(ocfg.moe.topk == 2);
+    CHECK(ocfg.moe.n_shared == 1);
+    CHECK(ocfg.dsa.topk == 4);
+    CHECK(ocfg.dsa.n_heads == 2);
+    CHECK(ocfg.dsa.head_dim == 8);
+    CHECK(ocfg.mla.q_lora == 8);
+    CHECK(ocfg.mla.kv_lora == 12);
+    CHECK(ocfg.mla.qk_rope == 4);
+    CHECK(ocfg.o_lora == 8);
+    CHECK(ocfg.o_groups == 2);
+    CHECK(ocfg.sliding_window == 7);
+    CHECK(ocfg.moe.intermediate == 16);
+    CHECK(ocfg.moe.routed_scale > 1.2f && ocfg.moe.routed_scale < 1.3f);
+    CHECK(ocfg.moe.swiglu_limit == 7.f);
+    CHECK(ocfg.mhc.mult == 3);
+    CHECK(ocfg.mhc.iters == 5);
+    CHECK(ocfg.max_position == 4096);
 
     Engine e;
     RuntimeConfig rt;
@@ -1079,11 +1137,66 @@ static void test_dsv4_tiny() {
     GenParams gp;
     gp.max_new_tokens = 4;
     gp.eos = 1;
+    gp.cache_slot = 0;
     GenResult gr;
     CHECK(e.generate("hi", gp, gr, err) == Status::Ok);
     CHECK(gr.completion_tokens > 0);
     CHECK(gr.completion_tokens <= 4);
     CHECK(gr.prompt_tokens > 0);
+
+    FamilyEngine *fe = e.family_impl();
+    CHECK(fe != nullptr);
+    GenParams stream;
+    stream.max_new_tokens = 3;
+    stream.eos = 1;
+    int reuse = 0;
+    const std::vector<int> ids = {1, 2, 3};
+    CHECK(fe->begin_generate(0, ids, stream, reuse, err) == Status::Ok);
+    int nstep = 0;
+    for (;;) {
+        int tok = -1;
+        bool done = false;
+        CHECK(fe->next_token(0, tok, done, err) == Status::Ok);
+        ++nstep;
+        if (done)
+            break;
+        CHECK(nstep < 8);
+    }
+    CHECK(nstep > 0);
+    fe->end_generate(0);
+
+    KvPersistRecord row;
+    const int nL = std::max(e.config().n_layers, 1);
+    const int kvL = std::max(e.config().mla.kv_lora, 0);
+    const int qr = std::max(e.config().mla.qk_rope, 0);
+    const int idh = std::max(e.config().dsa.head_dim, 0);
+    row.L.assign(static_cast<size_t>(nL) * static_cast<size_t>(std::max(kvL, 1)), 0.f);
+    row.R.assign(static_cast<size_t>(nL) * static_cast<size_t>(std::max(qr, 1)), 0.f);
+    row.I.assign(static_cast<size_t>(nL) * static_cast<size_t>(std::max(idh, 1)), 0.f);
+    CHECK(fe->export_kv_rows(0, 0, 1, &row) > 0);
+    CHECK(fe->export_kv_rows(-1, 0, 1, &row) == 0);
+    CHECK(fe->export_kv_rows(99, 0, 1, &row) == 0);
+    CHECK(fe->export_kv_rows(0, 0, 1, nullptr) == 0);
+    CHECK(fe->import_kv_rows(1, 0, 1, &row) == 1);
+    KvPersistRecord back;
+    back.L.assign(row.L.size(), 0.f);
+    back.R.assign(row.R.size(), 0.f);
+    back.I.assign(row.I.size(), 0.f);
+    CHECK(fe->export_kv_rows(1, 0, 1, &back) == 1);
+    CHECK(back.L == row.L);
+    CHECK(back.R == row.R);
+    CHECK(back.I == row.I);
+    CHECK(fe->import_kv_rows(-1, 0, 1, &row) == 0);
+
+    int reuse0 = 0, reuse1 = 0;
+    CHECK(fe->begin_generate(0, ids, stream, reuse0, err) == Status::Ok);
+    CHECK(fe->begin_generate(1, {2, 3}, stream, reuse1, err) == Status::Ok);
+    int mux_slots[2] = {0, 1};
+    int mux_toks[2] = {-1, -1};
+    uint8_t mux_done[2] = {0, 0};
+    CHECK(fe->next_tokens(mux_slots, 2, mux_toks, mux_done, err) == Status::Ok);
+    fe->end_generate(0);
+    fe->end_generate(1);
 
     Tokenizer tk;
     std::string chat = tk.apply_chat(Family::Dsv4, {{"user", "hi"}}, false);
@@ -1091,6 +1204,153 @@ static void test_dsv4_tiny() {
     CHECK(chat.find("<｜Assistant｜>") != std::string::npos);
     std::string think = tk.apply_chat(Family::Dsv4, {{"user", "hi"}}, true);
     CHECK(think.find("<think>") != std::string::npos);
+}
+
+static std::string env_copy(const char *k) {
+    const char *v = std::getenv(k);
+    return v ? std::string(v) : std::string();
+}
+
+static void env_restore(const char *k, const std::string &prev, bool had) {
+    if (had)
+        setenv(k, prev.c_str(), 1);
+    else
+        unsetenv(k);
+}
+
+static bool parse_dsv4_ckpt(const std::string &d, int &ckpt, unsigned long long &hits) {
+    const auto cpos = d.find("ckpt=");
+    const auto hpos = d.find("hits=");
+    if (cpos == std::string::npos || hpos == std::string::npos)
+        return false;
+    ckpt = std::atoi(d.c_str() + cpos + 5);
+    hits = std::strtoull(d.c_str() + hpos + 5, nullptr, 10);
+    return true;
+}
+
+static bool dir_has_files(const std::string &p) {
+    DIR *d = ::opendir(p.c_str());
+    if (!d)
+        return false;
+    bool any = false;
+    while (dirent *e = ::readdir(d)) {
+        if (e->d_name[0] == '.')
+            continue;
+        any = true;
+        break;
+    }
+    ::closedir(d);
+    return any;
+}
+
+static void test_dsv4_prefix_ckpt() {
+    using namespace mvllm;
+    const char *keys[] = {"V4_PREFIX_CKPT",         "V4_PREFIX_CKPT_MIN", "V4_PREFIX_CKPT_DISK",
+                          "V4_PREFIX_CKPT_SLOTS",   "V4_PREFIX_LOG",     "MVLLM_PREFIX_CKPT",
+                          "MVLLM_PREFIX_CKPT_MIN",  "MVLLM_PREFIX_CKPT_DISK",
+                          "MVLLM_PREFIX_CKPT_SLOTS", "MVLLM_PREFIX_CKPT_LOG"};
+    std::string prev[10];
+    bool had[10];
+    for (int i = 0; i < 10; ++i) {
+        had[i] = std::getenv(keys[i]) != nullptr;
+        prev[i] = env_copy(keys[i]);
+    }
+    unsetenv("MVLLM_PREFIX_CKPT");
+    unsetenv("MVLLM_PREFIX_CKPT_MIN");
+    unsetenv("MVLLM_PREFIX_CKPT_DISK");
+    unsetenv("MVLLM_PREFIX_CKPT_SLOTS");
+    unsetenv("MVLLM_PREFIX_CKPT_LOG");
+    setenv("V4_PREFIX_CKPT", "1", 1);
+    setenv("V4_PREFIX_CKPT_MIN", "2", 1);
+    setenv("V4_PREFIX_CKPT_DISK", "2", 1);
+    setenv("V4_PREFIX_CKPT_SLOTS", "4", 1);
+
+    std::string err;
+    std::string tiny = tmpdir();
+    write_file(tiny + "/config.json", R"({
+      "architectures": ["DeepseekV4ForCausalLM"],
+      "model_type": "deepseek_v4",
+      "hidden_size": 32,
+      "num_hidden_layers": 2,
+      "vocab_size": 32,
+      "num_attention_heads": 2,
+      "head_dim": 16,
+      "q_lora_rank": 16,
+      "qk_rope_head_dim": 8,
+      "o_groups": 1,
+      "o_lora_rank": 16,
+      "sliding_window": 8,
+      "index_n_heads": 2,
+      "index_head_dim": 16,
+      "index_topk": 2,
+      "n_routed_experts": 4,
+      "num_experts_per_tok": 2,
+      "n_shared_experts": 1,
+      "moe_intermediate_size": 16,
+      "hc_mult": 2,
+      "bos_token_id": 0,
+      "eos_token_id": 1
+    })");
+
+    Engine e;
+    RuntimeConfig rt;
+    rt.expert_gb = 0.01;
+    CHECK(e.load(tiny, rt, err) == Status::Ok);
+    FamilyEngine *fe = e.family_impl();
+    CHECK(fe != nullptr);
+
+    GenParams gp;
+    gp.max_new_tokens = 1;
+    gp.eos = 1;
+    gp.prefix_reuse = 3;
+    GenResult gr;
+    const bool dsv4_ckpt_first_ok = fe->generate({2, 3, 4, 5}, gp, gr, err) == Status::Ok;
+    CHECK(dsv4_ckpt_first_ok);
+    int ckpt_n = 0;
+    unsigned long long hits_n = 0;
+    const bool dsv4_ckpt_desc1 = parse_dsv4_ckpt(fe->describe(), ckpt_n, hits_n);
+    CHECK(dsv4_ckpt_desc1);
+    const bool dsv4_ckpt_prompt_end = ckpt_n >= 1;
+    CHECK(dsv4_ckpt_prompt_end);
+
+    gp.prefix_reuse = 0;
+    const bool dsv4_ckpt_second_ok = fe->generate({2, 3, 4, 6}, gp, gr, err) == Status::Ok;
+    CHECK(dsv4_ckpt_second_ok);
+    const bool dsv4_ckpt_desc2 = parse_dsv4_ckpt(fe->describe(), ckpt_n, hits_n);
+    CHECK(dsv4_ckpt_desc2);
+    const bool dsv4_ckpt_hit_prefix3 = hits_n >= 1;
+    CHECK(dsv4_ckpt_hit_prefix3);
+
+    const bool dsv4_ckpt_disk_dir = dir_has_files(tiny + "/.coli_ckpt");
+    CHECK(dsv4_ckpt_disk_dir);
+
+    Engine e2;
+    const bool dsv4_ckpt_reload_ok = e2.load(tiny, rt, err) == Status::Ok;
+    CHECK(dsv4_ckpt_reload_ok);
+    FamilyEngine *fe2 = e2.family_impl();
+    CHECK(fe2 != nullptr);
+    const bool dsv4_ckpt_third_ok = fe2->generate({2, 3, 4, 7}, gp, gr, err) == Status::Ok;
+    CHECK(dsv4_ckpt_third_ok);
+    int ckpt2 = 0;
+    unsigned long long hits2 = 0;
+    const bool dsv4_ckpt_desc3 = parse_dsv4_ckpt(fe2->describe(), ckpt2, hits2);
+    CHECK(dsv4_ckpt_desc3);
+    const bool dsv4_ckpt_lazy_hit = hits2 >= 1;
+    CHECK(dsv4_ckpt_lazy_hit);
+
+    setenv("V4_PREFIX_CKPT", "0", 1);
+    const unsigned long long hits_before_off = hits2;
+    const bool dsv4_ckpt_off_ok = fe2->generate({2, 3, 4, 8}, gp, gr, err) == Status::Ok;
+    CHECK(dsv4_ckpt_off_ok);
+    int ckpt_off = 0;
+    unsigned long long hits_off = 0;
+    const bool dsv4_ckpt_desc_off = parse_dsv4_ckpt(fe2->describe(), ckpt_off, hits_off);
+    CHECK(dsv4_ckpt_desc_off);
+    const bool dsv4_ckpt_disabled_no_new_hits = hits_off == hits_before_off;
+    CHECK(dsv4_ckpt_disabled_no_new_hits);
+
+    for (int i = 0; i < 10; ++i)
+        env_restore(keys[i], prev[i], had[i]);
 }
 
 static void test_idot() {
@@ -2823,6 +3083,7 @@ int main() {
     test_glm_eos_ids();
     test_config_and_families();
     test_dsv4_tiny();
+    test_dsv4_prefix_ckpt();
     test_offload_generate();
     test_glm53_container();
     test_k3_mxfp4_container();

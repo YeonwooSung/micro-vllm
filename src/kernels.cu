@@ -477,3 +477,64 @@ void pagedAttention(int layer, int num_active_slots, __nv_bfloat16 *q_proj, __nv
 {
     pagedAttentionKernel<<<dim3(num_active_slots, NUM_Q_HEADS), HEAD_DIM>>>(layer, num_active_slots, q_proj, kv_cache, block_table_gpu, gpu_seq_lens, gpu_active_slots, output);
 }
+
+// one block per row; each thread grid-strides over vocab and reduces in shared memory
+__global__ void argmaxRowsKernel(const __nv_bfloat16 *logits, int *out_ids, int n, int vocab)
+{
+    int row = blockIdx.x;
+    if (row >= n)
+    {
+        return;
+    }
+    const __nv_bfloat16 *row_logits = logits + (size_t)row * (size_t)vocab;
+    float best_val = -INFINITY;
+    int best_idx = 0;
+    for (int col = threadIdx.x; col < vocab; col += blockDim.x)
+    {
+        float v = (float)row_logits[col];
+        if (v > best_val)
+        {
+            best_val = v;
+            best_idx = col;
+        }
+    }
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    s_val[threadIdx.x] = best_val;
+    s_idx[threadIdx.x] = best_idx;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+    {
+        if (threadIdx.x < stride)
+        {
+            float other_val = s_val[threadIdx.x + stride];
+            int other_idx = s_idx[threadIdx.x + stride];
+            if (other_val > s_val[threadIdx.x] || (other_val == s_val[threadIdx.x] && other_idx < s_idx[threadIdx.x]))
+            {
+                s_val[threadIdx.x] = other_val;
+                s_idx[threadIdx.x] = other_idx;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+    {
+        out_ids[row] = s_idx[0];
+    }
+}
+
+void argmaxRows(const __nv_bfloat16 *logits, int *out_ids, int n, int vocab)
+{
+    if (n <= 0 || vocab <= 0)
+    {
+        return;
+    }
+    argmaxRowsKernel<<<n, 256>>>(logits, out_ids, n, vocab);
+#ifdef DEBUG
+    cudaError error = cudaGetLastError();
+    if (error != cudaError::cudaSuccess)
+    {
+        std::cout << "CUDA last error: " << cudaGetLastError() << std::endl;
+    }
+#endif
+}

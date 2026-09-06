@@ -117,7 +117,9 @@ DeepSeek V4 Flash (`deepseek-ai/DeepSeek-V4-Flash-0731`): 43 layers, hidden 4096
 256 routed MXFP4 experts + 1 shared, top-6, MLA + DSA + mHC. Official names are
 `layers.N.ffn.experts.E.w{1,2,3}.{weight,scale}` (also HF
 `layers.N.mlp.experts.E`). Dense overlay is FP8-e4m3 / BF16 at load; missing
-shards keep the synthetic pack so tiny fixtures generate.
+shards keep the synthetic pack so tiny fixtures generate. Mux `next_tokens`
+samples all live slots then steps the continuing ones; COLIKV
+`export_kv_rows`/`import_kv_rows` persist layer-major L/R plus concatenated DSA keys.
 
 Wired (host tests cover the store path):
 
@@ -199,6 +201,7 @@ extend the recorded fed ids, else prefill from scratch. Tainted state (ids
 cannot describe the input) never reuses. Equal or shorter prompts cannot rewind.
 `Engine::generate_ids` arms `KvPrefix` per slot and sets `prefix_reuse` from
 `reuse()` (no LCP fallback). Mux extras may pass `prefix_bytes` / `prefix_reuse`.
+DSV4 prefix checkpoints (`V4_PREFIX_CKPT`, `.coli_ckpt/`, LRU 4).
 
 `logprob_target` is official double softmax log p(token). Ragged decode
 rows are `kv_row(base, pos, width)` per sequence. UTF-8 is official
