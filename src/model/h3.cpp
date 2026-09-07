@@ -6,6 +6,7 @@
 #include "h3_vae.hpp"
 #include "h3_vision.hpp"
 #include "../gpu/backend.hpp"
+#include "../gpu/metal_h3.hpp"
 #include "../io/av_mux.hpp"
 #include "../io/image.hpp"
 #include "../io/safetensors.hpp"
@@ -183,6 +184,7 @@ public:
             avae_.load(model_dir, aerr);
         }
         loaded_ = true;
+        metal_h3::init();
         return Status::Ok;
     }
 
@@ -660,15 +662,21 @@ public:
                                         adaln_b_[static_cast<size_t>(b)][static_cast<size_t>(i)];
                         }
                     }
-                    if (!mod.empty() || r_cos) {
+                    {
                         AccTimer t(t_attn_);
-                        h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
-                                         latent.data(), seq, 1e-6f,
-                                         mod.empty() ? nullptr : mod.data(), qn, kn, r_cos, r_sin);
-                    } else {
-                        AccTimer t(t_attn_);
-                        gpu::dit_block(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
-                                       latent.data(), seq, 1e-6f);
+                        if (!metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner,
+                                                    ffn, hd, latent.data(), seq, 1e-6f,
+                                                    mod.empty() ? nullptr : mod.data(), qn, kn,
+                                                    r_cos, r_sin)) {
+                            if (!mod.empty() || r_cos)
+                                h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner,
+                                                 ffn, hd, latent.data(), seq, 1e-6f,
+                                                 mod.empty() ? nullptr : mod.data(), qn, kn, r_cos,
+                                                 r_sin);
+                            else
+                                gpu::dit_block(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
+                                               hd, latent.data(), seq, 1e-6f);
+                        }
                     }
                     ++computed;
                 }
@@ -883,7 +891,8 @@ public:
            << " lh=" << vae_.geom.latent_h << " lw=" << vae_.geom.latent_w
            << " ch=" << vae_.geom.latent_ch
            << " audio=" << (avae_.from_checkpoint ? "real" : "synth")
-           << " vision=" << (vision_.from_checkpoint() ? "qwen" : "off");
+           << " vision=" << (vision_.from_checkpoint() ? "qwen" : "off")
+           << " h3gpu=" << metal_h3::backend_name();
         return os.str();
     }
 

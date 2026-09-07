@@ -111,10 +111,14 @@ set(MVLLM_HOST_SOURCES
     src/gpu/backend.cpp
     src/gpu/dsv4_cuda.cpp
     src/gpu/coli_cuda.cpp
+    src/gpu/metal_ops.cpp
+    src/gpu/metal_h3.cpp
 )
 
 if(APPLE AND MVLLM_METAL)
     list(APPEND MVLLM_HOST_SOURCES src/gpu/metal.mm)
+    list(REMOVE_ITEM MVLLM_HOST_SOURCES src/gpu/metal_ops.cpp src/gpu/metal_h3.cpp)
+    list(APPEND MVLLM_HOST_SOURCES src/gpu/metal_ops.mm src/gpu/metal_h3.mm)
 endif()
 
 if(MVLLM_GPU_CUDA)
@@ -146,7 +150,7 @@ if(APPLE)
                                             "-framework CoreFoundation")
 endif()
 if(APPLE AND MVLLM_METAL)
-    set_source_files_properties(src/gpu/metal.mm PROPERTIES
+    set_source_files_properties(src/gpu/metal.mm src/gpu/metal_ops.mm src/gpu/metal_h3.mm PROPERTIES
         COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_compile_definitions(mvllm_host PUBLIC MVLLM_WITH_METAL=1)
     target_link_libraries(mvllm_host PUBLIC "-framework Metal" "-framework Foundation")

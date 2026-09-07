@@ -3,6 +3,8 @@
 #include "gpu/backend.hpp"
 #include "gpu/coli_cuda.hpp"
 #include "gpu/dsv4_cuda.hpp"
+#include "gpu/metal_ops.hpp"
+#include "gpu/metal_h3.hpp"
 #include "legacy/llama_dims.hpp"
 #include "io/dump_env.hpp"
 #include "io/file_io.hpp"
@@ -2170,6 +2172,114 @@ static void test_coli_cuda_tier() {
     shutdown();
 }
 
+static void test_metal_ops_tier() {
+    using namespace mvllm;
+    using namespace mvllm::metal_ops;
+
+    const bool metal_ops_init = init();
+    CHECK(metal_ops_init);
+    const bool metal_ops_avail = available();
+    CHECK(metal_ops_avail);
+
+    {
+        const float metal_ops_ones[4] = {1.f, 1.f, 1.f, 1.f};
+        const float metal_ops_w[4] = {1.f, 1.f, 1.f, 1.f};
+        float metal_ops_yn[4] = {};
+        const bool metal_ops_rms = rmsnorm(metal_ops_yn, metal_ops_ones, metal_ops_w, 1, 4, 1e-6f);
+        CHECK(metal_ops_rms);
+        const bool metal_ops_rms_fin = std::isfinite(metal_ops_yn[0]) && std::isfinite(metal_ops_yn[1]) &&
+                                       std::isfinite(metal_ops_yn[2]) && std::isfinite(metal_ops_yn[3]);
+        CHECK(metal_ops_rms_fin);
+    }
+
+    {
+        float metal_ops_acc[1] = {1.f};
+        const float metal_ops_addend[1] = {2.f};
+        const bool metal_ops_add = add(metal_ops_acc, metal_ops_addend, 1);
+        CHECK(metal_ops_add);
+        CHECK_NEAR(metal_ops_acc[0], 3.f, 1e-5);
+    }
+
+    {
+        float metal_ops_g[4] = {0.5f, -0.25f, 1.f, -1.f};
+        const float metal_ops_u[4] = {1.f, 2.f, 0.5f, -0.5f};
+        const bool metal_ops_silu = silu_mul(metal_ops_g, metal_ops_u, 4);
+        CHECK(metal_ops_silu);
+        const bool metal_ops_silu_fin = std::isfinite(metal_ops_g[0]) && std::isfinite(metal_ops_g[1]) &&
+                                        std::isfinite(metal_ops_g[2]) && std::isfinite(metal_ops_g[3]);
+        CHECK(metal_ops_silu_fin);
+    }
+
+    {
+        const int metal_ops_H = 2, metal_ops_hd = 4, metal_ops_K = 4, metal_ops_P = 8;
+        std::vector<float> metal_ops_win_q(static_cast<size_t>(metal_ops_P) * metal_ops_K, 0.f);
+        std::vector<float> metal_ops_win_k(static_cast<size_t>(metal_ops_P) * metal_ops_K, 0.f);
+        std::vector<float> metal_ops_win_v(static_cast<size_t>(metal_ops_P) * metal_ops_K, 0.f);
+        std::vector<float> metal_ops_qt(metal_ops_P, 0.1f);
+        std::vector<float> metal_ops_kt(metal_ops_P, 0.2f);
+        std::vector<float> metal_ops_tv(metal_ops_P, 0.3f);
+        std::vector<float> metal_ops_taps_q(static_cast<size_t>(metal_ops_P) * metal_ops_K, 0.f);
+        std::vector<float> metal_ops_taps_k(static_cast<size_t>(metal_ops_P) * metal_ops_K, 0.f);
+        std::vector<float> metal_ops_taps_v(static_cast<size_t>(metal_ops_P) * metal_ops_K, 0.f);
+        for (int p = 0; p < metal_ops_P; ++p) {
+            metal_ops_taps_q[static_cast<size_t>(p) * metal_ops_K + (metal_ops_K - 1)] = 1.f;
+            metal_ops_taps_k[static_cast<size_t>(p) * metal_ops_K + (metal_ops_K - 1)] = 1.f;
+            metal_ops_taps_v[static_cast<size_t>(p) * metal_ops_K + (metal_ops_K - 1)] = 1.f;
+        }
+        std::vector<float> metal_ops_S(static_cast<size_t>(metal_ops_H) * metal_ops_hd * metal_ops_hd,
+                                       0.f);
+        std::vector<float> metal_ops_alpha(static_cast<size_t>(metal_ops_H) * metal_ops_hd, 1.f);
+        std::vector<float> metal_ops_beta(metal_ops_H, 0.5f);
+        std::vector<float> metal_ops_oh(static_cast<size_t>(metal_ops_H) * metal_ops_hd, 0.f);
+        const bool metal_ops_kda =
+            kda_fused_token(metal_ops_win_q.data(), metal_ops_qt.data(), metal_ops_win_k.data(),
+                            metal_ops_kt.data(), metal_ops_win_v.data(), metal_ops_tv.data(),
+                            metal_ops_taps_q.data(), metal_ops_taps_k.data(), metal_ops_taps_v.data(),
+                            metal_ops_S.data(), metal_ops_alpha.data(), metal_ops_beta.data(),
+                            metal_ops_oh.data(), metal_ops_P, metal_ops_K, metal_ops_H, metal_ops_hd);
+        CHECK(metal_ops_kda);
+        bool metal_ops_oh_ok = true;
+        for (float v : metal_ops_oh)
+            metal_ops_oh_ok = metal_ops_oh_ok && std::isfinite(v);
+        const bool metal_ops_kda_fin = metal_ops_oh_ok;
+        CHECK(metal_ops_kda_fin);
+    }
+}
+
+static void test_metal_h3_tier() {
+    using namespace mvllm;
+    using namespace mvllm::metal_h3;
+
+    const bool metal_h3_init = init();
+    CHECK(metal_h3_init);
+
+    const int metal_h3_hidden = 8, metal_h3_inner = 8, metal_h3_ffn = 8, metal_h3_hd = 4,
+              metal_h3_tokens = 2;
+    const int64_t metal_h3_qkv_n = static_cast<int64_t>(3) * metal_h3_inner * metal_h3_hidden;
+    const int64_t metal_h3_out_n = static_cast<int64_t>(metal_h3_hidden) * metal_h3_inner;
+    const int64_t metal_h3_fc1_n = static_cast<int64_t>(2) * metal_h3_ffn * metal_h3_hidden;
+    const int64_t metal_h3_fc2_n = static_cast<int64_t>(metal_h3_hidden) * metal_h3_ffn;
+    std::vector<uint8_t> metal_h3_blob(
+        static_cast<size_t>(2 * (metal_h3_qkv_n + metal_h3_out_n + metal_h3_fc1_n + metal_h3_fc2_n)));
+    uint16_t *metal_h3_bf = reinterpret_cast<uint16_t *>(metal_h3_blob.data());
+    for (int64_t i = 0; i < metal_h3_qkv_n + metal_h3_out_n + metal_h3_fc1_n + metal_h3_fc2_n; ++i)
+        metal_h3_bf[i] = bf16_encode(((i * 17) % 11 - 5) * 0.05f);
+    std::vector<float> metal_h3_x(static_cast<size_t>(metal_h3_tokens) * metal_h3_hidden);
+    for (int i = 0; i < metal_h3_tokens * metal_h3_hidden; ++i)
+        metal_h3_x[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+    const bool metal_h3_dit =
+        dit_residual(metal_h3_blob.data(), metal_h3_qkv_n * 2, metal_h3_out_n * 2, metal_h3_fc1_n * 2,
+                     metal_h3_fc2_n * 2, metal_h3_hidden, metal_h3_inner, metal_h3_ffn, metal_h3_hd,
+                     metal_h3_x.data(), metal_h3_tokens, 1e-6f, nullptr, nullptr, nullptr, nullptr,
+                     nullptr);
+    CHECK(metal_h3_dit);
+    bool metal_h3_x_ok = true;
+    for (float v : metal_h3_x)
+        metal_h3_x_ok = metal_h3_x_ok && std::isfinite(v);
+    const bool metal_h3_dit_fin = metal_h3_x_ok;
+    CHECK(metal_h3_dit_fin);
+}
+
 static void test_llama_dims_helpers() {
     const bool llama_dims_nlayers = N_LAYERS == 16;
     CHECK(llama_dims_nlayers);
@@ -3943,6 +4053,8 @@ int main() {
     test_dsv4_prefix_ckpt();
     test_dsv4_cuda_tier();
     test_coli_cuda_tier();
+    test_metal_ops_tier();
+    test_metal_h3_tier();
     test_llama_dims_helpers();
     test_offload_generate();
     test_glm53_container();

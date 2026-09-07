@@ -1,4 +1,5 @@
 #include "family.hpp"
+#include "../gpu/coli_cuda.hpp"
 #include "../quant/quant.hpp"
 #include "../tok/logit_dump.hpp"
 #include "../tok/sample_nuc.hpp"
@@ -37,6 +38,95 @@ struct AccTimer {
             *acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
 };
+
+// y[I,O] = I_I @ W[O,I]^T  ⇒  W[o,i] = y[i,o]
+bool expand_quant_wt(const quant::QuantMat &w, std::vector<float> &wt) {
+    if (w.empty() || w.I <= 0 || w.O <= 0)
+        return false;
+    std::vector<float> ident(static_cast<size_t>(w.I) * static_cast<size_t>(w.I), 0.f);
+    for (int i = 0; i < w.I; ++i)
+        ident[static_cast<size_t>(i) * w.I + i] = 1.f;
+    wt.assign(static_cast<size_t>(w.I) * static_cast<size_t>(w.O), 0.f);
+    w.gemm(wt.data(), ident.data(), w.I);
+    return true;
+}
+
+// coli kv_b [H*(Q+V), K]: Wk[q,k] = Wkt[h*K+k, q], Wv[v,k] = Wv[h*V+v, k]
+bool pack_mla_kvb_f32(std::vector<float> &kvb, const quant::QuantMat &w_kt,
+                      const quant::QuantMat &w_v, int H, int Q, int V, int K) {
+    if (H <= 0 || Q <= 0 || V <= 0 || K <= 0)
+        return false;
+    if (w_kt.I != Q || w_v.I != K || w_kt.O < H * K || w_v.O < H * V)
+        return false;
+    const int rows = H * (Q + V);
+    kvb.assign(static_cast<size_t>(rows) * static_cast<size_t>(K), 0.f);
+    if (w_kt.fmt == 0 && w_v.fmt == 0 && !w_kt.f.empty() && !w_v.f.empty()) {
+        for (int h = 0; h < H; ++h) {
+            for (int q = 0; q < Q; ++q)
+                for (int k = 0; k < K; ++k)
+                    kvb[(static_cast<size_t>(h) * (Q + V) + q) * K + k] =
+                        w_kt.f[(static_cast<size_t>(h) * K + k) * Q + q];
+            for (int v = 0; v < V; ++v)
+                std::memcpy(kvb.data() + (static_cast<size_t>(h) * (Q + V) + Q + v) * K,
+                            w_v.f.data() + (static_cast<size_t>(h) * V + v) * K,
+                            static_cast<size_t>(K) * sizeof(float));
+        }
+        return true;
+    }
+    std::vector<float> kt_wt, v_wt;
+    if (!expand_quant_wt(w_kt, kt_wt) || !expand_quant_wt(w_v, v_wt))
+        return false;
+    for (int h = 0; h < H; ++h) {
+        for (int q = 0; q < Q; ++q)
+            for (int k = 0; k < K; ++k)
+                kvb[(static_cast<size_t>(h) * (Q + V) + q) * K + k] =
+                    kt_wt[static_cast<size_t>(q) * w_kt.O + (h * K + k)];
+        for (int v = 0; v < V; ++v)
+            for (int k = 0; k < K; ++k)
+                kvb[(static_cast<size_t>(h) * (Q + V) + Q + v) * K + k] =
+                    v_wt[static_cast<size_t>(k) * w_v.O + (h * V + v)];
+    }
+    return true;
+}
+
+bool mla_sel_is_prefix(const std::vector<int> &ts, int pos) {
+    if (pos < 0 || static_cast<int>(ts.size()) != pos + 1)
+        return false;
+    std::vector<unsigned char> seen(static_cast<size_t>(pos + 1), 0);
+    for (int t : ts) {
+        if (t < 0 || t > pos || seen[static_cast<size_t>(t)])
+            return false;
+        seen[static_cast<size_t>(t)] = 1;
+    }
+    return true;
+}
+
+bool mla_coli_absorb(float *ctx, const float *q, const float *cache, const quant::QuantMat &w_kt,
+                     const quant::QuantMat &w_v, int H, int Q, int R, int V, int K, int stride,
+                     int T, float scale) {
+    if (!ctx || !q || !cache || T <= 0 || stride < K)
+        return false;
+    std::vector<float> kvb;
+    if (!pack_mla_kvb_f32(kvb, w_kt, w_v, H, Q, V, K))
+        return false;
+    std::vector<float> latent(static_cast<size_t>(T) * static_cast<size_t>(K));
+    std::vector<float> rope(R > 0 ? static_cast<size_t>(T) * static_cast<size_t>(R) : 1, 0.f);
+    for (int t = 0; t < T; ++t) {
+        const float *ct = cache + static_cast<size_t>(t) * stride;
+        std::memcpy(latent.data() + static_cast<size_t>(t) * K, ct,
+                    static_cast<size_t>(K) * sizeof(float));
+        if (R > 0)
+            std::memcpy(rope.data() + static_cast<size_t>(t) * R, ct + K,
+                        static_cast<size_t>(R) * sizeof(float));
+    }
+    coli_cuda::Tensor *kv_t = nullptr;
+    if (!coli_cuda::tensor_upload(&kv_t, kvb.data(), nullptr, 0, K, H * (Q + V), 0, 0))
+        return false;
+    const bool ok = coli_cuda::attention_absorb(kv_t, ctx, q, latent.data(), rope.data(), H, Q, R,
+                                                V, K, T, scale);
+    coli_cuda::tensor_free(kv_t);
+    return ok;
+}
 
 } // namespace
 
@@ -1034,33 +1124,46 @@ void mla_step(const float *x, int hidden, const MlaConfig &mla, const quant::Qua
     const int nt = static_cast<int>(ts.size());
     const float scale = 1.f / std::sqrt(static_cast<float>(QH));
     std::vector<float> ctx(static_cast<size_t>(H) * Vh, 0.f);
-    std::vector<float> qabs(static_cast<size_t>(L));
-    std::vector<float> scores(static_cast<size_t>(std::max(nt, 1)));
-    std::vector<float> pooled(static_cast<size_t>(L));
-    for (int h = 0; h < H; ++h) {
-        const float *qh = q.data() + static_cast<size_t>(h) * QH;
-        w_kt->gemm_rows(qabs.data(), qh, 1, h * L, L);
-        for (int ti = 0; ti < nt; ++ti) {
-            const int t = ts[static_cast<size_t>(ti)];
-            const float *ct = cache + static_cast<size_t>(t) * stride;
-            float s = 0.f;
-            for (int i = 0; i < L; ++i)
-                s += qabs[i] * ct[i];
-            for (int i = 0; i < R; ++i)
-                s += qh[QK + i] * ct[L + i];
-            scores[static_cast<size_t>(ti)] = s * scale;
+
+    // coli absorb only for a dense prefix [0, pos]; sparse DSA stays on the host.
+    bool used_coli = false;
+    const bool prefix = !(selected && n_sel > 0) || mla_sel_is_prefix(ts, pos);
+    if (prefix) {
+        if (!coli_cuda::available())
+            coli_cuda::init(nullptr, 0);
+        if (coli_cuda::available())
+            used_coli = mla_coli_absorb(ctx.data(), q.data(), cache, *w_kt, *w_v, H, QK, R, Vh, L,
+                                        stride, pos + 1, scale);
+    }
+    if (!used_coli) {
+        std::vector<float> qabs(static_cast<size_t>(L));
+        std::vector<float> scores(static_cast<size_t>(std::max(nt, 1)));
+        std::vector<float> pooled(static_cast<size_t>(L));
+        for (int h = 0; h < H; ++h) {
+            const float *qh = q.data() + static_cast<size_t>(h) * QH;
+            w_kt->gemm_rows(qabs.data(), qh, 1, h * L, L);
+            for (int ti = 0; ti < nt; ++ti) {
+                const int t = ts[static_cast<size_t>(ti)];
+                const float *ct = cache + static_cast<size_t>(t) * stride;
+                float s = 0.f;
+                for (int i = 0; i < L; ++i)
+                    s += qabs[i] * ct[i];
+                for (int i = 0; i < R; ++i)
+                    s += qh[QK + i] * ct[L + i];
+                scores[static_cast<size_t>(ti)] = s * scale;
+            }
+            if (nt > 0)
+                quant::softmax_inplace(scores.data(), nt);
+            std::fill(pooled.begin(), pooled.end(), 0.f);
+            for (int ti = 0; ti < nt; ++ti) {
+                const int t = ts[static_cast<size_t>(ti)];
+                const float *ct = cache + static_cast<size_t>(t) * stride;
+                const float a = scores[static_cast<size_t>(ti)];
+                for (int i = 0; i < L; ++i)
+                    pooled[i] += a * ct[i];
+            }
+            w_v->gemm_rows(ctx.data() + static_cast<size_t>(h) * Vh, pooled.data(), 1, h * Vh, Vh);
         }
-        if (nt > 0)
-            quant::softmax_inplace(scores.data(), nt);
-        std::fill(pooled.begin(), pooled.end(), 0.f);
-        for (int ti = 0; ti < nt; ++ti) {
-            const int t = ts[static_cast<size_t>(ti)];
-            const float *ct = cache + static_cast<size_t>(t) * stride;
-            const float a = scores[static_cast<size_t>(ti)];
-            for (int i = 0; i < L; ++i)
-                pooled[i] += a * ct[i];
-        }
-        w_v->gemm_rows(ctx.data() + static_cast<size_t>(h) * Vh, pooled.data(), 1, h * Vh, Vh);
     }
     if (mla.output_gate && w_g && !w_g->empty()) {
         std::vector<float> g(static_cast<size_t>(H) * Vh, 0.f);

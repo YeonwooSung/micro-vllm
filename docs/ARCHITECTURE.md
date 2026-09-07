@@ -140,7 +140,8 @@ MLA (full-attn layers): absorbed NoPE. Cache stride is `kv_lora+qk_rope`
 (K3 `qk_rope=64`; GLM `0`). `score_j = (W_kᵀ q) · c_j + q_rot · R_j`,
 `out = W_v (Σ a_j c_j)`. `kv_b_proj` is folded at load (`mla_absorb_kvb`).
 `mla_bits` quantizes q/kv; `head_bits` quantizes o/g. Missing absorbed KV
-keeps the dense Q/O stand-in.
+keeps the dense Q/O stand-in. MLA score/pool in `mla_step` may use
+`coli_cuda::attention_absorb` when the cache prefix is dense.
 
 KDA `o_norm` is the official shared `[head_dim]` scale (not `[heads, head_dim]`).
 GLM mHC keeps M residual streams (stream 0 is the layer view; others stay
@@ -190,6 +191,20 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
   compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
 - `backend_name()` is `"cpu"` on this Mac path. Multi-GPU TP2/EP2 return false.
 - Prefix checkpoints stay on the host (`V4_PREFIX_CKPT`).
+
+Metal ops (`mvllm::metal_ops`):
+
+- Host API: `src/gpu/metal_ops.hpp`. CPU fallback TU (`metal_ops.cpp`) or
+  Metal `metal_ops.mm` when `APPLE AND MVLLM_METAL`.
+- Surface: `rmsnorm` / `add` / `silu_mul` plus fused KDA token
+  (`kda_fused_token`: depthwise conv+SiLU, L2-norm q/k, state recurrence).
+
+H3 Metal residual (`mvllm::metal_h3::dit_residual`):
+
+- Host API: `src/gpu/metal_h3.hpp`. CPU fallback TU (`metal_h3.cpp`) or
+  Metal `metal_h3.mm` when `APPLE AND MVLLM_METAL`.
+- AdaLN + SDPA + SwiGLU. H3 engine prefers this over `gpu::dit_block`
+  when AdaLN / RoPE is present.
 
 `micro-vllm smoke --model DIR` walks shard headers and, when expert / DiT
 tensors exist, `pread`s one expert slot (or a small H3 vector). Counted
