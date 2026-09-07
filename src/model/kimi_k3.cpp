@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "../gpu/backend.hpp"
+#include "../gpu/coli_cuda.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -95,6 +96,34 @@ K3ExpertGeom make_k3_geom(int latent, int inter) {
     }
     g.slot = 2 * (g.w1p + g.w1s) + g.w2p + g.w2s;
     return g;
+}
+
+// MXFP4 GEMM via coli_cuda; SiTU-GLU stays on the host. Never calls expert_mlp.
+bool k3_expert_try_coli(float *y, const float *x, int S, const uint8_t *blob, int I, int O,
+                        float b1, float b2) {
+    if (!coli_cuda::available())
+        return false;
+    if (!y || !x || !blob || S <= 0 || I <= 0 || O <= 0)
+        return false;
+    const K3ExpertGeom g = make_k3_geom(I, O);
+    const uint8_t *w1p = blob;
+    const uint8_t *w1s = w1p + g.w1p;
+    const uint8_t *w2p = w1s + g.w1s;
+    const uint8_t *w2s = w2p + g.w2p;
+    const uint8_t *w3p = w2s + g.w2s;
+    const uint8_t *w3s = w3p + g.w1p;
+    std::vector<float> gate(static_cast<size_t>(S) * O), up(static_cast<size_t>(S) * O);
+    if (!coli_cuda::matmul_mxfp4(gate.data(), x, w1p, w1s, S, I, O))
+        return false;
+    if (!coli_cuda::matmul_mxfp4(up.data(), x, w3p, w3s, S, I, O))
+        return false;
+    for (int s = 0; s < S; ++s) {
+        float *gg = gate.data() + static_cast<size_t>(s) * O;
+        const float *uu = up.data() + static_cast<size_t>(s) * O;
+        for (int i = 0; i < O; ++i)
+            gg[i] = quant::situ_glu(gg[i], uu[i], b1, b2);
+    }
+    return coli_cuda::matmul_mxfp4(y, gate.data(), w2p, w2s, S, O, I);
 }
 
 const char *k3_expert_mats[3] = {"w1", "w2", "w3"};
@@ -213,6 +242,7 @@ public:
             }
         }
         loaded_ = true;
+        coli_cuda::init(nullptr, 0);
         return Status::Ok;
     }
 
@@ -622,7 +652,14 @@ public:
            << " bits=" << rt_.dense_bits << " head_bits=" << rt_.head_bits
            << " prefix=" << (prefix_.empty() ? "-" : prefix_) << " offload=disk"
            << " hits=" << st.hits << " misses=" << st.misses << " mla=" << mla_n
-           << " prefill=layer";
+           << " prefill=layer"
+           << " coli=";
+        if (coli_cuda::available() && coli_cuda::available_device_count() > 0)
+            os << "cuda";
+        else if (coli_cuda::available())
+            os << "cpu";
+        else
+            os << "off";
         return os.str();
     }
 
@@ -1880,8 +1917,10 @@ private:
                 ++n;
             }
             if (n > 0) {
-                gpu::k3_expert(yb.data(), xb.data(), n, v.data, I, O, cfg_.moe.situ_b1,
-                               cfg_.moe.situ_b2, idot);
+                if (idot || !k3_expert_try_coli(yb.data(), xb.data(), n, v.data, I, O,
+                                                cfg_.moe.situ_b1, cfg_.moe.situ_b2))
+                    gpu::k3_expert(yb.data(), xb.data(), n, v.data, I, O, cfg_.moe.situ_b1,
+                                   cfg_.moe.situ_b2, idot);
                 for (int i = 0; i < n; ++i) {
                     float *ac = acc.data() + static_cast<size_t>(cmap[static_cast<size_t>(i)]) * I;
                     const float *hz = yb.data() + static_cast<size_t>(i) * I;

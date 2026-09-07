@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cassert>
 #include <iostream>
 #include <numeric>
 #include <fstream>
@@ -15,15 +17,9 @@ using json = nlohmann::json;
 
 constexpr int B_TO_MB = 1024 * 1024;
 constexpr int B_TO_GB = 1024 * 1024 * 1024;
-constexpr int HIDDEN_DIM = 8192;
-constexpr int NUM_K_HEADS = 8;
-constexpr int NUM_V_HEADS = 8;
-constexpr int GQA_ATTN_SCORES_TO_V_RATIO = 4;
-constexpr int VOCAB_SIZE = 128256;
 constexpr int END_OF_TEXT_TOKEN_ID = 128001; // <|end_of_text|>
 constexpr int EOT_ID_TOKEN_ID = 128009;      // <|eot_id|>
-constexpr int MAX_PROMPT_LEN = 512;          // TODO: arbitrary, tunable
-int g_nseq = 2;
+int g_max_prompt = DEFAULT_MAX_PROMPT;
 
 
 int checkGPUStatus()
@@ -102,6 +98,8 @@ int loadWeights(Weights &weights, const std::string &path) {
     std::unordered_map<std::string, uint64_t> offsets;
     json header_json = json::parse(header);
     uint64_t max_offset = 0;
+    std::vector<char> seen_layers(256, 0);
+    int file_layer_count = 0;
     for (auto &[key, value] : header_json.items()) {
         if (key == "__metadata__") {
             continue;
@@ -111,7 +109,22 @@ int loadWeights(Weights &weights, const std::string &path) {
             max_offset = offset_end;
         }
         offsets[key] = value["data_offsets"].at(0).get<uint64_t>();
+        if (key.compare(0, 13, "model.layers.") == 0) {
+            try {
+                int n = std::stoi(key.substr(13));
+                if (n >= 0 && n < (int)seen_layers.size() && !seen_layers[n]) {
+                    seen_layers[n] = 1;
+                    ++file_layer_count;
+                }
+            } catch (...) {
+            }
+        }
     }
+    if (file_layer_count != N_LAYERS) {
+        std::cerr << "warning: safetensors has " << file_layer_count << " layers, expected " << N_LAYERS << "\n";
+    }
+    std::cout << "dims layers=" << N_LAYERS << " hidden=" << EMBEDDING_LENGTH << " mlp=" << HIDDEN_DIM
+              << " q=" << NUM_Q_HEADS << " kv=" << NUM_K_HEADS << " vocab=" << VOCAB_SIZE << "\n";
 
     void *model_weights;
     cudaMalloc(&model_weights, max_offset); // max_offset tells where the model weights end in the memory
@@ -124,8 +137,6 @@ int loadWeights(Weights &weights, const std::string &path) {
     safetensors_file.close();
 
     // BASICALLY A HELPER STRUCT TO HAVE AN EASY ACCESS TO ANY MODEL WEIGHTS ON GPU
-    // TODO: right now I know the model structure since it's always llama 3.2 1B-Instruct, but maybe it would be convenient
-    //       to store dimensions somewhere for even easier access?
     weights.embed_tokens = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.embed_tokens.weight"));
     weights.norm = (__nv_bfloat16 *)((char *)model_weights + offsets.at("model.norm.weight"));
     for (int i = 0; i < N_LAYERS; ++i) {
@@ -142,6 +153,13 @@ int loadWeights(Weights &weights, const std::string &path) {
     return 0;
 }
 
+void syncBlockTableSlot(int slot, const std::vector<int> &block_table, int *block_table_gpu)
+{
+    const int off = llama_block_index(slot, 0, 0);
+    const int n = llama_slot_table_elems();
+    cudaMemcpy(block_table_gpu + off, block_table.data() + off, n * sizeof(int), cudaMemcpyHostToDevice);
+}
+
 void releaseSlot(int slot, std::vector<bool> &is_slot_free, std::vector<int> &block_table, std::vector<int> &free_blocks, int *block_table_gpu)
 {
     is_slot_free[slot] = true;
@@ -149,7 +167,7 @@ void releaseSlot(int slot, std::vector<bool> &is_slot_free, std::vector<int> &bl
     {
         for (int logical_block_idx = 0; logical_block_idx < MAX_BLOCKS_PER_SEQ; ++logical_block_idx)
         {
-            int block_idx = slot * N_LAYERS * MAX_BLOCKS_PER_SEQ + layer * MAX_BLOCKS_PER_SEQ + logical_block_idx;
+            int block_idx = llama_block_index(slot, layer, logical_block_idx);
             if (block_table[block_idx] != -1)
             {
                 free_blocks.push_back(block_table[block_idx]);
@@ -157,15 +175,118 @@ void releaseSlot(int slot, std::vector<bool> &is_slot_free, std::vector<int> &bl
             }
         }
     }
-    cudaMemcpy(block_table_gpu, block_table.data(), g_nseq * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
+    syncBlockTableSlot(slot, block_table, block_table_gpu);
 }
 
-// TODO: clean up this mess lol XD (I mean, the arguments list is so long, but maybe that's unavoidable, I don't know yet)
-void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int &prompt_len, std::vector<bool> &is_slot_free, int slot, int *gpu_input_tokens, nv_bfloat16 *input_embeddings, Weights &weights, nv_bfloat16 *hidden_state, nv_bfloat16 *rms_norms, nv_bfloat16 *&q_proj, nv_bfloat16 *buf_2048_1, cublasHandle_t cublas_handle, float &q_proj_alpha, float &q_proj_beta, float &k_proj_alpha, float &k_proj_beta, float &v_proj_alpha, float &v_proj_beta, nv_bfloat16 *prefill_attn_scores, float &attn_alpha, float &attn_beta, nv_bfloat16 *&attn_scores_v, float &attn_scores_v_alpha, float &attn_scores_v_beta, nv_bfloat16 *&o_proj, nv_bfloat16 *buf_2048_2, float &o_proj_alpha, float &o_proj_beta, float &gate_alpha, float &gate_beta, nv_bfloat16 *gate, float &up_alpha, float &up_beta, nv_bfloat16 *up, nv_bfloat16 *&down, float &down_alpha, float &down_beta, float &embed_alpha, float &embed_beta, nv_bfloat16 *embed_proj, std::vector<std::vector<int>> &generated_tokens, std::vector<int> &last_generated_tokens, std::vector<int> &current_prompt_len, __nv_bfloat16 *k_proj_temp_buf, __nv_bfloat16 *v_proj_temp_buf, std::vector<int> &block_table, int *block_table_gpu, std::vector<int> &free_blocks, __nv_bfloat16 *kv_cache)
+struct PrefillCtx
 {
-    prompt = queue.front();
-    prompt_len = prompt.size();
+    std::queue<std::vector<int>> &queue;
+    std::vector<bool> &is_slot_free;
+    int *gpu_input_tokens;
+    nv_bfloat16 *input_embeddings;
+    Weights &weights;
+    nv_bfloat16 *hidden_state;
+    nv_bfloat16 *rms_norms;
+    nv_bfloat16 *buf_2048_1;
+    cublasHandle_t cublas_handle;
+    float &q_proj_alpha;
+    float &q_proj_beta;
+    float &k_proj_alpha;
+    float &k_proj_beta;
+    float &v_proj_alpha;
+    float &v_proj_beta;
+    nv_bfloat16 *prefill_attn_scores;
+    float &attn_alpha;
+    float &attn_beta;
+    float &attn_scores_v_alpha;
+    float &attn_scores_v_beta;
+    nv_bfloat16 *buf_2048_2;
+    float &o_proj_alpha;
+    float &o_proj_beta;
+    float &gate_alpha;
+    float &gate_beta;
+    nv_bfloat16 *gate;
+    float &up_alpha;
+    float &up_beta;
+    nv_bfloat16 *up;
+    float &down_alpha;
+    float &down_beta;
+    float &embed_alpha;
+    float &embed_beta;
+    nv_bfloat16 *embed_proj;
+    std::vector<std::vector<int>> &generated_tokens;
+    std::vector<int> &last_generated_tokens;
+    std::vector<int> &current_prompt_len;
+    __nv_bfloat16 *k_proj_temp_buf;
+    __nv_bfloat16 *v_proj_temp_buf;
+    std::vector<int> &block_table;
+    int *block_table_gpu;
+    std::vector<int> &free_blocks;
+    __nv_bfloat16 *kv_cache;
+};
+
+void prefill(PrefillCtx &ctx, int slot)
+{
+    std::queue<std::vector<int>> &queue = ctx.queue;
+    std::vector<bool> &is_slot_free = ctx.is_slot_free;
+    int *gpu_input_tokens = ctx.gpu_input_tokens;
+    nv_bfloat16 *input_embeddings = ctx.input_embeddings;
+    Weights &weights = ctx.weights;
+    nv_bfloat16 *hidden_state = ctx.hidden_state;
+    nv_bfloat16 *rms_norms = ctx.rms_norms;
+    nv_bfloat16 *buf_2048_1 = ctx.buf_2048_1;
+    cublasHandle_t cublas_handle = ctx.cublas_handle;
+    float &q_proj_alpha = ctx.q_proj_alpha;
+    float &q_proj_beta = ctx.q_proj_beta;
+    float &k_proj_alpha = ctx.k_proj_alpha;
+    float &k_proj_beta = ctx.k_proj_beta;
+    float &v_proj_alpha = ctx.v_proj_alpha;
+    float &v_proj_beta = ctx.v_proj_beta;
+    nv_bfloat16 *prefill_attn_scores = ctx.prefill_attn_scores;
+    float &attn_alpha = ctx.attn_alpha;
+    float &attn_beta = ctx.attn_beta;
+    float &attn_scores_v_alpha = ctx.attn_scores_v_alpha;
+    float &attn_scores_v_beta = ctx.attn_scores_v_beta;
+    nv_bfloat16 *buf_2048_2 = ctx.buf_2048_2;
+    float &o_proj_alpha = ctx.o_proj_alpha;
+    float &o_proj_beta = ctx.o_proj_beta;
+    float &gate_alpha = ctx.gate_alpha;
+    float &gate_beta = ctx.gate_beta;
+    nv_bfloat16 *gate = ctx.gate;
+    float &up_alpha = ctx.up_alpha;
+    float &up_beta = ctx.up_beta;
+    nv_bfloat16 *up = ctx.up;
+    float &down_alpha = ctx.down_alpha;
+    float &down_beta = ctx.down_beta;
+    float &embed_alpha = ctx.embed_alpha;
+    float &embed_beta = ctx.embed_beta;
+    nv_bfloat16 *embed_proj = ctx.embed_proj;
+    std::vector<std::vector<int>> &generated_tokens = ctx.generated_tokens;
+    std::vector<int> &last_generated_tokens = ctx.last_generated_tokens;
+    std::vector<int> &current_prompt_len = ctx.current_prompt_len;
+    __nv_bfloat16 *k_proj_temp_buf = ctx.k_proj_temp_buf;
+    __nv_bfloat16 *v_proj_temp_buf = ctx.v_proj_temp_buf;
+    std::vector<int> &block_table = ctx.block_table;
+    int *block_table_gpu = ctx.block_table_gpu;
+    std::vector<int> &free_blocks = ctx.free_blocks;
+    __nv_bfloat16 *kv_cache = ctx.kv_cache;
+    nv_bfloat16 *q_proj = nullptr;
+    nv_bfloat16 *attn_scores_v = nullptr;
+    nv_bfloat16 *o_proj = nullptr;
+    nv_bfloat16 *down = nullptr;
+
+    if (queue.empty())
+    {
+        return;
+    }
+    std::vector<int> prompt = queue.front();
     queue.pop();
+    if ((int)prompt.size() > g_max_prompt)
+    {
+        return;
+    }
+
+    int prompt_len = (int)prompt.size();
     is_slot_free[slot] = false;
 
     cudaMemcpy(gpu_input_tokens, prompt.data(), prompt_len * sizeof(int), cudaMemcpyHostToDevice);
@@ -554,8 +675,7 @@ void prefill(std::vector<int> &prompt, std::queue<std::vector<int>> &queue, int 
     current_prompt_len[slot] = prompt_len;
 
     // synchronize state of block_table with block_table_gpu
-    // TODO: do it more clever and not copy full table unnecessarily
-    cudaMemcpy(block_table_gpu, block_table.data(), g_nseq * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
+    syncBlockTableSlot(slot, block_table, block_table_gpu);
 }
 
 
@@ -564,7 +684,8 @@ void printUsage(const char *argv0)
     std::cout << "Usage: " << argv0 << " [options]\n"
               << "  --model PATH, -m PATH   safetensors path (default: model.safetensors)\n"
               << "  --n N, --max-tokens N   max new tokens (default: 20)\n"
-              << "  --prompt-ids 1,2,3      use only this prompt (comma-separated token ids)\n"
+              << "  --prompt-ids 1,2,3      prompt token ids (comma-separated; repeatable)\n"
+              << "  --max-prompt N          max prompt tokens (default: 512)\n"
               << "  --kv-gb F               KV cache size in GiB (default: 2)\n"
               << "  --batch N, --batch-size N  concurrent sequences (default: 2)\n"
               << "  --help, -h              show this help\n";
@@ -592,7 +713,7 @@ int main(int argc, char *argv[]) {
     double kv_gb = 2.0;
     int batch_cli = 2;
     bool has_prompt_ids = false;
-    std::vector<int> cli_prompt_ids;
+    std::vector<std::vector<int>> cli_prompt_list;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -640,12 +761,27 @@ int main(int argc, char *argv[]) {
             {
                 try
                 {
-                    cli_prompt_ids = parsePromptIds(v);
+                    cli_prompt_list.push_back(parsePromptIds(v));
                     has_prompt_ids = true;
                 }
                 catch (...)
                 {
                     std::cerr << "Invalid --prompt-ids value: " << v << "\n";
+                }
+            }
+        }
+        else if (arg == "--max-prompt")
+        {
+            const char *v = take_value(arg);
+            if (v)
+            {
+                try
+                {
+                    g_max_prompt = std::max(1, std::stoi(v));
+                }
+                catch (...)
+                {
+                    std::cerr << "Invalid --max-prompt value: " << v << "\n";
                 }
             }
         }
@@ -686,8 +822,7 @@ int main(int argc, char *argv[]) {
     }
 
     const int batch = std::max(1, batch_cli);
-    const int buf = std::max(MAX_PROMPT_LEN, batch);
-    g_nseq = batch;
+    const int buf = std::max(g_max_prompt, batch);
 
     cublasHandle_t cublas_handle;
     cublasStatus_t status = cublasCreate(&cublas_handle);
@@ -718,9 +853,12 @@ int main(int argc, char *argv[]) {
     std::queue<std::vector<int>> queue;
     if (has_prompt_ids)
     {
-        if (!cli_prompt_ids.empty())
+        for (const auto &ids : cli_prompt_list)
         {
-            queue.push(cli_prompt_ids);
+            if (!ids.empty())
+            {
+                queue.push(ids);
+            }
         }
     }
     else
@@ -757,12 +895,10 @@ int main(int argc, char *argv[]) {
     // TODO: recalculate input_tokens_size and prompt_lengths always when there is a change to prompt_under_prefill
     // TODO: right now I handle input manually, it's the least interesting part, will come back to it when continuous batching and pagedattn works
 
-    std::vector<int> prompt;
-    int prompt_len;
     int *gpu_input_tokens;
-    cudaMalloc(&gpu_input_tokens, MAX_PROMPT_LEN * sizeof(int));
+    cudaMalloc(&gpu_input_tokens, g_max_prompt * sizeof(int));
     __nv_bfloat16 *input_embeddings;
-    cudaMalloc(&input_embeddings, MAX_PROMPT_LEN * sizeof(__nv_bfloat16) * EMBEDDING_LENGTH);
+    cudaMalloc(&input_embeddings, g_max_prompt * sizeof(__nv_bfloat16) * EMBEDDING_LENGTH);
 
     __nv_bfloat16 *hidden_state;
     cudaMalloc(&hidden_state, buf * sizeof(__nv_bfloat16) * EMBEDDING_LENGTH);
@@ -778,10 +914,10 @@ int main(int argc, char *argv[]) {
 
     // K and V cache
     __nv_bfloat16 *k_proj_temp_buf;
-    cudaMalloc(&k_proj_temp_buf, MAX_PROMPT_LEN * KV_DIM * sizeof(__nv_bfloat16));
+    cudaMalloc(&k_proj_temp_buf, g_max_prompt * KV_DIM * sizeof(__nv_bfloat16));
 
     __nv_bfloat16 *v_proj_temp_buf;
-    cudaMalloc(&v_proj_temp_buf, MAX_PROMPT_LEN * KV_DIM * sizeof(__nv_bfloat16));
+    cudaMalloc(&v_proj_temp_buf, g_max_prompt * KV_DIM * sizeof(__nv_bfloat16));
 
     float k_proj_alpha = 1.0f;
     float k_proj_beta = 0.0f;
@@ -790,11 +926,10 @@ int main(int argc, char *argv[]) {
     float v_proj_beta = 0.0f;
 
     __nv_bfloat16 *prefill_attn_scores;
-    cudaMalloc(&prefill_attn_scores, MAX_PROMPT_LEN * MAX_PROMPT_LEN * sizeof(__nv_bfloat16) * NUM_Q_HEADS);
+    cudaMalloc(&prefill_attn_scores, g_max_prompt * g_max_prompt * sizeof(__nv_bfloat16) * NUM_Q_HEADS);
     float attn_alpha = 1.0f / 8.0f;
     float attn_beta = 0.0f;
 
-    __nv_bfloat16 *attn_scores_v;
     float attn_scores_v_alpha = 1.0f;
     float attn_scores_v_beta = 0.0f;
 
@@ -834,19 +969,59 @@ int main(int argc, char *argv[]) {
     __nv_bfloat16 *v_proj_batched_buffer;
     cudaMalloc(&v_proj_batched_buffer, batch * sizeof(__nv_bfloat16) * KV_DIM);
 
+    PrefillCtx ctx{
+        queue,
+        is_slot_free,
+        gpu_input_tokens,
+        input_embeddings,
+        weights,
+        hidden_state,
+        rms_norms,
+        buf_2048_1,
+        cublas_handle,
+        q_proj_alpha,
+        q_proj_beta,
+        k_proj_alpha,
+        k_proj_beta,
+        v_proj_alpha,
+        v_proj_beta,
+        prefill_attn_scores,
+        attn_alpha,
+        attn_beta,
+        attn_scores_v_alpha,
+        attn_scores_v_beta,
+        buf_2048_2,
+        o_proj_alpha,
+        o_proj_beta,
+        gate_alpha,
+        gate_beta,
+        gate,
+        up_alpha,
+        up_beta,
+        up,
+        down_alpha,
+        down_beta,
+        embed_alpha,
+        embed_beta,
+        embed_proj,
+        generated_tokens,
+        last_generated_tokens,
+        current_prompt_len,
+        k_proj_temp_buf,
+        v_proj_temp_buf,
+        block_table,
+        block_table_gpu,
+        free_blocks,
+        kv_cache,
+    };
+
     for (int slot = 0; slot < is_slot_free.size() && !queue.empty(); ++slot)
     {
         if (!is_slot_free[slot])
         {
             continue; // slot taken, skip
         }
-        prefill(prompt, queue, prompt_len, is_slot_free, slot, gpu_input_tokens, input_embeddings, weights, hidden_state, rms_norms, q_proj, buf_2048_1, cublas_handle, q_proj_alpha, q_proj_beta, k_proj_alpha, k_proj_beta, v_proj_alpha, v_proj_beta, prefill_attn_scores, attn_alpha, attn_beta, attn_scores_v, attn_scores_v_alpha, attn_scores_v_beta, o_proj, buf_2048_2, o_proj_alpha, o_proj_beta, gate_alpha, gate_beta, gate, up_alpha, up_beta, up, down, down_alpha, down_beta, embed_alpha, embed_beta, embed_proj, generated_tokens, last_generated_tokens, current_prompt_len, k_proj_temp_buf, v_proj_temp_buf, block_table, block_table_gpu, free_blocks, kv_cache);
-
-        // // after prefill:
-        // int first_token = -1; // TODO just a stub
-        // last_generated_tokens[slot] = first_token;
-        // current_prompt_len[slot] = prompt.size();
-        // generated_tokens[slot].push_back(first_token);
+        prefill(ctx, slot);
     }
 
     // INFERENCE STARTS HERE! =]
@@ -872,12 +1047,25 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 generated_tokens[slot].clear();
-                prefill(prompt, queue, prompt_len, is_slot_free, slot, gpu_input_tokens, input_embeddings, weights, hidden_state, rms_norms, q_proj, buf_2048_1, cublas_handle, q_proj_alpha, q_proj_beta, k_proj_alpha, k_proj_beta, v_proj_alpha, v_proj_beta, prefill_attn_scores, attn_alpha, attn_beta, attn_scores_v, attn_scores_v_alpha, attn_scores_v_beta, o_proj, buf_2048_2, o_proj_alpha, o_proj_beta, gate_alpha, gate_beta, gate, up_alpha, up_beta, up, down, down_alpha, down_beta, embed_alpha, embed_beta, embed_proj, generated_tokens, last_generated_tokens, current_prompt_len, k_proj_temp_buf, v_proj_temp_buf, block_table, block_table_gpu, free_blocks, kv_cache);
+                prefill(ctx, slot);
+                if (is_slot_free[slot])
+                {
+                    continue;
+                }
             }
             if ((int)generated_tokens[slot].size() >= max_new_tokens)
             {
                 releaseSlot(slot, is_slot_free, block_table, free_blocks, block_table_gpu);
-                continue;
+                if (queue.empty())
+                {
+                    continue;
+                }
+                generated_tokens[slot].clear();
+                prefill(ctx, slot);
+                if (is_slot_free[slot] || (int)generated_tokens[slot].size() >= max_new_tokens)
+                {
+                    continue;
+                }
             }
             active_slots.push_back(slot);
             active_tokens.push_back(last_generated_tokens[slot]);
@@ -887,7 +1075,7 @@ int main(int argc, char *argv[]) {
         {
             if (queue.empty())
             {
-                break; // TODO: continue will make sense when I will finally write to queue, for now it has predefined size so break instead
+                break;
             }
             continue;
         }
@@ -942,10 +1130,7 @@ int main(int argc, char *argv[]) {
             // so we end up with: K_proj^T = W_k^T (512, 2048) * rms_norms (2048, num_prompt)
             // result dim is K_proj^T = (512, num_prompt)
             // but it's transposed, so in fact we get correct output dimension (num_prompt, 512)
-            // it was great for num_prompt=1, but the problem is that prompts have different length
-            // that's why we have vector of current_prompt_len, but also we can't write to K_proj
-            // directly, so I write to temp buffer kv_proj_batched_buffer and the scatter
-            // output to K_proj in a loop
+            // Decode K/V land in the batched buffer, then scatter into paged KV because sequences have different lengths.
             cublasGemmEx(cublas_handle,
                          CUBLAS_OP_T,
                          CUBLAS_OP_N,
@@ -961,7 +1146,7 @@ int main(int argc, char *argv[]) {
                          CUDA_R_16BF,
                          EMBEDDING_LENGTH, // ldb, same reason for rms_norms
                          &k_proj_beta,
-                         k_proj_batched_buffer, // TODO C
+                         k_proj_batched_buffer,
                          CUDA_R_16BF,
                          KV_DIM, // ldc = 512
                          CUBLAS_COMPUTE_32F,
@@ -1020,7 +1205,10 @@ int main(int argc, char *argv[]) {
             }
 
             // synchronize block table on cpu with block table on gpu (for attention)
-            cudaMemcpy(block_table_gpu, block_table.data(), batch * N_LAYERS * MAX_BLOCKS_PER_SEQ * sizeof(int), cudaMemcpyHostToDevice);
+            for (int slot = 0; slot < num_active_slots; ++slot)
+            {
+                syncBlockTableSlot(active_slots[slot], block_table, block_table_gpu);
+            }
 
             pagedAttention(layer, num_active_slots, q_proj, kv_cache, block_table_gpu, gpu_seq_lens, gpu_active_slots, buf_2048_1);
 
@@ -1168,6 +1356,11 @@ int main(int argc, char *argv[]) {
                 if ((int)generated_tokens[active_slot].size() >= max_new_tokens)
                 {
                     releaseSlot(active_slot, is_slot_free, block_table, free_blocks, block_table_gpu);
+                    if (!queue.empty())
+                    {
+                        generated_tokens[active_slot].clear();
+                        prefill(ctx, active_slot);
+                    }
                 }
             }
         }

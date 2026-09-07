@@ -6,7 +6,10 @@ host engine: disk/RAM/VRAM weight placement, CPU kernels, optional CUDA/HIP,
 and an OpenAI-compatible HTTP server. Expert GEMM (K3 MXFP4, GLM int4-g64)
 and the H3 DiT residual run on Metal or CUDA when `--device metal|cuda` /
 `MVLLM_DEVICE` is set; otherwise the CPU kernels. The Llama CUDA demo stays
-in `src/kernels.cu` and is not used by this path.
+in `src/kernels.cu` and is not used by this path. Runtime `--max-prompt`
+(default 512), a repeatable `--prompt-ids` queue, `PrefillCtx`, and
+per-slot `block_table` sync. Model dims live in `llama_dims.hpp`
+(override `-DLLAMA_*`). Still 3.2 1B defaults; not verified here (no nvcc).
 
 ## What the three source projects taught us
 
@@ -155,6 +158,38 @@ Metal / CUDA expert GEMM and H3 DiT (host engine, not `kernels.cu`):
 - `Engine::load` calls `gpu::select(rt.device)` and falls back to CPU if the
   GPU is missing. Default device stays CPU so host tests stay deterministic.
 - K3/GLM union-MoE batches tokens that share an expert into one GEMM.
+
+Generic CUDA tier (`mvllm::coli_cuda`):
+
+- Host API: `src/gpu/coli_cuda.hpp` / `src/gpu/coli_cuda.cpp` (always compiled).
+- Surface matches official colibri `backend_cuda` (fmt 0–4 `weight_at`,
+  fmt 8 fp8, mxfp4 helper, `expert_mlp` / grouped expert, MLA absorb,
+  pipe rmsnorm/rope/router).
+- Always compiled, CPU fallback. `available_device_count()` is 0 without CUDA.
+- `K3Engine::load` / GLM load call `coli_cuda::init`. `describe()` appends
+  `coli=cpu|cuda|off`.
+- K3 MXFP4 expert GEMM uses `coli_cuda::matmul_mxfp4` when the tier is up and
+  `idot` is off; SiTU-GLU stays on the host. Fallback `gpu::k3_expert`.
+- GLM int4-g64 expert GEMM uses `coli_cuda::matmul` fmt=4 gs=64; clamped-SwiGLU
+  stays on the host. Fallback `gpu::glm_expert`.
+- Do not use `coli_cuda::expert_mlp` here (plain SiLU, wrong family activation).
+
+DSV4 GPU tier (`mvllm::dsv4_cuda`):
+
+- Host API: `src/gpu/dsv4_cuda.hpp` / `src/gpu/dsv4_cuda.cpp` (always compiled).
+- Surface matches official colibri `backend_cuda_dsv4` (upload
+  fp8/fp4/bf16/f32, matvec, activations, grouped/shared MoE, mHC pre/post,
+  sparse attn + indexer, KV ring/comp, route top-6, expert bank, CUDA-graph
+  placeholders).
+- `Dsv4Engine::load` calls `dsv4_cuda::init`. `describe()` appends
+  `tier=cpu|cuda|off`.
+- MXFP4 routed-expert GEMM goes through `dsv4_cuda::expert_group` when the
+  tier is up and `idot` is off; otherwise `gpu::gemm_mxfp4`.
+- Host route / mHC / DSA / prefix checkpoints unchanged.
+- Optional device kernels in `src/gpu/dsv4_cuda.cu` + `dsv4_cuda_device.hpp`
+  compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
+- `backend_name()` is `"cpu"` on this Mac path. Multi-GPU TP2/EP2 return false.
+- Prefix checkpoints stay on the host (`V4_PREFIX_CKPT`).
 
 `micro-vllm smoke --model DIR` walks shard headers and, when expert / DiT
 tensors exist, `pread`s one expert slot (or a small H3 vector). Counted

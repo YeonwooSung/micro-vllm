@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "../gpu/backend.hpp"
+#include "../gpu/dsv4_cuda.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -128,6 +129,24 @@ void mxfp4_swiglu_expert(float *y, const float *x, int S, const uint8_t *blob, i
     const uint8_t *w2s = w2p + g.w2p;
     const uint8_t *w3p = w2s + g.w2s;
     const uint8_t *w3s = w3p + g.w1p;
+    if (!idot && dsv4_cuda::available()) {
+        dsv4_cuda::Tensor *gate = nullptr;
+        dsv4_cuda::Tensor *up = nullptr;
+        dsv4_cuda::Tensor *down = nullptr;
+        bool ok = dsv4_cuda::upload_fp4(&gate, w1p, w1s, O, H, 0) &&
+                  dsv4_cuda::upload_fp4(&up, w3p, w3s, O, H, 0) &&
+                  dsv4_cuda::upload_fp4(&down, w2p, w2s, H, O, 0);
+        const float one = 1.f;
+        for (int s = 0; ok && s < S; ++s)
+            ok = dsv4_cuda::expert_group(&gate, &up, &down, &one, 1, limit,
+                                         y + static_cast<size_t>(s) * H,
+                                         x + static_cast<size_t>(s) * H);
+        dsv4_cuda::tensor_free(gate);
+        dsv4_cuda::tensor_free(up);
+        dsv4_cuda::tensor_free(down);
+        if (ok)
+            return;
+    }
     std::vector<float> gate(static_cast<size_t>(S) * O), up(static_cast<size_t>(S) * O);
     gpu::gemm_mxfp4(gate.data(), x, w1p, w1s, S, H, O, idot);
     gpu::gemm_mxfp4(up.data(), x, w3p, w3s, S, H, O, idot);
@@ -315,6 +334,7 @@ public:
             std::string terr;
             trace_.open(tpath, terr);
         }
+        dsv4_cuda::init(nullptr, 0);
         return Status::Ok;
     }
 
@@ -419,7 +439,8 @@ public:
            << " window=" << cfg_.sliding_window << " dsa=" << (cfg_.dsa.topk > 0 ? cfg_.dsa.topk : 0)
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic")
            << " bits=" << rt_.dense_bits << " prefix=" << (prefix_.empty() ? "-" : prefix_)
-           << " ckpt=" << ckpts_.size() << " hits=" << ckpt_hits_;
+           << " ckpt=" << ckpts_.size() << " hits=" << ckpt_hits_
+           << " tier=" << (dsv4_cuda::available() ? dsv4_cuda::backend_name() : "off");
         return os.str();
     }
 

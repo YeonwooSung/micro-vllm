@@ -1,6 +1,9 @@
 #include "core/config.hpp"
 #include "engine.hpp"
 #include "gpu/backend.hpp"
+#include "gpu/coli_cuda.hpp"
+#include "gpu/dsv4_cuda.hpp"
+#include "legacy/llama_dims.hpp"
 #include "io/dump_env.hpp"
 #include "io/file_io.hpp"
 #include "io/safetensors.hpp"
@@ -1134,6 +1137,13 @@ static void test_dsv4_tiny() {
     std::string info = e.info();
     CHECK(info.find("dsv4") != std::string::npos);
     CHECK(info.find("checkpoint=synthetic") != std::string::npos);
+    const bool dsv4_cu_wire_tier_cpu = info.find("tier=cpu") != std::string::npos;
+    CHECK(dsv4_cu_wire_tier_cpu);
+    const bool dsv4_cu_wire_avail = mvllm::dsv4_cuda::available();
+    CHECK(dsv4_cu_wire_avail);
+    const bool dsv4_cu_wire_name_cpu =
+        std::strcmp(mvllm::dsv4_cuda::backend_name(), "cpu") == 0;
+    CHECK(dsv4_cu_wire_name_cpu);
     GenParams gp;
     gp.max_new_tokens = 4;
     gp.eos = 1;
@@ -1351,6 +1361,843 @@ static void test_dsv4_prefix_ckpt() {
 
     for (int i = 0; i < 10; ++i)
         env_restore(keys[i], prev[i], had[i]);
+}
+
+static void test_dsv4_cuda_tier() {
+    using namespace mvllm;
+    using namespace mvllm::dsv4_cuda;
+
+    auto sqrt_softplus = [](float v) {
+        float sp;
+        if (v > 20.f)
+            sp = v;
+        else if (v < -20.f)
+            sp = std::exp(v);
+        else
+            sp = std::log1p(std::exp(v));
+        return std::sqrt(std::max(sp, 0.f));
+    };
+    auto all_finite = [](const float *p, int n) {
+        for (int i = 0; i < n; ++i)
+            if (!std::isfinite(p[i]))
+                return false;
+        return true;
+    };
+
+    const bool dsv4_cu_init = init(nullptr, 0);
+    CHECK(dsv4_cu_init);
+    const bool dsv4_cu_avail = available();
+    CHECK(dsv4_cu_avail);
+    const bool dsv4_cu_name_cpu = std::strcmp(backend_name(), "cpu") == 0;
+    CHECK(dsv4_cu_name_cpu);
+    const bool dsv4_cu_arch = backend_arch_ok(0);
+    CHECK(dsv4_cu_arch);
+    const bool dsv4_cu_init_again = init(nullptr, 0);
+    CHECK(dsv4_cu_init_again);
+
+    {
+        const float W[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                             0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const float x[4] = {1.f, 2.f, 3.f, 4.f};
+        float y[4] = {};
+        Tensor *tw = nullptr;
+        const bool dsv4_cu_up_f32 = upload_f32(&tw, W, 4, 4, 0);
+        CHECK(dsv4_cu_up_f32);
+        const bool dsv4_cu_mv_f32 = matvec(tw, y, x);
+        CHECK(dsv4_cu_mv_f32);
+        CHECK_NEAR(y[0], 1.f, 1e-5);
+        CHECK_NEAR(y[1], 2.f, 1e-5);
+        CHECK_NEAR(y[2], 3.f, 1e-5);
+        CHECK_NEAR(y[3], 4.f, 1e-5);
+        tensor_free(tw);
+    }
+
+    {
+        const int O = 8, I = 8;
+        std::vector<uint8_t> w(static_cast<size_t>(O) * I);
+        std::vector<uint8_t> sc(static_cast<size_t>(O) * ((I + 127) / 128), 127);
+        std::vector<float> x(I), y(O), ref(O, 0.f);
+        for (int o = 0; o < O; ++o)
+            for (int i = 0; i < I; ++i)
+                w[static_cast<size_t>(o) * I + i] =
+                    static_cast<uint8_t>(((o * 17 + i * 13) % 120) + 1);
+        for (int i = 0; i < I; ++i)
+            x[static_cast<size_t>(i)] = 0.1f * static_cast<float>(i + 1);
+        const float tile = e8m0_decode(127);
+        for (int o = 0; o < O; ++o)
+            for (int i = 0; i < I; ++i)
+                ref[static_cast<size_t>(o)] +=
+                    x[static_cast<size_t>(i)] *
+                    e4m3fn_decode(w[static_cast<size_t>(o) * I + i]) * tile;
+        Tensor *tw = nullptr;
+        const bool dsv4_cu_up_fp8 = upload_fp8(&tw, w.data(), sc.data(), O, I, 0);
+        CHECK(dsv4_cu_up_fp8);
+        const bool dsv4_cu_mv_fp8 = matvec(tw, y.data(), x.data());
+        CHECK(dsv4_cu_mv_fp8);
+        for (int o = 0; o < O; ++o)
+            CHECK_NEAR(y[static_cast<size_t>(o)], ref[static_cast<size_t>(o)], 1e-4);
+        tensor_free(tw);
+    }
+
+    {
+        const int O = 32, I = 32;
+        std::vector<uint8_t> packed(static_cast<size_t>(O) * (I / 2));
+        std::vector<uint8_t> sc(static_cast<size_t>(O) * ((I + 31) / 32), 127);
+        std::vector<float> x(I), y(O), ref(O, 0.f);
+        for (size_t i = 0; i < packed.size(); ++i)
+            packed[i] = static_cast<uint8_t>((i * 37 + 11) & 0xff);
+        for (int i = 0; i < I; ++i)
+            x[static_cast<size_t>(i)] = 0.1f * static_cast<float>(i + 1);
+        quant::matmul_mxfp4(ref.data(), x.data(), packed.data(), sc.data(), 1, I, O);
+        Tensor *tw = nullptr;
+        const bool dsv4_cu_up_fp4 = upload_fp4(&tw, packed.data(), sc.data(), O, I, 0);
+        CHECK(dsv4_cu_up_fp4);
+        const bool dsv4_cu_mv_fp4 = matvec(tw, y.data(), x.data());
+        CHECK(dsv4_cu_mv_fp4);
+        for (int o = 0; o < O; ++o)
+            CHECK_NEAR(y[static_cast<size_t>(o)], ref[static_cast<size_t>(o)], 1e-4);
+        tensor_free(tw);
+    }
+
+    {
+        const uint16_t Wb[4] = {0x3f80, 0, 0, 0x3f80};
+        const float xb[2] = {1.5f, -2.f};
+        float yb[2] = {};
+        Tensor *tw = nullptr;
+        const bool dsv4_cu_up_bf16 = upload_bf16(&tw, Wb, 2, 2, 0);
+        CHECK(dsv4_cu_up_bf16);
+        const bool dsv4_cu_mv_bf16 = matvec(tw, yb, xb);
+        CHECK(dsv4_cu_mv_bf16);
+        CHECK_NEAR(yb[0], 1.5f, 1e-5);
+        CHECK_NEAR(yb[1], -2.f, 1e-5);
+        tensor_free(tw);
+    }
+
+    {
+        float ax[8];
+        for (int i = 0; i < 8; ++i)
+            ax[i] = 0.1f * static_cast<float>(i + 1);
+        Activation *a0 = activation_create(0, 8);
+        const bool dsv4_cu_act_a0 = a0 != nullptr;
+        CHECK(dsv4_cu_act_a0);
+        const bool dsv4_cu_act_up = activation_upload(a0, ax, 8);
+        CHECK(dsv4_cu_act_up);
+        Activation *a1 = activation_create(0, 8);
+        const bool dsv4_cu_act_a1 = a1 != nullptr;
+        CHECK(dsv4_cu_act_a1);
+        const bool dsv4_cu_act_cp = activation_copy(a1, a0, 8);
+        CHECK(dsv4_cu_act_cp);
+        float ay[8] = {};
+        const bool dsv4_cu_act_dn = activation_download(ay, a1, 8);
+        CHECK(dsv4_cu_act_dn);
+        for (int i = 0; i < 8; ++i)
+            CHECK_NEAR(ay[i], ax[i], 1e-5);
+        const bool dsv4_cu_act_dev = activation_device(a0) == 0;
+        CHECK(dsv4_cu_act_dev);
+        const bool dsv4_cu_act_sync = activation_sync(a0);
+        CHECK(dsv4_cu_act_sync);
+        const bool dsv4_cu_act_n = activation_elements(a0) == 8;
+        CHECK(dsv4_cu_act_n);
+
+        Activation *a2 = activation_create(0, 8);
+        const bool dsv4_cu_act_a2 = a2 != nullptr;
+        CHECK(dsv4_cu_act_a2);
+        float az[8] = {};
+        const bool dsv4_cu_act_up2 = activation_upload(a2, az, 8);
+        CHECK(dsv4_cu_act_up2);
+        const bool dsv4_cu_act_rng = activation_copy_range(a2, 2, a0, 2, 3);
+        CHECK(dsv4_cu_act_rng);
+        float ar[8] = {};
+        const bool dsv4_cu_act_dn2 = activation_download(ar, a2, 8);
+        CHECK(dsv4_cu_act_dn2);
+        CHECK_NEAR(ar[2], ax[2], 1e-5);
+        CHECK_NEAR(ar[3], ax[3], 1e-5);
+        CHECK_NEAR(ar[4], ax[4], 1e-5);
+
+        const bool dsv4_cu_act_empty = activation_create(0, 0) == nullptr;
+        CHECK(dsv4_cu_act_empty);
+        const bool dsv4_cu_act_neg = activation_create(0, -3) == nullptr;
+        CHECK(dsv4_cu_act_neg);
+        activation_free(nullptr);
+        activation_free(a0);
+        activation_free(a1);
+        activation_free(a2);
+    }
+
+    {
+        const int O = 32, I = 32;
+        const float limit = 7.f;
+        const float ew[2] = {0.7f, 0.3f};
+        std::vector<float> x(I);
+        for (int i = 0; i < I; ++i)
+            x[static_cast<size_t>(i)] = 0.05f * static_cast<float>((i % 7) - 3);
+        Tensor *gate[2] = {}, *up[2] = {}, *down[2] = {};
+        for (int e = 0; e < 2; ++e) {
+            std::vector<uint8_t> pg(static_cast<size_t>(O) * (I / 2));
+            std::vector<uint8_t> pu(static_cast<size_t>(O) * (I / 2));
+            std::vector<uint8_t> pd(static_cast<size_t>(I) * (O / 2));
+            std::vector<uint8_t> sg(static_cast<size_t>(O) * ((I + 31) / 32), 127);
+            std::vector<uint8_t> su(static_cast<size_t>(O) * ((I + 31) / 32), 127);
+            std::vector<uint8_t> sd(static_cast<size_t>(I) * ((O + 31) / 32), 127);
+            for (size_t i = 0; i < pg.size(); ++i) {
+                pg[i] = static_cast<uint8_t>((i * 19 + static_cast<size_t>(e) * 5 + 3) & 0xff);
+                pu[i] = static_cast<uint8_t>((i * 23 + static_cast<size_t>(e) * 7 + 9) & 0xff);
+            }
+            for (size_t i = 0; i < pd.size(); ++i)
+                pd[i] = static_cast<uint8_t>((i * 29 + static_cast<size_t>(e) * 11 + 1) & 0xff);
+            const bool dsv4_cu_ex_g = upload_fp4(&gate[e], pg.data(), sg.data(), O, I, 0);
+            CHECK(dsv4_cu_ex_g);
+            const bool dsv4_cu_ex_u = upload_fp4(&up[e], pu.data(), su.data(), O, I, 0);
+            CHECK(dsv4_cu_ex_u);
+            const bool dsv4_cu_ex_d = upload_fp4(&down[e], pd.data(), sd.data(), I, O, 0);
+            CHECK(dsv4_cu_ex_d);
+        }
+
+        std::vector<float> y_seq(I, 0.f);
+        for (int e = 0; e < 2; ++e) {
+            std::vector<float> g(O), u(O), h(O), d(I);
+            const bool dsv4_cu_seq_g = matvec(gate[e], g.data(), x.data());
+            CHECK(dsv4_cu_seq_g);
+            const bool dsv4_cu_seq_u = matvec(up[e], u.data(), x.data());
+            CHECK(dsv4_cu_seq_u);
+            for (int i = 0; i < O; ++i)
+                h[static_cast<size_t>(i)] =
+                    quant::clamped_swiglu(g[static_cast<size_t>(i)], u[static_cast<size_t>(i)],
+                                          limit);
+            const bool dsv4_cu_seq_d = matvec(down[e], d.data(), h.data());
+            CHECK(dsv4_cu_seq_d);
+            for (int i = 0; i < I; ++i)
+                y_seq[static_cast<size_t>(i)] += ew[e] * d[static_cast<size_t>(i)];
+        }
+        std::vector<float> y_grp(I, 0.f);
+        const bool dsv4_cu_ex_grp = expert_group(gate, up, down, ew, 2, limit, y_grp.data(), x.data());
+        CHECK(dsv4_cu_ex_grp);
+        for (int i = 0; i < I; ++i)
+            CHECK_NEAR(y_grp[static_cast<size_t>(i)], y_seq[static_cast<size_t>(i)], 1e-3);
+
+        std::vector<uint8_t> sw(static_cast<size_t>(O) * I);
+        std::vector<uint8_t> ssc(static_cast<size_t>(O) * ((I + 127) / 128), 127);
+        for (size_t i = 0; i < sw.size(); ++i)
+            sw[i] = static_cast<uint8_t>((i * 11 + 5) % 120 + 1);
+        Tensor *sg = nullptr, *su = nullptr, *sd = nullptr;
+        const bool dsv4_cu_sh_g = upload_fp8(&sg, sw.data(), ssc.data(), O, I, 0);
+        CHECK(dsv4_cu_sh_g);
+        const bool dsv4_cu_sh_u = upload_fp8(&su, sw.data(), ssc.data(), O, I, 0);
+        CHECK(dsv4_cu_sh_u);
+        const bool dsv4_cu_sh_d = upload_fp8(&sd, sw.data(), ssc.data(), I, O, 0);
+        CHECK(dsv4_cu_sh_d);
+        std::vector<float> y_sh(I, 0.f), y_moe(I, 0.f);
+        const bool dsv4_cu_ex_fp8 = expert_fp8(sg, su, sd, limit, y_sh.data(), x.data());
+        CHECK(dsv4_cu_ex_fp8);
+        const bool dsv4_cu_moe = moe(gate, up, down, ew, 2, sg, su, sd, limit, y_moe.data(), x.data());
+        CHECK(dsv4_cu_moe);
+        for (int i = 0; i < I; ++i)
+            CHECK_NEAR(y_moe[static_cast<size_t>(i)],
+                       y_grp[static_cast<size_t>(i)] + y_sh[static_cast<size_t>(i)], 1e-3);
+
+        tensor_free(sg);
+        tensor_free(su);
+        tensor_free(sd);
+        for (int e = 0; e < 2; ++e) {
+            tensor_free(gate[e]);
+            tensor_free(up[e]);
+            tensor_free(down[e]);
+        }
+    }
+
+    {
+        const int E = 16, H = 8;
+        const float routed_scale = 1.5f;
+        std::vector<float> W(static_cast<size_t>(E) * H), bias(E), xv(H);
+        for (int e = 0; e < E; ++e) {
+            bias[static_cast<size_t>(e)] = static_cast<float>(e);
+            for (int h = 0; h < H; ++h)
+                W[static_cast<size_t>(e) * H + h] = 0.01f * static_cast<float>((e + h) % 3);
+        }
+        for (int h = 0; h < H; ++h)
+            xv[static_cast<size_t>(h)] = 1.f;
+        Tensor *tg = nullptr, *tb = nullptr;
+        const bool dsv4_cu_rt_g = upload_f32(&tg, W.data(), E, H, 0);
+        CHECK(dsv4_cu_rt_g);
+        const bool dsv4_cu_rt_b = upload_f32(&tb, bias.data(), E, 1, 0);
+        CHECK(dsv4_cu_rt_b);
+        Activation *ain = activation_create(0, H);
+        const bool dsv4_cu_rt_ain = ain != nullptr;
+        CHECK(dsv4_cu_rt_ain);
+        const bool dsv4_cu_rt_up = activation_upload(ain, xv.data(), H);
+        CHECK(dsv4_cu_rt_up);
+
+        float logits[16], scores[16], choice[16];
+        quant::matmul_f32(logits, xv.data(), W.data(), 1, H, E);
+        int order[16];
+        for (int e = 0; e < E; ++e) {
+            scores[e] = sqrt_softplus(logits[e]);
+            choice[e] = scores[e] + bias[static_cast<size_t>(e)];
+            order[e] = e;
+        }
+        std::partial_sort(order, order + 6, order + E, [&](int a, int b) {
+            if (choice[a] == choice[b])
+                return a < b;
+            return choice[a] > choice[b];
+        });
+        int ref_ids[6];
+        float ref_w[6];
+        float wsum = 0.f;
+        for (int k = 0; k < 6; ++k) {
+            ref_ids[k] = order[k];
+            ref_w[k] = scores[order[k]] < 0.f ? 0.f : scores[order[k]];
+            wsum += ref_w[k];
+        }
+        for (int k = 0; k < 6; ++k)
+            ref_w[k] = (wsum > 0.f ? ref_w[k] / wsum : 1.f / 6.f) * routed_scale;
+
+        int ids[6] = {};
+        float weights[6] = {};
+        const bool dsv4_cu_route = route(ain, tg, tb, nullptr, routed_scale, ids, weights);
+        CHECK(dsv4_cu_route);
+        for (int k = 0; k < 6; ++k) {
+            const bool dsv4_cu_rt_id = ids[k] == ref_ids[k];
+            CHECK(dsv4_cu_rt_id);
+            CHECK_NEAR(weights[k], ref_w[k], 1e-4);
+        }
+
+        const int fixed[6] = {1, 3, 5, 7, 9, 11};
+        float fix_w[6];
+        float fsum = 0.f;
+        for (int k = 0; k < 6; ++k) {
+            fix_w[k] = scores[fixed[k]] < 0.f ? 0.f : scores[fixed[k]];
+            fsum += fix_w[k];
+        }
+        for (int k = 0; k < 6; ++k)
+            fix_w[k] = (fsum > 0.f ? fix_w[k] / fsum : 1.f / 6.f) * routed_scale;
+        int fids[6] = {};
+        float fweights[6] = {};
+        const bool dsv4_cu_route_fix = route(ain, tg, tb, fixed, routed_scale, fids, fweights);
+        CHECK(dsv4_cu_route_fix);
+        for (int k = 0; k < 6; ++k) {
+            const bool dsv4_cu_rt_fid = fids[k] == fixed[k];
+            CHECK(dsv4_cu_rt_fid);
+            CHECK_NEAR(fweights[k], fix_w[k], 1e-4);
+        }
+        activation_free(ain);
+        tensor_free(tg);
+        tensor_free(tb);
+    }
+
+    {
+        const int M = 2, H = 8;
+        const int mix_n = (2 + M) * M;
+        std::vector<float> residual(static_cast<size_t>(M) * H);
+        std::vector<float> fn(static_cast<size_t>(mix_n) * M * H);
+        std::vector<float> scale = {0.7f, 0.8f, 0.9f};
+        std::vector<float> base(static_cast<size_t>(mix_n));
+        for (int i = 0; i < M * H; ++i)
+            residual[static_cast<size_t>(i)] = 0.1f * static_cast<float>(i + 1);
+        for (size_t i = 0; i < fn.size(); ++i)
+            fn[i] = 0.01f * static_cast<float>(static_cast<int>(i % 5) - 2);
+        for (int i = 0; i < mix_n; ++i)
+            base[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i - 3);
+        Tensor *tfn = nullptr, *tsc = nullptr, *tbase = nullptr;
+        const bool dsv4_cu_mhc_fn = upload_f32(&tfn, fn.data(), mix_n, M * H, 0);
+        CHECK(dsv4_cu_mhc_fn);
+        const bool dsv4_cu_mhc_sc = upload_f32(&tsc, scale.data(), 3, 1, 0);
+        CHECK(dsv4_cu_mhc_sc);
+        const bool dsv4_cu_mhc_base = upload_f32(&tbase, base.data(), mix_n, 1, 0);
+        CHECK(dsv4_cu_mhc_base);
+        Activation *ares = activation_create(0, static_cast<long long>(M) * H);
+        Activation *astate = activation_create(0, M + M * M);
+        Activation *ain = activation_create(0, H);
+        const bool dsv4_cu_mhc_acts = ares && astate && ain;
+        CHECK(dsv4_cu_mhc_acts);
+        const bool dsv4_cu_mhc_up = activation_upload(ares, residual.data(), M * H);
+        CHECK(dsv4_cu_mhc_up);
+        const bool dsv4_cu_mhc_pre =
+            mhc_pre(ares, tfn, tsc, tbase, M, H, 1e-6f, 1e-6f, 1e-6f, 1.f, 3, astate, ain);
+        CHECK(dsv4_cu_mhc_pre);
+        std::vector<float> collapsed(H, 0.f), stv(static_cast<size_t>(M + M * M), 0.f);
+        const bool dsv4_cu_mhc_dn_in = activation_download(collapsed.data(), ain, H);
+        CHECK(dsv4_cu_mhc_dn_in);
+        const bool dsv4_cu_mhc_dn_st =
+            activation_download(stv.data(), astate, M + M * M);
+        CHECK(dsv4_cu_mhc_dn_st);
+        bool any_nz = false;
+        for (int i = 0; i < H; ++i)
+            if (collapsed[static_cast<size_t>(i)] != 0.f)
+                any_nz = true;
+        const bool dsv4_cu_mhc_in_nz = any_nz;
+        CHECK(dsv4_cu_mhc_in_nz);
+        const bool dsv4_cu_mhc_in_fin = all_finite(collapsed.data(), H);
+        CHECK(dsv4_cu_mhc_in_fin);
+        const bool dsv4_cu_mhc_st_n = activation_elements(astate) == M + M * M;
+        CHECK(dsv4_cu_mhc_st_n);
+        const bool dsv4_cu_mhc_st_fin = all_finite(stv.data(), M + M * M);
+        CHECK(dsv4_cu_mhc_st_fin);
+
+        std::vector<float> branch(H);
+        for (int i = 0; i < H; ++i)
+            branch[static_cast<size_t>(i)] = 0.05f * static_cast<float>(i + 1);
+        Activation *abr = activation_create(0, H);
+        Activation *aout = activation_create(0, static_cast<long long>(M) * H);
+        const bool dsv4_cu_mhc_br = abr && aout;
+        CHECK(dsv4_cu_mhc_br);
+        const bool dsv4_cu_mhc_br_up = activation_upload(abr, branch.data(), H);
+        CHECK(dsv4_cu_mhc_br_up);
+        const bool dsv4_cu_mhc_post = mhc_post(abr, ares, astate, M, H, aout);
+        CHECK(dsv4_cu_mhc_post);
+        std::vector<float> postv(static_cast<size_t>(M) * H, 0.f);
+        const bool dsv4_cu_mhc_dn_out = activation_download(postv.data(), aout, M * H);
+        CHECK(dsv4_cu_mhc_dn_out);
+        const bool dsv4_cu_mhc_out_fin = all_finite(postv.data(), M * H);
+        CHECK(dsv4_cu_mhc_out_fin);
+
+        std::vector<float> zres(static_cast<size_t>(M) * H, 0.f);
+        const bool dsv4_cu_mhc_zup = activation_upload(ares, zres.data(), M * H);
+        CHECK(dsv4_cu_mhc_zup);
+        const bool dsv4_cu_mhc_pre0 =
+            mhc_pre(ares, tfn, tsc, tbase, M, H, 1e-6f, 1e-6f, 1e-6f, 1.f, 3, astate, ain);
+        CHECK(dsv4_cu_mhc_pre0);
+        std::fill(collapsed.begin(), collapsed.end(), 1.f);
+        const bool dsv4_cu_mhc_dn0 = activation_download(collapsed.data(), ain, H);
+        CHECK(dsv4_cu_mhc_dn0);
+        for (int i = 0; i < H; ++i)
+            CHECK_NEAR(collapsed[static_cast<size_t>(i)], 0.f, 1e-4);
+
+        activation_free(ares);
+        activation_free(astate);
+        activation_free(ain);
+        activation_free(abr);
+        activation_free(aout);
+        tensor_free(tfn);
+        tensor_free(tsc);
+        tensor_free(tbase);
+    }
+
+    {
+        const int tokens = 2, heads = 2, dim = 4, value_rows = 3, comp_base = 2;
+        std::vector<float> q(static_cast<size_t>(tokens) * heads * dim);
+        std::vector<float> q2(q.size());
+        std::vector<float> vals(static_cast<size_t>(value_rows) * dim);
+        std::vector<float> sinks(heads);
+        std::vector<float> out(static_cast<size_t>(tokens) * heads * dim, 0.f);
+        std::vector<float> out2(out.size(), 0.f);
+        for (size_t i = 0; i < q.size(); ++i) {
+            q[i] = 0.1f * static_cast<float>(i + 1);
+            q2[i] = 0.3f * static_cast<float>(i + 2);
+        }
+        for (size_t i = 0; i < vals.size(); ++i)
+            vals[i] = 0.1f * static_cast<float>(i + 1);
+        for (int h = 0; h < heads; ++h)
+            sinks[static_cast<size_t>(h)] = 0.1f * static_cast<float>(h + 1);
+        const int meta[6] = {0, 2, 1, 1, 1, 1};
+        const float scale = 0.5f;
+        const bool dsv4_cu_sa = sparse_attn_batch(0, q.data(), vals.data(), sinks.data(), meta,
+                                                  value_rows, comp_base, heads, dim, tokens, scale,
+                                                  out.data());
+        CHECK(dsv4_cu_sa);
+        const bool dsv4_cu_sa_fin = all_finite(out.data(), static_cast<int>(out.size()));
+        CHECK(dsv4_cu_sa_fin);
+        const bool dsv4_cu_sa2 = sparse_attn_batch(0, q2.data(), vals.data(), sinks.data(), meta,
+                                                   value_rows, comp_base, heads, dim, tokens, scale,
+                                                   out2.data());
+        CHECK(dsv4_cu_sa2);
+        bool changed = false;
+        for (size_t i = 0; i < out.size(); ++i)
+            if (std::fabs(out[i] - out2[i]) > 1e-6f)
+                changed = true;
+        const bool dsv4_cu_sa_changed = changed;
+        CHECK(dsv4_cu_sa_changed);
+    }
+
+    {
+        const int tokens = 1, heads = 2, dim = 4, count = 3;
+        std::vector<float> queries(static_cast<size_t>(tokens) * heads * dim, 0.25f);
+        std::vector<float> keys(static_cast<size_t>(count) * dim, 0.5f);
+        std::vector<float> head_w(static_cast<size_t>(tokens) * heads, 1.f);
+        const int counts[1] = {2};
+        float scores[3] = {1.f, 1.f, 1.f};
+        const bool dsv4_cu_idx = indexer_score_batch(0, queries.data(), keys.data(), head_w.data(),
+                                                     counts, tokens, heads, dim, count, scores);
+        CHECK(dsv4_cu_idx);
+        CHECK_NEAR(scores[2], 0.f, 1e-6);
+        const bool dsv4_cu_idx_pos = scores[0] > 0.f || scores[1] > 0.f;
+        CHECK(dsv4_cu_idx_pos);
+
+        std::vector<float> kneg(keys.size(), -0.5f);
+        float sneg[3] = {1.f, 1.f, 1.f};
+        const bool dsv4_cu_idx_relu =
+            indexer_score_batch(0, queries.data(), kneg.data(), head_w.data(), counts, tokens, heads,
+                                dim, count, sneg);
+        CHECK(dsv4_cu_idx_relu);
+        CHECK_NEAR(sneg[0], 0.f, 1e-6);
+        CHECK_NEAR(sneg[1], 0.f, 1e-6);
+        CHECK_NEAR(sneg[2], 0.f, 1e-6);
+    }
+
+    {
+        const int heads = 2, dim = 4, tokens = 1;
+        float rows[8];
+        for (int i = 0; i < 8; ++i)
+            rows[i] = 0.1f * static_cast<float>(i + 1);
+        const bool dsv4_cu_kv_app = kv_ring_append(0, 0, rows, 0, 2, 8, dim);
+        CHECK(dsv4_cu_kv_app);
+        float q[8], chunk[8], sinks[2] = {0.1f, 0.2f}, out[8] = {};
+        for (int i = 0; i < 8; ++i) {
+            q[i] = 0.1f * static_cast<float>(i + 1);
+            chunk[i] = rows[i];
+        }
+        const int meta[3] = {0, 2, 0};
+        const bool dsv4_cu_sa_cached =
+            sparse_attn_batch_cached(0, 0, q, chunk, 0, sinks, meta, 0, 0, heads, dim, tokens, 0.5f,
+                                     out);
+        CHECK(dsv4_cu_sa_cached);
+        const bool dsv4_cu_sa_cached_fin = all_finite(out, 8);
+        CHECK(dsv4_cu_sa_cached_fin);
+    }
+
+    {
+        const bool dsv4_cu_graph_begin = graph_begin(0);
+        CHECK(dsv4_cu_graph_begin);
+        Graph *g = graph_end(0);
+        const bool dsv4_cu_graph_end = g != nullptr;
+        CHECK(dsv4_cu_graph_end);
+        const bool dsv4_cu_graph_launch = graph_launch(g);
+        CHECK(dsv4_cu_graph_launch);
+        graph_free(g);
+    }
+
+    {
+        const float W[16] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f,
+                             10.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        const float x[4] = {1.f, 0.f, 0.f, 0.f};
+        Tensor *tw = nullptr;
+        const bool dsv4_cu_ha_up = upload_f32(&tw, W, 4, 4, 0);
+        CHECK(dsv4_cu_ha_up);
+        int id = -1;
+        float value = 0.f;
+        const bool dsv4_cu_ha = head_argmax(tw, x, &id, &value);
+        CHECK(dsv4_cu_ha);
+        const bool dsv4_cu_ha_id = id == 2;
+        CHECK(dsv4_cu_ha_id);
+        tensor_free(tw);
+    }
+
+    {
+        const int H = 8, heads = 2, dim = 4;
+        std::vector<float> ones8(H, 1.f), ones4(dim, 1.f), ones2(heads, 0.f);
+        std::vector<float> ident(static_cast<size_t>(H) * H, 0.f);
+        for (int i = 0; i < H; ++i)
+            ident[static_cast<size_t>(i) * H + i] = 1.f;
+        std::vector<float> wkv(static_cast<size_t>(dim) * H, 0.f);
+        for (int i = 0; i < dim; ++i)
+            wkv[static_cast<size_t>(i) * H + i] = 1.f;
+        std::vector<float> xin(H);
+        for (int i = 0; i < H; ++i)
+            xin[static_cast<size_t>(i)] = 0.1f * static_cast<float>(i + 1);
+        Tensor *attn_n = nullptr, *q_a = nullptr, *q_n = nullptr, *q_b = nullptr, *wkv_t = nullptr,
+               *kv_n = nullptr, *sink = nullptr, *wo_a = nullptr, *wo_b = nullptr;
+        const bool dsv4_cu_af_n = upload_f32(&attn_n, ones8.data(), 1, H, 0);
+        CHECK(dsv4_cu_af_n);
+        const bool dsv4_cu_af_qa = upload_f32(&q_a, ident.data(), H, H, 0);
+        CHECK(dsv4_cu_af_qa);
+        const bool dsv4_cu_af_qn = upload_f32(&q_n, ones8.data(), 1, H, 0);
+        CHECK(dsv4_cu_af_qn);
+        const bool dsv4_cu_af_qb = upload_f32(&q_b, ident.data(), heads * dim, H, 0);
+        CHECK(dsv4_cu_af_qb);
+        const bool dsv4_cu_af_wkv = upload_f32(&wkv_t, wkv.data(), dim, H, 0);
+        CHECK(dsv4_cu_af_wkv);
+        const bool dsv4_cu_af_kvn = upload_f32(&kv_n, ones4.data(), 1, dim, 0);
+        CHECK(dsv4_cu_af_kvn);
+        const bool dsv4_cu_af_sink = upload_f32(&sink, ones2.data(), heads, 1, 0);
+        CHECK(dsv4_cu_af_sink);
+        const bool dsv4_cu_af_woa = upload_f32(&wo_a, ident.data(), H, heads * dim, 0);
+        CHECK(dsv4_cu_af_woa);
+        const bool dsv4_cu_af_wob = upload_f32(&wo_b, ident.data(), H, H, 0);
+        CHECK(dsv4_cu_af_wob);
+        Activation *ain = activation_create(0, H);
+        Activation *aout = activation_create(0, H);
+        const bool dsv4_cu_af_acts = ain && aout;
+        CHECK(dsv4_cu_af_acts);
+        const bool dsv4_cu_af_up = activation_upload(ain, xin.data(), H);
+        CHECK(dsv4_cu_af_up);
+        const bool dsv4_cu_af =
+            attention_first(ain, attn_n, q_a, q_n, q_b, wkv_t, kv_n, sink, wo_a, wo_b, heads, dim, 0,
+                            1, 1e-6f, aout);
+        CHECK(dsv4_cu_af);
+        const bool dsv4_cu_af_len = activation_elements(aout) == H;
+        CHECK(dsv4_cu_af_len);
+        std::vector<float> y(H, 0.f);
+        const bool dsv4_cu_af_dn = activation_download(y.data(), aout, H);
+        CHECK(dsv4_cu_af_dn);
+        const bool dsv4_cu_af_fin = all_finite(y.data(), H);
+        CHECK(dsv4_cu_af_fin);
+        activation_free(ain);
+        activation_free(aout);
+        tensor_free(attn_n);
+        tensor_free(q_a);
+        tensor_free(q_n);
+        tensor_free(q_b);
+        tensor_free(wkv_t);
+        tensor_free(kv_n);
+        tensor_free(sink);
+        tensor_free(wo_a);
+        tensor_free(wo_b);
+    }
+
+    tensor_free(nullptr);
+    shutdown();
+    (void)available();
+    const bool dsv4_cu_reinit = init(nullptr, 0);
+    CHECK(dsv4_cu_reinit);
+    const bool dsv4_cu_reavail = available();
+    CHECK(dsv4_cu_reavail);
+    shutdown();
+}
+
+static void test_coli_cuda_tier() {
+    using namespace mvllm;
+    using namespace mvllm::coli_cuda;
+
+    auto silu = [](float v) { return v * quant::sigmoid(v); };
+    auto all_finite = [](const float *p, int n) {
+        for (int i = 0; i < n; ++i)
+            if (!std::isfinite(p[i]))
+                return false;
+        return true;
+    };
+
+    const bool coli_cu_w0 = weight_at_supported(0);
+    CHECK(coli_cu_w0);
+    const bool coli_cu_w1 = weight_at_supported(1);
+    CHECK(coli_cu_w1);
+    const bool coli_cu_w2 = weight_at_supported(2);
+    CHECK(coli_cu_w2);
+    const bool coli_cu_w3 = weight_at_supported(3);
+    CHECK(coli_cu_w3);
+    const bool coli_cu_w4 = weight_at_supported(4);
+    CHECK(coli_cu_w4);
+    const bool coli_cu_w5 = !weight_at_supported(5);
+    CHECK(coli_cu_w5);
+    const bool coli_cu_w7 = !weight_at_supported(7);
+    CHECK(coli_cu_w7);
+    const bool coli_cu_w6 = !weight_at_supported(6);
+    CHECK(coli_cu_w6);
+    const bool coli_cu_w8 = !weight_at_supported(8);
+    CHECK(coli_cu_w8);
+
+    const bool coli_cu_init = init(nullptr, 0);
+    CHECK(coli_cu_init);
+    const bool coli_cu_avail = available();
+    CHECK(coli_cu_avail);
+    const bool coli_cu_ndev = available_device_count() == 0;
+    CHECK(coli_cu_ndev);
+    const bool coli_cu_init2 = init(nullptr, 0);
+    CHECK(coli_cu_init2);
+
+    {
+        const float W[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                             0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const float x[4] = {1.f, 2.f, 3.f, 4.f};
+        float y[4] = {};
+        Tensor *tw = nullptr;
+        const bool coli_cu_up_f32 = tensor_upload(&tw, W, nullptr, 0, 4, 4, 0, 0);
+        CHECK(coli_cu_up_f32);
+        const bool coli_cu_mm_f32 = matmul(&tw, y, x, W, nullptr, 0, 1, 4, 4, 0, 0);
+        CHECK(coli_cu_mm_f32);
+        CHECK_NEAR(y[0], 1.f, 1e-5);
+        CHECK_NEAR(y[1], 2.f, 1e-5);
+        CHECK_NEAR(y[2], 3.f, 1e-5);
+        CHECK_NEAR(y[3], 4.f, 1e-5);
+        tensor_free(tw);
+    }
+
+    {
+        const int O = 32, I = 32;
+        std::vector<float> W(static_cast<size_t>(O) * I), x(I), y(O), ref(O);
+        for (int i = 0; i < O * I; ++i)
+            W[static_cast<size_t>(i)] = ((i * 17) % 11 - 5) * 0.1f;
+        for (int i = 0; i < I; ++i)
+            x[static_cast<size_t>(i)] = ((i * 3) % 7 - 3) * 0.2f;
+        std::vector<uint8_t> packed(static_cast<size_t>(O) * (I / 2));
+        std::vector<float> scales(static_cast<size_t>(O) * ((I + 63) / 64));
+        quant::quantize_int4_g64(W.data(), O, I, packed.data(), scales.data());
+        quant::matmul_int4_g64(ref.data(), x.data(), packed.data(), scales.data(), 1, I, O);
+        Tensor *tw = nullptr;
+        const bool coli_cu_up_i4 = tensor_upload(&tw, packed.data(), scales.data(), 4, I, O, 0, 64);
+        CHECK(coli_cu_up_i4);
+        const bool coli_cu_mm_i4 =
+            matmul(&tw, y.data(), x.data(), packed.data(), scales.data(), 4, 1, I, O, 0, 64);
+        CHECK(coli_cu_mm_i4);
+        for (int o = 0; o < O; ++o)
+            CHECK_NEAR(y[static_cast<size_t>(o)], ref[static_cast<size_t>(o)], 1e-4);
+        tensor_free(tw);
+    }
+
+    {
+        const int O = 32, I = 32;
+        std::vector<uint8_t> packed(static_cast<size_t>(O) * (I / 2));
+        std::vector<uint8_t> e8s(static_cast<size_t>(O) * ((I + 31) / 32), 127);
+        std::vector<float> x(I), y(O), ref(O);
+        for (size_t i = 0; i < packed.size(); ++i)
+            packed[i] = static_cast<uint8_t>((i * 37 + 11) & 0xff);
+        for (int i = 0; i < I; ++i)
+            x[static_cast<size_t>(i)] = 0.1f * static_cast<float>(i + 1);
+        quant::matmul_mxfp4(ref.data(), x.data(), packed.data(), e8s.data(), 1, I, O);
+        const bool coli_cu_mm_mx =
+            matmul_mxfp4(y.data(), x.data(), packed.data(), e8s.data(), 1, I, O);
+        CHECK(coli_cu_mm_mx);
+        for (int o = 0; o < O; ++o)
+            CHECK_NEAR(y[static_cast<size_t>(o)], ref[static_cast<size_t>(o)], 1e-4);
+    }
+
+    {
+        const int D = 4;
+        const float ident[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                                 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const float x[4] = {0.2f, -0.4f, 0.6f, -0.8f};
+        float y[4] = {}, ref[4] = {};
+        Tensor *gate = nullptr, *up = nullptr, *down = nullptr;
+        const bool coli_cu_mlp_g = tensor_upload(&gate, ident, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_mlp_g);
+        const bool coli_cu_mlp_u = tensor_upload(&up, ident, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_mlp_u);
+        const bool coli_cu_mlp_d = tensor_upload(&down, ident, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_mlp_d);
+        const bool coli_cu_mlp = expert_mlp(gate, up, down, y, x, 1);
+        CHECK(coli_cu_mlp);
+        for (int i = 0; i < D; ++i)
+            ref[i] = silu(x[i]) * x[i];
+        const bool coli_cu_mlp_fin = all_finite(y, D);
+        CHECK(coli_cu_mlp_fin);
+        for (int i = 0; i < D; ++i)
+            CHECK_NEAR(y[i], ref[i], 1e-5);
+        tensor_free(gate);
+        tensor_free(up);
+        tensor_free(down);
+    }
+
+    {
+        const int D = 4;
+        const float ident[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                                 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const float simple[16] = {2.f, 0.f, 0.f, 0.f, 0.f, 2.f, 0.f, 0.f,
+                                  0.f, 0.f, 2.f, 0.f, 0.f, 0.f, 0.f, 2.f};
+        const float x[8] = {0.1f, 0.2f, 0.3f, 0.4f, -0.2f, 0.3f, -0.4f, 0.5f};
+        const int rows[2] = {1, 1};
+        Tensor *gates[2] = {}, *ups[2] = {}, *downs[2] = {};
+        const bool coli_cu_eg_g0 = tensor_upload(&gates[0], ident, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_eg_g0);
+        const bool coli_cu_eg_u0 = tensor_upload(&ups[0], ident, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_eg_u0);
+        const bool coli_cu_eg_d0 = tensor_upload(&downs[0], ident, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_eg_d0);
+        const bool coli_cu_eg_g1 = tensor_upload(&gates[1], simple, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_eg_g1);
+        const bool coli_cu_eg_u1 = tensor_upload(&ups[1], simple, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_eg_u1);
+        const bool coli_cu_eg_d1 = tensor_upload(&downs[1], simple, nullptr, 0, D, D, 0, 0);
+        CHECK(coli_cu_eg_d1);
+        float y[8] = {};
+        const bool coli_cu_eg = expert_group(gates, ups, downs, rows, 2, y, x);
+        CHECK(coli_cu_eg);
+        const bool coli_cu_eg_fin = all_finite(y, 8);
+        CHECK(coli_cu_eg_fin);
+        const bool coli_cu_eg_iss = expert_group_issue(gates, ups, downs, rows, 2, x);
+        CHECK(coli_cu_eg_iss);
+        const float *taken = expert_group_take(0);
+        const bool coli_cu_eg_take = taken != nullptr;
+        CHECK(coli_cu_eg_take);
+        if (taken) {
+            for (int i = 0; i < 8; ++i)
+                CHECK_NEAR(taken[i], y[i], 1e-4);
+        }
+        tensor_free(gates[0]);
+        tensor_free(ups[0]);
+        tensor_free(downs[0]);
+        tensor_free(gates[1]);
+        tensor_free(ups[1]);
+        tensor_free(downs[1]);
+    }
+
+    {
+        const int H = 1, Q = 2, R = 2, V = 2, K = 2, T = 1;
+        const float kvb_w[8] = {1.f, 0.f, 0.f, 1.f, 1.f, 0.f, 0.f, 1.f};
+        const float q[4] = {0.1f, 0.2f, 0.3f, 0.4f};
+        const float latent[2] = {0.5f, 0.6f};
+        const float rope[2] = {0.7f, 0.8f};
+        float ctx[2] = {};
+        Tensor *kvb = nullptr;
+        const bool coli_cu_abs_up = tensor_upload(&kvb, kvb_w, nullptr, 0, K, H * (Q + V), 0, 0);
+        CHECK(coli_cu_abs_up);
+        const bool coli_cu_abs =
+            attention_absorb(kvb, ctx, q, latent, rope, H, Q, R, V, K, T, 1.f);
+        CHECK(coli_cu_abs);
+        const bool coli_cu_abs_fin = all_finite(ctx, V);
+        CHECK(coli_cu_abs_fin);
+        // T=1 softmax is 1: ctx = Wv @ latent (identity Wv).
+        CHECK_NEAR(ctx[0], latent[0], 1e-5);
+        CHECK_NEAR(ctx[1], latent[1], 1e-5);
+        tensor_free(kvb);
+    }
+
+    {
+        const float ones[4] = {1.f, 1.f, 1.f, 1.f};
+        const float weight[4] = {1.f, 1.f, 1.f, 1.f};
+        float yn[4] = {};
+        const bool coli_cu_rms = pipe_rmsnorm(0, yn, ones, weight, 1, 4, 1e-6f);
+        CHECK(coli_cu_rms);
+        const bool coli_cu_rms_fin = all_finite(yn, 4);
+        CHECK(coli_cu_rms_fin);
+        float gate[4] = {1.f, 1.f, 1.f, 1.f};
+        const bool coli_cu_silu = pipe_silu_mul(0, gate, ones, 4);
+        CHECK(coli_cu_silu);
+        const bool coli_cu_silu_fin = all_finite(gate, 4);
+        CHECK(coli_cu_silu_fin);
+        float acc[4] = {1.f, 1.f, 1.f, 1.f};
+        const bool coli_cu_add = pipe_add(0, acc, ones, 4);
+        CHECK(coli_cu_add);
+        CHECK_NEAR(acc[0], 2.f, 1e-5);
+        CHECK_NEAR(acc[1], 2.f, 1e-5);
+        CHECK_NEAR(acc[2], 2.f, 1e-5);
+        CHECK_NEAR(acc[3], 2.f, 1e-5);
+    }
+
+    tensor_free(nullptr);
+    shutdown();
+    const bool coli_cu_reinit = init(nullptr, 0);
+    CHECK(coli_cu_reinit);
+    const bool coli_cu_reavail = available();
+    CHECK(coli_cu_reavail);
+    shutdown();
+}
+
+static void test_llama_dims_helpers() {
+    const bool llama_dims_nlayers = N_LAYERS == 16;
+    CHECK(llama_dims_nlayers);
+    const bool llama_dims_embed = EMBEDDING_LENGTH == 2048;
+    CHECK(llama_dims_embed);
+    const bool llama_dims_hidden = HIDDEN_DIM == 8192;
+    CHECK(llama_dims_hidden);
+    const bool llama_dims_vocab = VOCAB_SIZE == 128256;
+    CHECK(llama_dims_vocab);
+    const bool llama_dims_qh = NUM_Q_HEADS == 32;
+    CHECK(llama_dims_qh);
+    const bool llama_dims_kh = NUM_K_HEADS == 8;
+    CHECK(llama_dims_kh);
+    const bool llama_dims_gqa = GQA_Q_TO_K_RATIO == 4;
+    CHECK(llama_dims_gqa);
+    const bool llama_dims_maxp = DEFAULT_MAX_PROMPT == 512;
+    CHECK(llama_dims_maxp);
+    const bool llama_dims_clamp0 = llama_clamp_n(0, 1) == 1;
+    CHECK(llama_dims_clamp0);
+    const bool llama_dims_clamp8 = llama_clamp_n(8, 1) == 8;
+    CHECK(llama_dims_clamp8);
+    const bool llama_dims_bidx =
+        llama_block_index(1, 2, 3) == 1 * N_LAYERS * MAX_BLOCKS_PER_SEQ + 2 * MAX_BLOCKS_PER_SEQ + 3;
+    CHECK(llama_dims_bidx);
+    const bool llama_dims_slot = llama_slot_table_elems() == N_LAYERS * MAX_BLOCKS_PER_SEQ;
+    CHECK(llama_dims_slot);
+    const bool llama_dims_btab = llama_block_table_elems(2) == 2 * llama_slot_table_elems();
+    CHECK(llama_dims_btab);
 }
 
 static void test_idot() {
@@ -1730,6 +2577,10 @@ static void test_glm53_container() {
     std::string info = eg.info();
     CHECK(info.find("checkpoint=yes") != std::string::npos);
     CHECK(info.find("bits=4") != std::string::npos);
+    const bool glm_coli_tier_cpu = info.find("coli=cpu") != std::string::npos;
+    CHECK(glm_coli_tier_cpu);
+    const bool glm_coli_avail = mvllm::coli_cuda::available();
+    CHECK(glm_coli_avail);
     CHECK(eg.config().moe.n_experts == 2);
     GenParams gp;
     gp.max_new_tokens = 2;
@@ -1807,6 +2658,12 @@ static void test_k3_mxfp4_container() {
     std::string info = ek.info();
     CHECK(info.find("checkpoint=yes") != std::string::npos);
     CHECK(info.find("bits=4") != std::string::npos);
+    const bool k3_coli_tier_cpu = info.find("coli=cpu") != std::string::npos;
+    CHECK(k3_coli_tier_cpu);
+    const bool k3_coli_avail = mvllm::coli_cuda::available();
+    CHECK(k3_coli_avail);
+    const bool k3_coli_ndev = mvllm::coli_cuda::available_device_count() == 0;
+    CHECK(k3_coli_ndev);
     GenParams gp;
     gp.max_new_tokens = 2;
     gp.eos = 1;
@@ -3084,6 +3941,9 @@ int main() {
     test_config_and_families();
     test_dsv4_tiny();
     test_dsv4_prefix_ckpt();
+    test_dsv4_cuda_tier();
+    test_coli_cuda_tier();
+    test_llama_dims_helpers();
     test_offload_generate();
     test_glm53_container();
     test_k3_mxfp4_container();

@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "../gpu/backend.hpp"
+#include "../gpu/coli_cuda.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -71,6 +72,42 @@ ExpertGeom make_expert_geom(int hidden, int inter) {
     g.sc_d = static_cast<int64_t>(hidden) * ((inter + 63) / 64) * static_cast<int64_t>(sizeof(float));
     g.slot = 2 * (g.pack_go + g.sc_go) + g.pack_d + g.sc_d;
     return g;
+}
+
+bool glm_expert_try_coli(float *y, const float *x, int S, const uint8_t *blob, int H, int O,
+                         float limit) {
+    if (!coli_cuda::available() || !y || !x || !blob || S <= 0 || H <= 0 || O <= 0)
+        return false;
+    const ExpertGeom g = make_expert_geom(H, O);
+    const uint8_t *gp = blob;
+    const float *gs = reinterpret_cast<const float *>(gp + g.pack_go);
+    const uint8_t *up = gp + g.pack_go + g.sc_go;
+    const float *us = reinterpret_cast<const float *>(up + g.pack_go);
+    const uint8_t *dp = up + g.pack_go + g.sc_go;
+    const float *ds = reinterpret_cast<const float *>(dp + g.pack_d);
+    coli_cuda::Tensor *tg = nullptr;
+    coli_cuda::Tensor *tu = nullptr;
+    coli_cuda::Tensor *td = nullptr;
+    std::vector<float> gate(static_cast<size_t>(S) * O), u(static_cast<size_t>(S) * O);
+    bool ok = coli_cuda::tensor_upload(&tg, gp, gs, 4, H, O, 0, 64) &&
+              coli_cuda::tensor_upload(&tu, up, us, 4, H, O, 0, 64) &&
+              coli_cuda::tensor_upload(&td, dp, ds, 4, O, H, 0, 64);
+    if (ok)
+        ok = coli_cuda::matmul(&tg, gate.data(), x, gp, gs, 4, S, H, O, 0, 64) &&
+             coli_cuda::matmul(&tu, u.data(), x, up, us, 4, S, H, O, 0, 64);
+    if (ok) {
+        for (int s = 0; s < S; ++s) {
+            float *gg = gate.data() + static_cast<size_t>(s) * O;
+            const float *uu = u.data() + static_cast<size_t>(s) * O;
+            for (int i = 0; i < O; ++i)
+                gg[i] = quant::clamped_swiglu(gg[i], uu[i], limit);
+        }
+        ok = coli_cuda::matmul(&td, y, gate.data(), dp, ds, 4, S, O, H, 0, 64);
+    }
+    coli_cuda::tensor_free(tg);
+    coli_cuda::tensor_free(tu);
+    coli_cuda::tensor_free(td);
+    return ok;
 }
 
 const char *kExpertPieces[6] = {
@@ -182,6 +219,7 @@ public:
             std::string terr;
             trace_.open(tpath, terr);
         }
+        coli_cuda::init(nullptr, 0);
         return Status::Ok;
     }
 
@@ -304,7 +342,13 @@ public:
            << " bits=" << rt_.dense_bits << " head_bits=" << rt_.head_bits
            << " prefix=" << (prefix_.empty() ? "-" : prefix_) << " mla=" << mla_n
            << " prefill=layer"
-           << " dsa=" << (cfg_.dsa.topk > 0 ? cfg_.dsa.topk : 0);
+           << " dsa=" << (cfg_.dsa.topk > 0 ? cfg_.dsa.topk : 0) << " coli=";
+        if (coli_cuda::available() && coli_cuda::available_device_count() > 0)
+            os << "cuda";
+        else if (coli_cuda::available())
+            os << "cpu";
+        else
+            os << "off";
         return os.str();
     }
 
@@ -1790,7 +1834,9 @@ private:
                 ++n;
             }
             if (n > 0) {
-                gpu::glm_expert(yb.data(), xb.data(), n, v.data, H, O, cfg_.moe.swiglu_limit);
+                if (!glm_expert_try_coli(yb.data(), xb.data(), n, v.data, H, O,
+                                         cfg_.moe.swiglu_limit))
+                    gpu::glm_expert(yb.data(), xb.data(), n, v.data, H, O, cfg_.moe.swiglu_limit);
                 for (int i = 0; i < n; ++i) {
                     float *ac = acc.data() + static_cast<size_t>(cmap[static_cast<size_t>(i)]) * H;
                     const float *d = yb.data() + static_cast<size_t>(i) * H;

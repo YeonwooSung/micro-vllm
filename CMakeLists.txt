@@ -9,6 +9,7 @@ else()
     option(MVLLM_METAL "Metal expert GEMM and H3 DiT in the host engine" OFF)
 endif()
 option(MVLLM_GPU_CUDA "CUDA expert GEMM and H3 DiT in the host engine (not the Llama demo)" OFF)
+# DSV4 CUDA tier: src/gpu/dsv4_cuda.cpp is always-on (CPU API); .cu is optional.
 
 if(NOT USE_HIP AND MVLLM_CUDA AND NOT MVLLM_HOST_ONLY)
     if(EXISTS "/opt/cuda/bin/nvcc")
@@ -108,6 +109,8 @@ set(MVLLM_HOST_SOURCES
     src/serve/scheduler.cpp
     src/engine.cpp
     src/gpu/backend.cpp
+    src/gpu/dsv4_cuda.cpp
+    src/gpu/coli_cuda.cpp
 )
 
 if(APPLE AND MVLLM_METAL)
@@ -119,7 +122,7 @@ if(MVLLM_GPU_CUDA)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
         enable_language(CUDA)
-        list(APPEND MVLLM_HOST_SOURCES src/gpu/cuda_gemm.cu)
+        list(APPEND MVLLM_HOST_SOURCES src/gpu/cuda_gemm.cu src/gpu/dsv4_cuda.cu)
     else()
         message(WARNING "MVLLM_GPU_CUDA=ON but no CUDA compiler was found")
         set(MVLLM_GPU_CUDA OFF)
