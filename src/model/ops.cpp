@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "../gpu/coli_cuda.hpp"
+#include "../gpu/metal_ops.hpp"
 #include "../quant/quant.hpp"
 #include "../tok/logit_dump.hpp"
 #include "../tok/sample_nuc.hpp"
@@ -176,20 +177,6 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     if (w_v)
         w_v->gemm(v.data(), x, 1);
     const int K = kda.conv_k > 0 ? kda.conv_k : 4;
-    kda_short_conv(q.data(), conv_q, win_q, P, K);
-    kda_short_conv(k.data(), conv_k, win_k, P, K);
-    kda_short_conv(v.data(), conv_v, win_v, P, K);
-    silu_vec(q.data(), P);
-    silu_vec(k.data(), P);
-    silu_vec(v.data(), P);
-
-    const float qscale = 1.f / std::sqrt(static_cast<float>(D));
-    for (int h = 0; h < H; ++h) {
-        l2_normalize(q.data() + h * D, D, 1e-6f);
-        l2_normalize(k.data() + h * D, D, 1e-6f);
-        for (int i = 0; i < D; ++i)
-            q[h * D + i] *= qscale;
-    }
 
     // z = W_fb(W_fa x) + dt_bias   (low-rank dt)
     std::vector<float> fa(orows(w_fa, D > 0 ? D : 1), 0.f);
@@ -226,6 +213,78 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::Qua
     }
 
     const float gmin = kda.gate_lower_bound;
+    std::vector<float> alpha(static_cast<size_t>(std::max(P, 0)), 0.f);
+    std::vector<float> beta(static_cast<size_t>(std::max(H, 0)), 0.5f);
+    for (int h = 0; h < H; ++h) {
+        float alog = 0.f;
+        if (a_log)
+            alog = a_log[h];
+        const float eA = std::exp(alog);
+        for (int i = 0; i < D; ++i)
+            alpha[static_cast<size_t>(h * D + i)] =
+                std::exp(gmin * quant::sigmoid(eA * z[h * D + i]));
+        if (bn >= P && D > 0) {
+            float acc = 0.f;
+            const float *bh = b.data() + h * D;
+            for (int i = 0; i < D; ++i)
+                acc += quant::sigmoid(bh[i]);
+            beta[static_cast<size_t>(h)] = acc / static_cast<float>(D);
+        } else if (h < bn) {
+            beta[static_cast<size_t>(h)] = quant::sigmoid(b[h]);
+        } else {
+            beta[static_cast<size_t>(h)] = 0.5f;
+        }
+    }
+
+    if (!metal_ops::available())
+        metal_ops::init();
+    if (metal_ops::available() && win_q && win_k && win_v && conv_q && conv_k && conv_v &&
+        qn >= P && kn >= P && vn >= P && P == H * D && D >= 1 && H >= 1 && S && y) {
+        std::vector<float> qwork(q.begin(), q.begin() + P);
+        std::vector<float> kwork(k.begin(), k.begin() + P);
+        std::vector<float> vwork(v.begin(), v.begin() + P);
+        std::vector<float> fused_oh(static_cast<size_t>(P), 0.f);
+        if (metal_ops::kda_fused_token(win_q, qwork.data(), win_k, kwork.data(), win_v,
+                                       vwork.data(), conv_q, conv_k, conv_v, S, alpha.data(),
+                                       beta.data(), fused_oh.data(), P, K, H, D)) {
+            std::memcpy(o.data(), fused_oh.data(), static_cast<size_t>(P) * sizeof(float));
+            for (int h = 0; h < H; ++h) {
+                float *oh = o.data() + h * D;
+                quant::rmsnorm(oh, out_norm, oh, D, eps);
+                if (!out_norm) {
+                    // rmsnorm with w=1
+                }
+                float gate = quant::sigmoid(g[h * D]); // first channel as scalar if full-rank unused
+                // Full-rank gate is per-channel.
+                for (int i = 0; i < D; ++i) {
+                    float gi = quant::sigmoid(g[h * D + i]);
+                    oh[i] *= gi;
+                    (void)gate;
+                }
+            }
+            if (w_o && !w_o->empty())
+                w_o->gemm(y, o.data(), 1);
+            else
+                std::memcpy(y, o.data(), std::min(P, hidden) * sizeof(float));
+            return;
+        }
+    }
+
+    kda_short_conv(q.data(), conv_q, win_q, P, K);
+    kda_short_conv(k.data(), conv_k, win_k, P, K);
+    kda_short_conv(v.data(), conv_v, win_v, P, K);
+    silu_vec(q.data(), P);
+    silu_vec(k.data(), P);
+    silu_vec(v.data(), P);
+
+    const float qscale = 1.f / std::sqrt(static_cast<float>(D));
+    for (int h = 0; h < H; ++h) {
+        l2_normalize(q.data() + h * D, D, 1e-6f);
+        l2_normalize(k.data() + h * D, D, 1e-6f);
+        for (int i = 0; i < D; ++i)
+            q[h * D + i] *= qscale;
+    }
+
     for (int h = 0; h < H; ++h) {
         float *Sh = S + static_cast<size_t>(h) * D * D;
         const float *qh = q.data() + h * D;

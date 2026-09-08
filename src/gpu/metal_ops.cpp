@@ -4,6 +4,7 @@
 #include "../quant/quant.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace mvllm {
@@ -102,6 +103,77 @@ bool kda_args_ok(const float *win_q, const float *qt, const float *win_k, const 
            beta && oh && P == H * hd && K >= 1 && H >= 1 && hd >= 1;
 }
 
+void cpu_layer_decode(float *x, const float *attn, const float *post_ln, const float *shg,
+                      const float *shu, const float *shd, int D, int Iinter, float eps,
+                      float *nrm_out, float *sh_out) {
+    for (int i = 0; i < D; ++i)
+        x[i] += attn[i];
+    quant::rmsnorm(x, post_ln, nrm_out, D, eps);
+    if (!shg || !shu || !shd || Iinter < 1)
+        return;
+    std::vector<float> gate(static_cast<size_t>(Iinter));
+    std::vector<float> up(static_cast<size_t>(Iinter));
+    quant::matmul_f32(gate.data(), nrm_out, shg, 1, D, Iinter);
+    quant::matmul_f32(up.data(), nrm_out, shu, 1, D, Iinter);
+    quant::silu_mul(gate.data(), up.data(), Iinter);
+    if (sh_out)
+        quant::matmul_f32(sh_out, gate.data(), shd, 1, Iinter, D);
+}
+
+void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
+                   const void *const *u, const void *const *d, const float *const *gs,
+                   const float *const *us, const float *const *ds, const float *xg, const int *xoff,
+                   const int *nr, const int *rows, const float *rw, float *out, int S) {
+    (void)qgs;
+    int base = 0;
+    std::vector<float> gate, up, hh;
+    for (int e = 0; e < nb; ++e) {
+        const int nre = nr[e];
+        if (nre <= 0)
+            continue;
+        if (Iinter < 1 || !g || !u || !d || !g[e] || !u[e] || !d[e] || !xoff) {
+            base += nre;
+            continue;
+        }
+        if (fmt == 4 && (!gs || !us || !ds || !gs[e] || !us[e] || !ds[e])) {
+            base += nre;
+            continue;
+        }
+        const float *xe = xg + static_cast<size_t>(xoff[e]) * static_cast<size_t>(D);
+        gate.assign(static_cast<size_t>(nre) * static_cast<size_t>(Iinter), 0.f);
+        up.assign(static_cast<size_t>(nre) * static_cast<size_t>(Iinter), 0.f);
+        hh.assign(static_cast<size_t>(nre) * static_cast<size_t>(D), 0.f);
+        if (fmt == 0) {
+            quant::matmul_f32(gate.data(), xe, static_cast<const float *>(g[e]), nre, D, Iinter);
+            quant::matmul_f32(up.data(), xe, static_cast<const float *>(u[e]), nre, D, Iinter);
+            quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+            quant::matmul_f32(hh.data(), gate.data(), static_cast<const float *>(d[e]), nre, Iinter,
+                              D);
+        } else {
+            quant::matmul_int4_g64(gate.data(), xe, static_cast<const uint8_t *>(g[e]), gs[e], nre,
+                                   D, Iinter);
+            quant::matmul_int4_g64(up.data(), xe, static_cast<const uint8_t *>(u[e]), us[e], nre, D,
+                                   Iinter);
+            quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+            quant::matmul_int4_g64(hh.data(), gate.data(), static_cast<const uint8_t *>(d[e]), ds[e],
+                                   nre, Iinter, D);
+        }
+        if (rows && rw) {
+            for (int r = 0; r < nre; ++r) {
+                const int dest = rows[base + r];
+                if (dest < 0 || (S > 0 && dest >= S))
+                    continue;
+                const float w = rw[base + r];
+                const float *hr = hh.data() + static_cast<size_t>(r) * static_cast<size_t>(D);
+                float *orow = out + static_cast<size_t>(dest) * static_cast<size_t>(D);
+                for (int i = 0; i < D; ++i)
+                    orow[i] += w * hr[i];
+            }
+        }
+        base += nre;
+    }
+}
+
 } // namespace
 
 bool init() {
@@ -145,6 +217,27 @@ bool kda_fused_token(float *win_q, float *qt, float *win_k, float *kt, float *wi
         return false;
     cpu_kda_fused(win_q, qt, win_k, kt, win_v, tv, taps_q, taps_k, taps_v, S, alpha, beta, oh, P, K,
                   H, hd);
+    return true;
+}
+
+bool layer_decode(float *x, const float *attn, const float *post_ln, const float *shg,
+                  const float *shu, const float *shd, int D, int Iinter, float eps, float *nrm_out,
+                  float *sh_out) {
+    if (!x || !attn || !post_ln || !nrm_out || D < 1)
+        return false;
+    cpu_layer_decode(x, attn, post_ln, shg, shu, shd, D, Iinter, eps, nrm_out, sh_out);
+    return true;
+}
+
+bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
+               const void *const *u, const void *const *d, const float *const *gs,
+               const float *const *us, const float *const *ds, const float *xg, const int *xoff,
+               const int *nr, const int *rows, const float *rw, float *out, int S) {
+    if (nb < 1 || D < 1 || !out || !xg || (fmt != 0 && fmt != 4))
+        return false;
+    if (!xoff || !nr)
+        return false;
+    cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, S);
     return true;
 }
 

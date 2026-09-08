@@ -198,6 +198,10 @@ Metal ops (`mvllm::metal_ops`):
   Metal `metal_ops.mm` when `APPLE AND MVLLM_METAL`.
 - Surface: `rmsnorm` / `add` / `silu_mul` plus fused KDA token
   (`kda_fused_token`: depthwise conv+SiLU, L2-norm q/k, state recurrence).
+  `layer_decode` is the post-attention tail (residual + rmsnorm + optional
+  F32 shared SwiGLU). `moe_block` is batched routed SwiGLU in one Metal
+  command buffer (CPU scatter). `kda_step` uses `kda_fused_token` when
+  windows/taps are present.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 

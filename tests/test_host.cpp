@@ -2244,6 +2244,68 @@ static void test_metal_ops_tier() {
         const bool metal_ops_kda_fin = metal_ops_oh_ok;
         CHECK(metal_ops_kda_fin);
     }
+
+    {
+        float metal_ops_ld_x[4] = {1.f, 0.f, 0.f, 0.f};
+        const float metal_ops_ld_attn[4] = {0.f, 1.f, 0.f, 0.f};
+        const float metal_ops_ld_post[4] = {1.f, 1.f, 1.f, 1.f};
+        const float metal_ops_ld_id[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                                           0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        float metal_ops_ld_nrm[4] = {};
+        float metal_ops_ld_sh[4] = {};
+        const bool metal_ops_ld =
+            layer_decode(metal_ops_ld_x, metal_ops_ld_attn, metal_ops_ld_post, metal_ops_ld_id,
+                         metal_ops_ld_id, metal_ops_ld_id, 4, 4, 1e-6f, metal_ops_ld_nrm,
+                         metal_ops_ld_sh);
+        CHECK(metal_ops_ld);
+        const bool metal_ops_ld_nrm_fin =
+            std::isfinite(metal_ops_ld_nrm[0]) && std::isfinite(metal_ops_ld_nrm[1]) &&
+            std::isfinite(metal_ops_ld_nrm[2]) && std::isfinite(metal_ops_ld_nrm[3]);
+        CHECK(metal_ops_ld_nrm_fin);
+        const bool metal_ops_ld_resid = (metal_ops_ld_x[0] != 0.f) && (metal_ops_ld_x[1] != 0.f);
+        CHECK(metal_ops_ld_resid);
+        const bool metal_ops_ld_sh_fin =
+            std::isfinite(metal_ops_ld_sh[0]) && std::isfinite(metal_ops_ld_sh[1]) &&
+            std::isfinite(metal_ops_ld_sh[2]) && std::isfinite(metal_ops_ld_sh[3]);
+        CHECK(metal_ops_ld_sh_fin);
+    }
+
+    {
+        const float metal_ops_moe_id[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                                            0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const void *metal_ops_moe_g[1] = {metal_ops_moe_id};
+        const void *metal_ops_moe_u[1] = {metal_ops_moe_id};
+        const void *metal_ops_moe_d[1] = {metal_ops_moe_id};
+        const float metal_ops_moe_x[4] = {0.5f, -0.25f, 1.f, -1.f};
+        const int metal_ops_moe_xoff[1] = {0};
+        const int metal_ops_moe_nr[1] = {1};
+        const int metal_ops_moe_rows[1] = {0};
+        const float metal_ops_moe_rw[1] = {1.f};
+        float metal_ops_moe_out[4] = {};
+        const bool metal_ops_moe =
+            moe_block(1, 4, 4, 0, 0, metal_ops_moe_g, metal_ops_moe_u, metal_ops_moe_d, nullptr,
+                      nullptr, nullptr, metal_ops_moe_x, metal_ops_moe_xoff, metal_ops_moe_nr,
+                      metal_ops_moe_rows, metal_ops_moe_rw, metal_ops_moe_out, 1);
+        CHECK(metal_ops_moe);
+        const bool metal_ops_moe_out_fin =
+            std::isfinite(metal_ops_moe_out[0]) && std::isfinite(metal_ops_moe_out[1]) &&
+            std::isfinite(metal_ops_moe_out[2]) && std::isfinite(metal_ops_moe_out[3]);
+        CHECK(metal_ops_moe_out_fin);
+        float metal_ops_moe_exp[4];
+        for (int metal_ops_moe_i = 0; metal_ops_moe_i < 4; ++metal_ops_moe_i) {
+            const float metal_ops_moe_v = metal_ops_moe_x[metal_ops_moe_i];
+            const float metal_ops_moe_sig =
+                metal_ops_moe_v >= 0.f
+                    ? 1.f / (1.f + std::exp(-metal_ops_moe_v))
+                    : (std::exp(metal_ops_moe_v) / (1.f + std::exp(metal_ops_moe_v)));
+            metal_ops_moe_exp[metal_ops_moe_i] =
+                (metal_ops_moe_v * metal_ops_moe_sig) * metal_ops_moe_x[metal_ops_moe_i];
+        }
+        CHECK_NEAR(metal_ops_moe_out[0], metal_ops_moe_exp[0], 1e-4);
+        CHECK_NEAR(metal_ops_moe_out[1], metal_ops_moe_exp[1], 1e-4);
+        CHECK_NEAR(metal_ops_moe_out[2], metal_ops_moe_exp[2], 1e-4);
+        CHECK_NEAR(metal_ops_moe_out[3], metal_ops_moe_exp[3], 1e-4);
+    }
 }
 
 static void test_metal_h3_tier() {
