@@ -1,6 +1,7 @@
 #include "family.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/coli_cuda.hpp"
+#include "../gpu/metal_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -108,6 +109,54 @@ bool glm_expert_try_coli(float *y, const float *x, int S, const uint8_t *blob, i
     coli_cuda::tensor_free(tu);
     coli_cuda::tensor_free(td);
     return ok;
+}
+
+// Unpack GLM int4-g64 expert blob (same geom as glm_expert_try_coli) for moe_block fmt=4.
+bool glm_pack_int4_g64(const uint8_t *blob, int H, int O, const void **g, const void **u,
+                       const void **d, const float **gs, const float **us, const float **ds) {
+    if (!blob || H <= 0 || O <= 0 || !g || !u || !d || !gs || !us || !ds)
+        return false;
+    const ExpertGeom geom = make_expert_geom(H, O);
+    const uint8_t *gp = blob;
+    *g = gp;
+    *gs = reinterpret_cast<const float *>(gp + geom.pack_go);
+    const uint8_t *up = gp + geom.pack_go + geom.sc_go;
+    *u = up;
+    *us = reinterpret_cast<const float *>(up + geom.pack_go);
+    const uint8_t *dp = up + geom.pack_go + geom.sc_go;
+    *d = dp;
+    *ds = reinterpret_cast<const float *>(dp + geom.pack_d);
+    return true;
+}
+
+// moe_block is plain SiLU. Caller must only use this when swiglu_limit <= 0.
+bool glm_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, int H, int O) {
+    if (!metal_ops::available() || !y || !x || S <= 0)
+        return false;
+    const void *g = nullptr, *u = nullptr, *d = nullptr;
+    const float *gs = nullptr, *us = nullptr, *ds = nullptr;
+    if (!glm_pack_int4_g64(blob, H, O, &g, &u, &d, &gs, &us, &ds))
+        return false;
+    const int xoff = 0;
+    const int nr = S;
+    std::vector<int> rows(static_cast<size_t>(S));
+    std::vector<float> rw(static_cast<size_t>(S), 1.f);
+    for (int i = 0; i < S; ++i)
+        rows[static_cast<size_t>(i)] = i;
+    std::memset(y, 0, static_cast<size_t>(S) * static_cast<size_t>(H) * sizeof(float));
+    return metal_ops::moe_block(1, H, O, 4, 64, &g, &u, &d, &gs, &us, &ds, x, &xoff, &nr,
+                                rows.data(), rw.data(), y, S);
+}
+
+// x += attn; nrm = rmsnorm(x, post_ln). Shared expert stays on the host (clamped SwiGLU).
+void glm_resid_post_ln(float *x, const float *attn, const float *post_ln, float *nrm, int H,
+                       float eps) {
+    if (metal_ops::layer_decode(x, attn, post_ln, nullptr, nullptr, nullptr, H, 0, eps, nrm,
+                                nullptr))
+        return;
+    for (int i = 0; i < H; ++i)
+        x[i] += attn[i];
+    quant::rmsnorm(x, post_ln, nrm, H, eps);
 }
 
 const char *kExpertPieces[6] = {
@@ -220,6 +269,7 @@ public:
             trace_.open(tpath, terr);
         }
         coli_cuda::init(nullptr, 0);
+        metal_ops::init();
         return Status::Ok;
     }
 
@@ -349,6 +399,7 @@ public:
             os << "cpu";
         else
             os << "off";
+        os << " metal=" << (metal_ops::available() ? metal_ops::backend_name() : "off");
         return os.str();
     }
 
@@ -966,10 +1017,13 @@ private:
         }
     }
 
-    Status ffn_one(float *hh, int l, std::string &err) {
+    Status ffn_one(float *hh, int l, const float *attn, std::string &err) {
         const int H = cfg_.hidden;
         std::vector<float> n(static_cast<size_t>(H));
-        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+        if (attn)
+            glm_resid_post_ln(hh, attn, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+        else
+            quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
         if (l < cfg_.first_dense) {
             dense_mlp(l, n.data(), hh);
             return Status::Ok;
@@ -1059,6 +1113,7 @@ private:
         slot_embed(s, token);
         float *h = s.streams.data();
         for (int l = 0; l < L; ++l) {
+            std::vector<float> attn_y;
             if (official_hc(l, false)) {
                 std::vector<float> collapsed(static_cast<size_t>(H)), post(static_cast<size_t>(M)),
                     comb(static_cast<size_t>(M) * M), branch(static_cast<size_t>(H), 0.f);
@@ -1068,7 +1123,12 @@ private:
                          comb.data(), M, H);
             } else {
                 apply_mhc(s.streams.data(), l);
-                attn_one(s, h, s.pos, l, nullptr);
+                if (!official_hc(l, true)) {
+                    attn_y.assign(static_cast<size_t>(H), 0.f);
+                    attn_one(s, h, s.pos, l, attn_y.data());
+                } else {
+                    attn_one(s, h, s.pos, l, nullptr);
+                }
             }
             if (official_hc(l, true)) {
                 std::vector<float> collapsed(static_cast<size_t>(H)), post(static_cast<size_t>(M)),
@@ -1086,7 +1146,7 @@ private:
                 mhc_post(s.streams.data(), branch.data(), s.streams.data(), post.data(),
                          comb.data(), M, H);
             } else {
-                Status st = ffn_one(h, l, err);
+                Status st = ffn_one(h, l, attn_y.empty() ? nullptr : attn_y.data(), err);
                 if (st != Status::Ok)
                     return st;
                 apply_mhc(s.streams.data(), l);
@@ -1107,6 +1167,10 @@ private:
         for (int c = 0; c < S; ++c)
             slot_embed(*ss[c], tokens[c]);
         for (int l = 0; l < L; ++l) {
+            const bool fuse_ld = !official_hc(l, false) && !official_hc(l, true);
+            std::vector<float> attn_ys;
+            if (fuse_ld)
+                attn_ys.assign(static_cast<size_t>(S) * H, 0.f);
             for (int c = 0; c < S; ++c) {
                 Glm53Slot &s = *ss[c];
                 float *st = s.streams.data();
@@ -1119,7 +1183,10 @@ private:
                     mhc_post(st, branch.data(), st, post.data(), comb.data(), M, H);
                 } else {
                     apply_mhc(st, l);
-                    attn_one(s, st, s.pos, l, nullptr);
+                    if (fuse_ld)
+                        attn_one(s, st, s.pos, l, attn_ys.data() + static_cast<size_t>(c) * H);
+                    else
+                        attn_one(s, st, s.pos, l, nullptr);
                 }
             }
             if (official_hc(l, true)) {
@@ -1166,7 +1233,11 @@ private:
                 for (int c = 0; c < S; ++c) {
                     float *hh = ss[c]->streams.data();
                     std::vector<float> n(static_cast<size_t>(H));
-                    quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                    if (fuse_ld)
+                        glm_resid_post_ln(hh, attn_ys.data() + static_cast<size_t>(c) * H,
+                                          out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                    else
+                        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
                     dense_mlp(l, n.data(), hh);
                 }
                 for (int c = 0; c < S; ++c)
@@ -1176,10 +1247,17 @@ private:
                     s0(static_cast<size_t>(S) * H);
                 for (int c = 0; c < S; ++c) {
                     float *hh = ss[c]->streams.data();
+                    if (fuse_ld)
+                        glm_resid_post_ln(hh, attn_ys.data() + static_cast<size_t>(c) * H,
+                                          out_n_[l].data(),
+                                          norms.data() + static_cast<size_t>(c) * H, H,
+                                          cfg_.rms_eps);
+                    else
+                        quant::rmsnorm(hh, out_n_[l].data(),
+                                       norms.data() + static_cast<size_t>(c) * H, H,
+                                       cfg_.rms_eps);
                     std::memcpy(s0.data() + static_cast<size_t>(c) * H, hh,
                                 static_cast<size_t>(H) * sizeof(float));
-                    quant::rmsnorm(hh, out_n_[l].data(), norms.data() + static_cast<size_t>(c) * H,
-                                   H, cfg_.rms_eps);
                 }
                 Status st = moe_layer_n(l, norms.data(), s0.data(), S, err);
                 if (st != Status::Ok)
@@ -1236,6 +1314,10 @@ private:
                 }
             }
             for (int l = 0; l < L; ++l) {
+                const bool fuse_ld = !official_hc(l, false) && !official_hc(l, true);
+                std::vector<float> attn_ys;
+                if (fuse_ld)
+                    attn_ys.assign(static_cast<size_t>(C) * H, 0.f);
                 for (int c = 0; c < C; ++c) {
                     float *st = act.data() + static_cast<size_t>(c) * M * H;
                     if (official_hc(l, false)) {
@@ -1247,7 +1329,11 @@ private:
                         mhc_post(st, branch.data(), st, post.data(), comb.data(), M, H);
                     } else {
                         apply_mhc(st, l);
-                        attn_one(s, st, s.pos + c, l, nullptr);
+                        if (fuse_ld)
+                            attn_one(s, st, s.pos + c, l,
+                                     attn_ys.data() + static_cast<size_t>(c) * H);
+                        else
+                            attn_one(s, st, s.pos + c, l, nullptr);
                     }
                 }
                 if (official_hc(l, true)) {
@@ -1273,7 +1359,11 @@ private:
                     for (int c = 0; c < C; ++c) {
                         float *hh = act.data() + static_cast<size_t>(c) * M * H;
                         std::vector<float> n(static_cast<size_t>(H));
-                        quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                        if (fuse_ld)
+                            glm_resid_post_ln(hh, attn_ys.data() + static_cast<size_t>(c) * H,
+                                              out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                        else
+                            quant::rmsnorm(hh, out_n_[l].data(), n.data(), H, cfg_.rms_eps);
                         dense_mlp(l, n.data(), hh);
                     }
                     for (int c = 0; c < C; ++c)
@@ -1283,11 +1373,17 @@ private:
                         s0(static_cast<size_t>(C) * H);
                     for (int c = 0; c < C; ++c) {
                         float *hh = act.data() + static_cast<size_t>(c) * M * H;
+                        if (fuse_ld)
+                            glm_resid_post_ln(hh, attn_ys.data() + static_cast<size_t>(c) * H,
+                                              out_n_[l].data(),
+                                              norms.data() + static_cast<size_t>(c) * H, H,
+                                              cfg_.rms_eps);
+                        else
+                            quant::rmsnorm(hh, out_n_[l].data(),
+                                           norms.data() + static_cast<size_t>(c) * H, H,
+                                           cfg_.rms_eps);
                         std::memcpy(s0.data() + static_cast<size_t>(c) * H, hh,
                                     static_cast<size_t>(H) * sizeof(float));
-                        quant::rmsnorm(hh, out_n_[l].data(),
-                                       norms.data() + static_cast<size_t>(c) * H, H,
-                                       cfg_.rms_eps);
                     }
                     Status mst = moe_layer_n(l, norms.data(), s0.data(), C, err);
                     if (mst != Status::Ok)
@@ -1834,8 +1930,11 @@ private:
                 ++n;
             }
             if (n > 0) {
-                if (!glm_expert_try_coli(yb.data(), xb.data(), n, v.data, H, O,
-                                         cfg_.moe.swiglu_limit))
+                bool ran = false;
+                if (cfg_.moe.swiglu_limit <= 0.f)
+                    ran = glm_expert_try_metal(yb.data(), xb.data(), n, v.data, H, O);
+                if (!ran && !glm_expert_try_coli(yb.data(), xb.data(), n, v.data, H, O,
+                                                 cfg_.moe.swiglu_limit))
                     gpu::glm_expert(yb.data(), xb.data(), n, v.data, H, O, cfg_.moe.swiglu_limit);
                 for (int i = 0; i < n; ++i) {
                     float *ac = acc.data() + static_cast<size_t>(cmap[static_cast<size_t>(i)]) * H;

@@ -1,6 +1,7 @@
 #include "family.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/coli_cuda.hpp"
+#include "../gpu/metal_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -126,6 +127,17 @@ bool k3_expert_try_coli(float *y, const float *x, int S, const uint8_t *blob, in
     return coli_cuda::matmul_mxfp4(y, gate.data(), w2p, w2s, S, O, I);
 }
 
+// x += attn; nrm = rmsnorm(x, post_ln). Shared expert stays on the host (SiTU).
+void k3_resid_post_ln(float *x, const float *attn, const float *post_ln, float *nrm, int H,
+                      float eps) {
+    if (metal_ops::layer_decode(x, attn, post_ln, nullptr, nullptr, nullptr, H, 0, eps, nrm,
+                                nullptr))
+        return;
+    for (int i = 0; i < H; ++i)
+        x[i] += attn[i];
+    quant::rmsnorm(x, post_ln, nrm, H, eps);
+}
+
 const char *k3_expert_mats[3] = {"w1", "w2", "w3"};
 const char *k3_expert_half[2] = {"packed", "scale"};
 
@@ -243,6 +255,7 @@ public:
         }
         loaded_ = true;
         coli_cuda::init(nullptr, 0);
+        metal_ops::init();
         return Status::Ok;
     }
 
@@ -385,12 +398,11 @@ public:
                             prefix[i] += y[i];
                     }
                     attnres_mix(snaps, prefix.data(), sw_mlp(l), nullptr, h.data(), H, cfg_.rms_eps);
+                    quant::rmsnorm(h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
                 } else {
-                    for (int i = 0; i < H; ++i)
-                        h[i] += y[i];
+                    k3_resid_post_ln(h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
+                                     cfg_.rms_eps);
                 }
-
-                quant::rmsnorm(h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
                 if (l < cfg_.first_dense) {
                     std::vector<float> g(cfg_.dense_intermediate), u(cfg_.dense_intermediate),
                         down(H);
@@ -660,6 +672,7 @@ public:
             os << "cpu";
         else
             os << "off";
+        os << " metal=" << (metal_ops::available() ? metal_ops::backend_name() : "off");
         return os.str();
     }
 
@@ -1179,12 +1192,11 @@ private:
                         prefix[i] += y[i];
                 }
                 attnres_mix(snaps, prefix.data(), sw_mlp(l), nullptr, s.h.data(), H, cfg_.rms_eps);
+                quant::rmsnorm(s.h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
             } else {
-                for (int i = 0; i < H; ++i)
-                    s.h[i] += y[i];
+                k3_resid_post_ln(s.h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
+                                 cfg_.rms_eps);
             }
-
-            quant::rmsnorm(s.h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
             if (l < cfg_.first_dense) {
                 std::vector<float> g(cfg_.dense_intermediate), u(cfg_.dense_intermediate),
                     down(static_cast<size_t>(H));

@@ -2753,6 +2753,8 @@ static void test_glm53_container() {
     CHECK(glm_coli_tier_cpu);
     const bool glm_coli_avail = mvllm::coli_cuda::available();
     CHECK(glm_coli_avail);
+    const bool glm_metal_tier = info.find("metal=") != std::string::npos;
+    CHECK(glm_metal_tier);
     CHECK(eg.config().moe.n_experts == 2);
     GenParams gp;
     gp.max_new_tokens = 2;
@@ -2836,6 +2838,8 @@ static void test_k3_mxfp4_container() {
     CHECK(k3_coli_avail);
     const bool k3_coli_ndev = mvllm::coli_cuda::available_device_count() == 0;
     CHECK(k3_coli_ndev);
+    const bool k3_metal_tier = info.find("metal=") != std::string::npos;
+    CHECK(k3_metal_tier);
     GenParams gp;
     gp.max_new_tokens = 2;
     gp.eos = 1;
@@ -3384,6 +3388,46 @@ static void test_mla_absorb() {
     }
     CHECK(n0 > 0.f && n1 > 0.f);
     CHECK(diff > 1e-8f);
+
+    quant::QuantMat mla_q8_kt, mla_q8_vv;
+    mla_absorb_kvb(kv_b.data(), H, QK, Vh, L, mla_q8_kt, mla_q8_vv, 8);
+    std::vector<float> mla_q8_cache(static_cast<size_t>(4) * L, 0.f);
+    std::vector<float> mla_q8_x(hidden), mla_q8_y0(hidden), mla_q8_y1(hidden);
+    for (int i = 0; i < hidden; ++i)
+        mla_q8_x[i] = ((i % 5) - 2) * 0.1f;
+    mla_step(mla_q8_x.data(), hidden, mla, &qa, qa_ln.data(), &qb, &kva, kva_ln.data(), &mla_q8_kt,
+             &mla_q8_vv, &wo, nullptr, mla_q8_cache.data(), 0, mla_q8_y0.data(), 1e-5f);
+    for (int i = 0; i < hidden; ++i)
+        mla_q8_x[i] = ((i % 7) - 3) * 0.25f;
+    mla_step(mla_q8_x.data(), hidden, mla, &qa, qa_ln.data(), &qb, &kva, kva_ln.data(), &mla_q8_kt,
+             &mla_q8_vv, &wo, nullptr, mla_q8_cache.data(), 1, mla_q8_y1.data(), 1e-5f);
+    float mla_q8_e0 = 0.f, mla_q8_e1 = 0.f;
+    for (int i = 0; i < hidden; ++i) {
+        CHECK(std::isfinite(mla_q8_y0[i]) && std::isfinite(mla_q8_y1[i]));
+        mla_q8_e0 += mla_q8_y0[i] * mla_q8_y0[i];
+        mla_q8_e1 += mla_q8_y1[i] * mla_q8_y1[i];
+    }
+    CHECK(mla_q8_e0 > 0.f && mla_q8_e1 > 0.f);
+
+    quant::QuantMat mla_q4_kt, mla_q4_vv;
+    mla_absorb_kvb(kv_b.data(), H, QK, Vh, L, mla_q4_kt, mla_q4_vv, 4);
+    std::vector<float> mla_q4_cache(static_cast<size_t>(4) * L, 0.f);
+    std::vector<float> mla_q4_x(hidden), mla_q4_y0(hidden), mla_q4_y1(hidden);
+    for (int i = 0; i < hidden; ++i)
+        mla_q4_x[i] = ((i % 5) - 2) * 0.1f;
+    mla_step(mla_q4_x.data(), hidden, mla, &qa, qa_ln.data(), &qb, &kva, kva_ln.data(), &mla_q4_kt,
+             &mla_q4_vv, &wo, nullptr, mla_q4_cache.data(), 0, mla_q4_y0.data(), 1e-5f);
+    for (int i = 0; i < hidden; ++i)
+        mla_q4_x[i] = ((i % 7) - 3) * 0.25f;
+    mla_step(mla_q4_x.data(), hidden, mla, &qa, qa_ln.data(), &qb, &kva, kva_ln.data(), &mla_q4_kt,
+             &mla_q4_vv, &wo, nullptr, mla_q4_cache.data(), 1, mla_q4_y1.data(), 1e-5f);
+    float mla_q4_e0 = 0.f, mla_q4_e1 = 0.f;
+    for (int i = 0; i < hidden; ++i) {
+        CHECK(std::isfinite(mla_q4_y0[i]) && std::isfinite(mla_q4_y1[i]));
+        mla_q4_e0 += mla_q4_y0[i] * mla_q4_y0[i];
+        mla_q4_e1 += mla_q4_y1[i] * mla_q4_y1[i];
+    }
+    CHECK(mla_q4_e0 > 0.f && mla_q4_e1 > 0.f);
 
     // K3 rope strip: cache stride is kv_lora+qk_rope; R is not absorbed.
     MlaConfig mlar = mla;

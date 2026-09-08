@@ -873,8 +873,40 @@ private:
         const auto &fn = ffn ? hc_ffn_fn_[l] : hc_attn_fn_[l];
         const auto &base = ffn ? hc_ffn_base_[l] : hc_attn_base_[l];
         const auto &sc = ffn ? hc_ffn_scale_[l] : hc_attn_scale_[l];
-        mhc_pre(collapsed, post, comb, st, fn.data(), sc.data(), base.data(), M, H, cfg_.mhc.iters,
-                cfg_.rms_eps, cfg_.mhc.eps);
+        const int N = 2 * M + M * M;
+        const int MH = M * H;
+        const int stn = M + M * M;
+        bool done = false;
+        if (dsv4_cuda::available() && M > 1 && H > 0 && cfg_.mhc.iters >= 1 && st && collapsed &&
+            post && comb && static_cast<int>(fn.size()) >= N * MH &&
+            static_cast<int>(sc.size()) >= 3 && static_cast<int>(base.size()) >= N) {
+            dsv4_cuda::Tensor *tfn = nullptr, *tsc = nullptr, *tbase = nullptr;
+            dsv4_cuda::Activation *ares = dsv4_cuda::activation_create(0, MH);
+            dsv4_cuda::Activation *astate = dsv4_cuda::activation_create(0, stn);
+            dsv4_cuda::Activation *ain = dsv4_cuda::activation_create(0, H);
+            std::vector<float> state(static_cast<size_t>(stn), 0.f);
+            if (dsv4_cuda::upload_f32(&tfn, fn.data(), N, MH, 0) &&
+                dsv4_cuda::upload_f32(&tsc, sc.data(), 3, 1, 0) &&
+                dsv4_cuda::upload_f32(&tbase, base.data(), N, 1, 0) && ares && astate && ain &&
+                dsv4_cuda::activation_upload(ares, st, MH) &&
+                dsv4_cuda::mhc_pre(ares, tfn, tsc, tbase, M, H, cfg_.rms_eps, cfg_.mhc.eps,
+                                   cfg_.mhc.eps, 2.f, cfg_.mhc.iters, astate, ain) &&
+                dsv4_cuda::activation_download(collapsed, ain, H) &&
+                dsv4_cuda::activation_download(state.data(), astate, stn)) {
+                std::memcpy(post, state.data(), static_cast<size_t>(M) * sizeof(float));
+                std::memcpy(comb, state.data() + M, static_cast<size_t>(M) * M * sizeof(float));
+                done = true;
+            }
+            dsv4_cuda::activation_free(ares);
+            dsv4_cuda::activation_free(astate);
+            dsv4_cuda::activation_free(ain);
+            dsv4_cuda::tensor_free(tfn);
+            dsv4_cuda::tensor_free(tsc);
+            dsv4_cuda::tensor_free(tbase);
+        }
+        if (!done)
+            ::mvllm::mhc_pre(collapsed, post, comb, st, fn.data(), sc.data(), base.data(), M, H,
+                             cfg_.mhc.iters, cfg_.rms_eps, cfg_.mhc.eps);
     }
 
     bool dsa_live(int l) const {
@@ -1007,7 +1039,37 @@ private:
         const float *kbase =
             (l < static_cast<int>(s.kv.size()) && !s.kv[l].empty()) ? s.kv[l].data() : kv.data();
         const int past = at + 1;
-        if (!sel.empty() && past > 0) {
+        bool used_cu_attn = false;
+        if (dsv4_cuda::available() && !sel.empty() && past > 0 && hd > 0 && nh > 0) {
+            bool sink_zero = true;
+            for (int h = 0; h < nh && h < static_cast<int>(sink_[l].size()); ++h) {
+                if (sink_[l][static_cast<size_t>(h)] != 0.f) {
+                    sink_zero = false;
+                    break;
+                }
+            }
+            if (sink_zero) {
+                std::vector<int> picked;
+                picked.reserve(sel.size());
+                for (int idx : sel) {
+                    if (idx >= 0 && idx <= at)
+                        picked.push_back(idx);
+                }
+                if (!picked.empty()) {
+                    const int nsel = static_cast<int>(picked.size());
+                    std::vector<float> vals(static_cast<size_t>(nsel) * static_cast<size_t>(hd));
+                    for (int i = 0; i < nsel; ++i)
+                        std::memcpy(vals.data() + static_cast<size_t>(i) * hd,
+                                    kbase + static_cast<size_t>(picked[static_cast<size_t>(i)]) * hd,
+                                    static_cast<size_t>(hd) * sizeof(float));
+                    const int meta[3] = {0, nsel, 0};
+                    used_cu_attn = dsv4_cuda::sparse_attn_batch(
+                        0, q.data(), vals.data(), nullptr, meta, nsel, nsel, nh, hd, 1, scale,
+                        ctx.data());
+                }
+            }
+        }
+        if (!used_cu_attn && !sel.empty() && past > 0) {
             std::vector<float> sc(sel.size());
             for (int h = 0; h < nh; ++h) {
                 const float *qh = q.data() + static_cast<size_t>(h) * hd;
@@ -2016,23 +2078,72 @@ private:
         const int H = cfg_.hidden;
         const int O = cfg_.moe.intermediate;
         const int K = std::max(cfg_.moe.topk, 0);
+        const int E = cfg_.moe.n_experts;
         std::vector<int> idx(static_cast<size_t>(C) * std::max(K, 1), -1);
         std::vector<float> wt(static_cast<size_t>(C) * std::max(K, 1), 0.f);
         std::string terr;
-        for (int c = 0; c < C; ++c) {
-            std::vector<float> scores(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1))),
-                choice(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1)));
-            if (!router_[layer].empty())
-                quant::matmul_f32(scores.data(), xs + static_cast<size_t>(c) * H,
-                                  router_[layer].data(), 1, H, cfg_.moe.n_experts);
-            for (int i = 0; i < cfg_.moe.n_experts; ++i) {
-                scores[i] = sqrt_softplus(scores[i]);
-                float b = i < static_cast<int>(router_bias_[layer].size()) ? router_bias_[layer][i]
-                                                                          : 0.f;
-                choice[i] = scores[i] + b;
+        struct CuRoute {
+            dsv4_cuda::Tensor *gate = nullptr;
+            dsv4_cuda::Tensor *bias = nullptr;
+            ~CuRoute() {
+                dsv4_cuda::tensor_free(gate);
+                dsv4_cuda::tensor_free(bias);
             }
-            moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
-                     wt.data() + static_cast<size_t>(c) * K, scores.data());
+        } cu;
+        const bool try_cu_route = K == 6 && dsv4_cuda::available() && H > 0 && E > 0 &&
+                                  static_cast<int>(router_[layer].size()) >= E * H;
+        if (try_cu_route) {
+            if (!dsv4_cuda::upload_f32(&cu.gate, router_[layer].data(), E, H, 0))
+                cu.gate = nullptr;
+            else if (!router_bias_[layer].empty()) {
+                bool bok = false;
+                if (static_cast<int>(router_bias_[layer].size()) >= E)
+                    bok = dsv4_cuda::upload_f32(&cu.bias, router_bias_[layer].data(), E, 1, 0);
+                else {
+                    std::vector<float> bpad(static_cast<size_t>(E), 0.f);
+                    std::memcpy(bpad.data(), router_bias_[layer].data(),
+                                router_bias_[layer].size() * sizeof(float));
+                    bok = dsv4_cuda::upload_f32(&cu.bias, bpad.data(), E, 1, 0);
+                }
+                if (!bok) {
+                    dsv4_cuda::tensor_free(cu.gate);
+                    cu.gate = nullptr;
+                    cu.bias = nullptr;
+                }
+            }
+        }
+        for (int c = 0; c < C; ++c) {
+            bool routed = false;
+            if (cu.gate) {
+                dsv4_cuda::Activation *ain = dsv4_cuda::activation_create(0, H);
+                int ids6[6];
+                float wt6[6];
+                if (ain && dsv4_cuda::activation_upload(ain, xs + static_cast<size_t>(c) * H, H) &&
+                    dsv4_cuda::route(ain, cu.gate, cu.bias, nullptr, 1.f, ids6, wt6)) {
+                    for (int t = 0; t < 6; ++t) {
+                        idx[static_cast<size_t>(c) * K + static_cast<size_t>(t)] = ids6[t];
+                        wt[static_cast<size_t>(c) * K + static_cast<size_t>(t)] = wt6[t];
+                    }
+                    routed = true;
+                }
+                dsv4_cuda::activation_free(ain);
+            }
+            if (!routed) {
+                std::vector<float> scores(static_cast<size_t>(std::max(E, 1))),
+                    choice(static_cast<size_t>(std::max(E, 1)));
+                if (!router_[layer].empty())
+                    quant::matmul_f32(scores.data(), xs + static_cast<size_t>(c) * H,
+                                      router_[layer].data(), 1, H, cfg_.moe.n_experts);
+                for (int i = 0; i < cfg_.moe.n_experts; ++i) {
+                    scores[i] = sqrt_softplus(scores[i]);
+                    float b = i < static_cast<int>(router_bias_[layer].size())
+                                  ? router_bias_[layer][i]
+                                  : 0.f;
+                    choice[i] = scores[i] + b;
+                }
+                moe_topk(choice.data(), cfg_.moe.n_experts, K, idx.data() + static_cast<size_t>(c) * K,
+                         wt.data() + static_cast<size_t>(c) * K, scores.data());
+            }
             const int *ids = idx.data() + static_cast<size_t>(c) * K;
             usage_.count(layer, ids, K);
             mark_hits(layer, ids, K);

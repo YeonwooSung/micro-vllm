@@ -141,7 +141,8 @@ MLA (full-attn layers): absorbed NoPE. Cache stride is `kv_lora+qk_rope`
 `out = W_v (Σ a_j c_j)`. `kv_b_proj` is folded at load (`mla_absorb_kvb`).
 `mla_bits` quantizes q/kv; `head_bits` quantizes o/g. Missing absorbed KV
 keeps the dense Q/O stand-in. MLA score/pool in `mla_step` may use
-`coli_cuda::attention_absorb` when the cache prefix is dense.
+`coli_cuda::attention_absorb` when the cache prefix is dense. coli absorb
+works after expanding int8/int4 `W_kt`/`W_v` to f32.
 
 KDA `o_norm` is the official shared `[head_dim]` scale (not `[heads, head_dim]`).
 GLM mHC keeps M residual streams (stream 0 is the layer view; others stay
@@ -168,7 +169,7 @@ Generic CUDA tier (`mvllm::coli_cuda`):
   pipe rmsnorm/rope/router).
 - Always compiled, CPU fallback. `available_device_count()` is 0 without CUDA.
 - `K3Engine::load` / GLM load call `coli_cuda::init`. `describe()` appends
-  `coli=cpu|cuda|off`.
+  `coli=cpu|cuda|off` and may show `metal=cpu|metal`.
 - K3 MXFP4 expert GEMM uses `coli_cuda::matmul_mxfp4` when the tier is up and
   `idot` is off; SiTU-GLU stays on the host. Fallback `gpu::k3_expert`.
 - GLM int4-g64 expert GEMM uses `coli_cuda::matmul` fmt=4 gs=64; clamped-SwiGLU
@@ -186,7 +187,10 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
   `tier=cpu|cuda|off`.
 - MXFP4 routed-expert GEMM goes through `dsv4_cuda::expert_group` when the
   tier is up and `idot` is off; otherwise `gpu::gemm_mxfp4`.
-- Host route / mHC / DSA / prefix checkpoints unchanged.
+- `dsv4_cuda::route` when `topk==6` (host applies `moe.routed_scale` after).
+  `mhc_pre` when official tensors/sizes/iters match; else host `mhc_pre`.
+  `sparse_attn_batch` after the host indexer when every sink is 0.
+- Prefix checkpoints stay on the host.
 - Optional device kernels in `src/gpu/dsv4_cuda.cu` + `dsv4_cuda_device.hpp`
   compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
 - `backend_name()` is `"cpu"` on this Mac path. Multi-GPU TP2/EP2 return false.
@@ -202,6 +206,9 @@ Metal ops (`mvllm::metal_ops`):
   F32 shared SwiGLU). `moe_block` is batched routed SwiGLU in one Metal
   command buffer (CPU scatter). `kda_step` uses `kda_fused_token` when
   windows/taps are present.
+- K3/GLM `describe()` may show `metal=cpu|metal`. `layer_decode` is used
+  for residual + post-LN when it fits. GLM may use `moe_block` only if
+  `swiglu_limit<=0`.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 
@@ -214,7 +221,7 @@ H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 tensors exist, `pread`s one expert slot (or a small H3 vector). Counted
 experts must match `config.json`. Empty / fixture dirs stay on the synthetic
 pack path. Live dumps: set `MVLLM_DUMP_K3` / `MVLLM_DUMP_GLM53` / `MVLLM_DUMP_H3`
-(`COLI_DUMP_*` aliases; `MVLLM_DUMP_DSV4` / `COLI_DUMP_DSV4` reserved) and run
+(`COLI_DUMP_*` aliases, including `MVLLM_DUMP_DSV4` / `COLI_DUMP_DSV4`) and run
 `micro-vllm smoke` against those trees. Omit `--model` to pick the first
 existing dump dir in that order. Host tests (`test_live_dump_env`) sniff +
 `probe_shards` when a dump env points at a readable directory, and skip when

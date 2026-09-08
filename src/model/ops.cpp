@@ -40,53 +40,105 @@ struct AccTimer {
     }
 };
 
-// y[I,O] = I_I @ W[O,I]^T  ⇒  W[o,i] = y[i,o]
+// y[I,O] = I_I @ W[O,I]^T  ⇒  W[o,i] = y[i,o]. Emits row-major [O,I].
 bool expand_quant_wt(const quant::QuantMat &w, std::vector<float> &wt) {
     if (w.empty() || w.I <= 0 || w.O <= 0)
         return false;
     std::vector<float> ident(static_cast<size_t>(w.I) * static_cast<size_t>(w.I), 0.f);
     for (int i = 0; i < w.I; ++i)
         ident[static_cast<size_t>(i) * w.I + i] = 1.f;
-    wt.assign(static_cast<size_t>(w.I) * static_cast<size_t>(w.O), 0.f);
-    w.gemm(wt.data(), ident.data(), w.I);
+    std::vector<float> y(static_cast<size_t>(w.I) * static_cast<size_t>(w.O), 0.f);
+    w.gemm(y.data(), ident.data(), w.I);
+    wt.resize(static_cast<size_t>(w.O) * static_cast<size_t>(w.I));
+    for (int o = 0; o < w.O; ++o)
+        for (int i = 0; i < w.I; ++i)
+            wt[static_cast<size_t>(o) * w.I + i] = y[static_cast<size_t>(i) * w.O + o];
     return true;
 }
 
+// W[O,I] f32. coli fmt 1 and QuantMat fmt 8 are int8-row; fmt 4 is int4-g64.
+bool expand_quant_w(const quant::QuantMat &w, std::vector<float> &woi) {
+    if (w.empty() || w.I <= 0 || w.O <= 0)
+        return false;
+    const size_t n = static_cast<size_t>(w.O) * static_cast<size_t>(w.I);
+    if (w.fmt == 0 && w.f.size() >= n) {
+        woi.assign(w.f.data(), w.f.data() + n);
+        return true;
+    }
+    if ((w.fmt == 1 || w.fmt == 8) && w.q8.size() >= n &&
+        w.scales.size() >= static_cast<size_t>(w.O)) {
+        woi.resize(n);
+        for (int o = 0; o < w.O; ++o) {
+            const float s = w.scales[static_cast<size_t>(o)];
+            const int8_t *q = w.q8.data() + static_cast<size_t>(o) * w.I;
+            float *row = woi.data() + static_cast<size_t>(o) * w.I;
+            for (int i = 0; i < w.I; ++i)
+                row[i] = static_cast<float>(q[i]) * s;
+        }
+        return true;
+    }
+    if (w.fmt == 4) {
+        if (w.I % 64 != 0)
+            return false;
+        const int stride = w.I / 2;
+        const int ng = w.I / 64;
+        if (w.q4.size() < static_cast<size_t>(w.O) * static_cast<size_t>(stride) ||
+            w.scales.size() < static_cast<size_t>(w.O) * static_cast<size_t>(ng))
+            return false;
+        woi.resize(n);
+        for (int o = 0; o < w.O; ++o) {
+            const uint8_t *prow = w.q4.data() + static_cast<size_t>(o) * stride;
+            const float *srow = w.scales.data() + static_cast<size_t>(o) * ng;
+            float *row = woi.data() + static_cast<size_t>(o) * w.I;
+            for (int i = 0; i < w.I; ++i) {
+                const uint8_t b = prow[i >> 1];
+                const int nib = (i & 1) ? (b >> 4) : (b & 15);
+                row[i] = static_cast<float>(nib - 8) * srow[i / 64];
+            }
+        }
+        return true;
+    }
+    return expand_quant_wt(w, woi);
+}
+
 // coli kv_b [H*(Q+V), K]: Wk[q,k] = Wkt[h*K+k, q], Wv[v,k] = Wv[h*V+v, k]
+void pack_mla_kvb_from_f32(float *kvb, const float *w_kt, const float *w_v, int H, int Q, int V,
+                           int K) {
+    for (int h = 0; h < H; ++h) {
+        for (int q = 0; q < Q; ++q)
+            for (int k = 0; k < K; ++k)
+                kvb[(static_cast<size_t>(h) * (Q + V) + q) * K + k] =
+                    w_kt[(static_cast<size_t>(h) * K + k) * Q + q];
+        for (int v = 0; v < V; ++v)
+            std::memcpy(kvb + (static_cast<size_t>(h) * (Q + V) + Q + v) * K,
+                        w_v + (static_cast<size_t>(h) * V + v) * K,
+                        static_cast<size_t>(K) * sizeof(float));
+    }
+}
+
 bool pack_mla_kvb_f32(std::vector<float> &kvb, const quant::QuantMat &w_kt,
                       const quant::QuantMat &w_v, int H, int Q, int V, int K) {
     if (H <= 0 || Q <= 0 || V <= 0 || K <= 0)
         return false;
     if (w_kt.I != Q || w_v.I != K || w_kt.O < H * K || w_v.O < H * V)
         return false;
-    const int rows = H * (Q + V);
-    kvb.assign(static_cast<size_t>(rows) * static_cast<size_t>(K), 0.f);
-    if (w_kt.fmt == 0 && w_v.fmt == 0 && !w_kt.f.empty() && !w_v.f.empty()) {
-        for (int h = 0; h < H; ++h) {
-            for (int q = 0; q < Q; ++q)
-                for (int k = 0; k < K; ++k)
-                    kvb[(static_cast<size_t>(h) * (Q + V) + q) * K + k] =
-                        w_kt.f[(static_cast<size_t>(h) * K + k) * Q + q];
-            for (int v = 0; v < V; ++v)
-                std::memcpy(kvb.data() + (static_cast<size_t>(h) * (Q + V) + Q + v) * K,
-                            w_v.f.data() + (static_cast<size_t>(h) * V + v) * K,
-                            static_cast<size_t>(K) * sizeof(float));
-        }
-        return true;
-    }
-    std::vector<float> kt_wt, v_wt;
-    if (!expand_quant_wt(w_kt, kt_wt) || !expand_quant_wt(w_v, v_wt))
+    std::vector<float> kt_f, v_f;
+    const float *kt = nullptr;
+    const float *vv = nullptr;
+    if (w_kt.fmt == 0 && w_kt.f.size() >= static_cast<size_t>(w_kt.O) * static_cast<size_t>(w_kt.I))
+        kt = w_kt.f.data();
+    else if (!expand_quant_w(w_kt, kt_f))
         return false;
-    for (int h = 0; h < H; ++h) {
-        for (int q = 0; q < Q; ++q)
-            for (int k = 0; k < K; ++k)
-                kvb[(static_cast<size_t>(h) * (Q + V) + q) * K + k] =
-                    kt_wt[static_cast<size_t>(q) * w_kt.O + (h * K + k)];
-        for (int v = 0; v < V; ++v)
-            for (int k = 0; k < K; ++k)
-                kvb[(static_cast<size_t>(h) * (Q + V) + Q + v) * K + k] =
-                    v_wt[static_cast<size_t>(k) * w_v.O + (h * V + v)];
-    }
+    else
+        kt = kt_f.data();
+    if (w_v.fmt == 0 && w_v.f.size() >= static_cast<size_t>(w_v.O) * static_cast<size_t>(w_v.I))
+        vv = w_v.f.data();
+    else if (!expand_quant_w(w_v, v_f))
+        return false;
+    else
+        vv = v_f.data();
+    kvb.assign(static_cast<size_t>(H) * static_cast<size_t>(Q + V) * static_cast<size_t>(K), 0.f);
+    pack_mla_kvb_from_f32(kvb.data(), kt, vv, H, Q, V, K);
     return true;
 }
 
