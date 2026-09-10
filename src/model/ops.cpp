@@ -199,6 +199,279 @@ void kda_short_conv(float *x, const float *taps, float *window, int channels, in
     }
 }
 
+bool kda_fill_token(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
+                    const quant::QuantMat *w_k, const quant::QuantMat *w_v,
+                    const quant::QuantMat *w_b, const quant::QuantMat *w_fa,
+                    const quant::QuantMat *w_fb, const float *dt_bias, int dt_n, const float *a_log,
+                    const float *conv_q, const float *conv_k, const float *conv_v, float *win_q,
+                    float *win_k, float *win_v, float *S, std::vector<float> &qt,
+                    std::vector<float> &kt, std::vector<float> &tv, std::vector<float> &alpha,
+                    std::vector<float> &beta, std::vector<float> &oh, metal_ops::KdaToken &tok) {
+    (void)hidden;
+    const int H = kda.heads;
+    const int D = kda.head_dim;
+    const int P = H * D;
+    const int K = kda.conv_k > 0 ? kda.conv_k : 4;
+    tok = {};
+    if (!x || !win_q || !win_k || !win_v || !conv_q || !conv_k || !conv_v || !S || H < 1 || D < 1 ||
+        K < 1 || P != H * D)
+        return false;
+    auto orows = [](const quant::QuantMat *w, int fb) {
+        return (w && !w->empty() && w->O > fb) ? w->O : fb;
+    };
+    const int qn = orows(w_q, P);
+    const int kn = orows(w_k, P);
+    const int vn = orows(w_v, P);
+    const int bn = (w_b && !w_b->empty()) ? w_b->O : H;
+    const int zn = orows(w_fb, P);
+    std::vector<float> q(static_cast<size_t>(std::max(qn, P)), 0.f),
+        k(static_cast<size_t>(std::max(kn, P)), 0.f), v(static_cast<size_t>(std::max(vn, P)), 0.f),
+        b(static_cast<size_t>(std::max(bn, 1)), 0.f), z(static_cast<size_t>(std::max(zn, P)), 0.f);
+
+    if (w_q)
+        w_q->gemm(q.data(), x, 1);
+    if (w_k)
+        w_k->gemm(k.data(), x, 1);
+    if (w_v)
+        w_v->gemm(v.data(), x, 1);
+
+    std::vector<float> fa(static_cast<size_t>(orows(w_fa, D > 0 ? D : 1)), 0.f);
+    if (w_fa && w_fb && !w_fa->empty() && !w_fb->empty()) {
+        w_fa->gemm(fa.data(), x, 1);
+        w_fb->gemm(z.data(), fa.data(), 1);
+    }
+    if (dt_bias && dt_n >= P) {
+        for (int i = 0; i < P; ++i)
+            z[static_cast<size_t>(i)] += dt_bias[i];
+    } else if (dt_bias && dt_n >= H) {
+        for (int h = 0; h < H; ++h)
+            for (int i = 0; i < D; ++i)
+                z[static_cast<size_t>(h * D + i)] += dt_bias[h];
+    } else if (dt_bias && dt_n > 0) {
+        for (int i = 0; i < P; ++i)
+            z[static_cast<size_t>(i)] += dt_bias[i % dt_n];
+    }
+
+    if (w_b && !w_b->empty())
+        w_b->gemm(b.data(), x, 1);
+
+    const float gmin = kda.gate_lower_bound;
+    alpha.assign(static_cast<size_t>(std::max(P, 0)), 0.f);
+    beta.assign(static_cast<size_t>(std::max(H, 0)), 0.5f);
+    for (int h = 0; h < H; ++h) {
+        float alog = 0.f;
+        if (a_log)
+            alog = a_log[h];
+        const float eA = std::exp(alog);
+        for (int i = 0; i < D; ++i)
+            alpha[static_cast<size_t>(h * D + i)] =
+                std::exp(gmin * quant::sigmoid(eA * z[static_cast<size_t>(h * D + i)]));
+        if (bn >= P && D > 0) {
+            float acc = 0.f;
+            const float *bh = b.data() + h * D;
+            for (int i = 0; i < D; ++i)
+                acc += quant::sigmoid(bh[i]);
+            beta[static_cast<size_t>(h)] = acc / static_cast<float>(D);
+        } else if (h < bn) {
+            beta[static_cast<size_t>(h)] = quant::sigmoid(b[static_cast<size_t>(h)]);
+        } else {
+            beta[static_cast<size_t>(h)] = 0.5f;
+        }
+    }
+
+    qt.assign(q.begin(), q.begin() + P);
+    kt.assign(k.begin(), k.begin() + P);
+    tv.assign(v.begin(), v.begin() + P);
+    oh.assign(static_cast<size_t>(P), 0.f);
+    tok.win_q = win_q;
+    tok.qt = qt.data();
+    tok.win_k = win_k;
+    tok.kt = kt.data();
+    tok.win_v = win_v;
+    tok.tv = tv.data();
+    tok.taps_q = conv_q;
+    tok.taps_k = conv_k;
+    tok.taps_v = conv_v;
+    tok.S = S;
+    tok.alpha = alpha.data();
+    tok.beta = beta.data();
+    tok.oh = oh.data();
+    tok.P = P;
+    tok.K = K;
+    tok.H = H;
+    tok.hd = D;
+    return true;
+}
+
+void kda_project_out(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_g,
+                     const quant::QuantMat *w_gb, const quant::QuantMat *w_o, const float *out_norm,
+                     const float *oh, float *y, float eps) {
+    const int H = kda.heads;
+    const int D = kda.head_dim;
+    const int P = H * D;
+    if (!y || H < 1 || D < 1)
+        return;
+    auto orows = [](const quant::QuantMat *w, int fb) {
+        return (w && !w->empty() && w->O > fb) ? w->O : fb;
+    };
+    const int gn = (w_gb && !w_gb->empty()) ? orows(w_gb, P) : orows(w_g, P);
+    const int on = (w_o && !w_o->empty() && w_o->I > P) ? w_o->I : P;
+    std::vector<float> g(static_cast<size_t>(std::max(gn, 1)), 0.f),
+        o(static_cast<size_t>(std::max(on, P)), 0.f);
+    if (w_g && !w_g->empty() && w_gb && !w_gb->empty()) {
+        std::vector<float> ga(static_cast<size_t>(std::max(w_g->O, 1)), 0.f);
+        if (x)
+            w_g->gemm(ga.data(), x, 1);
+        w_gb->gemm(g.data(), ga.data(), 1);
+    } else if (w_g && !w_g->empty()) {
+        if (x)
+            w_g->gemm(g.data(), x, 1);
+    }
+    if (oh)
+        std::memcpy(o.data(), oh, static_cast<size_t>(P) * sizeof(float));
+    for (int h = 0; h < H; ++h) {
+        float *hp = o.data() + h * D;
+        quant::rmsnorm(hp, out_norm, hp, D, eps);
+        if (!out_norm) {
+            // rmsnorm with w=1
+        }
+        float gate = quant::sigmoid(g[static_cast<size_t>(h * D)]);
+        for (int i = 0; i < D; ++i) {
+            float gi = quant::sigmoid(g[static_cast<size_t>(h * D + i)]);
+            hp[i] *= gi;
+            (void)gate;
+        }
+    }
+    if (w_o && !w_o->empty())
+        w_o->gemm(y, o.data(), 1);
+    else
+        std::memcpy(y, o.data(), static_cast<size_t>(std::min(P, hidden)) * sizeof(float));
+}
+
+bool kda_try_layer_decode(const float *in_n, float *x, const float *post_ln, float *nrm, float *y,
+                          int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
+                          const quant::QuantMat *w_k, const quant::QuantMat *w_v,
+                          const quant::QuantMat *w_b, const quant::QuantMat *w_fa,
+                          const quant::QuantMat *w_fb, const float *dt_bias, int dt_n,
+                          const float *a_log, const quant::QuantMat *w_g,
+                          const quant::QuantMat *w_gb, const quant::QuantMat *w_o,
+                          const float *out_norm, float *S, float eps, const float *conv_q,
+                          const float *conv_k, const float *conv_v, float *win_q, float *win_k,
+                          float *win_v) {
+    if (!in_n || !x || !post_ln || !nrm || !y || hidden < 1)
+        return false;
+    metal_ops::KdaToken tok{};
+    std::vector<float> qt, kt, tv, alpha, beta, oh;
+    if (!kda_fill_token(in_n, hidden, kda, w_q, w_k, w_v, w_b, w_fa, w_fb, dt_bias, dt_n, a_log,
+                        conv_q, conv_k, conv_v, win_q, win_k, win_v, S, qt, kt, tv, alpha, beta, oh,
+                        tok))
+        return false;
+    if (!metal_ops::available())
+        metal_ops::init();
+    std::vector<float> scratch(static_cast<size_t>(hidden), 0.f);
+    if (!metal_ops::layer_decode_kda(tok, x, nullptr, post_ln, nullptr, nullptr, nullptr, hidden, 0,
+                                     eps, metal_ops::Act::Silu, 0.f, 0.f, nullptr, nullptr, 0, 0,
+                                     1.f, nullptr, scratch.data(), nullptr, nullptr, nullptr))
+        return false;
+    kda_project_out(in_n, hidden, kda, w_g, w_gb, w_o, out_norm, tok.oh, y, eps);
+    for (int i = 0; i < hidden; ++i)
+        x[i] += y[i] - tok.oh[i];
+    quant::rmsnorm(x, post_ln, nrm, hidden, eps);
+    return true;
+}
+
+bool mla_try_layer_decode(const float *in_n, float *x, const float *post_ln, float *nrm, float *y,
+                          int hidden, const MlaConfig &mla, const quant::QuantMat *w_qa,
+                          const float *qa_ln, const quant::QuantMat *w_qb,
+                          const quant::QuantMat *w_kva, const float *kva_ln,
+                          const quant::QuantMat *w_kt, const quant::QuantMat *w_v,
+                          const quant::QuantMat *w_o, const quant::QuantMat *w_g, float *cache,
+                          int pos, float eps, const int *selected, int n_sel) {
+    if (!in_n || !x || !post_ln || !nrm || !y || hidden < 1 || pos < 0)
+        return false;
+    if (selected && n_sel > 0)
+        return false;
+    const int H = mla.n_heads > 0 ? mla.n_heads : 0;
+    const int QK = mla.qk_nope;
+    const int R = mla.qk_rope > 0 ? mla.qk_rope : 0;
+    const int QH = QK + R;
+    const int Vh = mla.v_head > 0 ? mla.v_head : QK;
+    const int L = mla.kv_lora;
+    const int QL = mla.q_lora > 0 ? mla.q_lora : 0;
+    const int stride = L + R;
+    const int hv = H * Vh;
+    const bool absorbed = H >= 1 && QK >= 1 && Vh >= 1 && L >= 1 && w_kva && !w_kva->empty() &&
+                          w_kt && !w_kt->empty() && w_v && !w_v->empty() && cache && w_o &&
+                          !w_o->empty();
+    if (!absorbed)
+        return false;
+    if (w_kt->I != QK || w_kt->O < H * L || w_v->I != L || w_v->O < hv || w_o->I != hv ||
+        w_o->O != hidden)
+        return false;
+
+    std::vector<float> kt_f, v_f, o_f;
+    if (!expand_quant_w(*w_kt, kt_f) || !expand_quant_w(*w_v, v_f) || !expand_quant_w(*w_o, o_f))
+        return false;
+    if (mla.output_gate && w_g && !w_g->empty()) {
+        std::vector<float> g(static_cast<size_t>(std::max(hv, w_g->O)), 0.f);
+        w_g->gemm(g.data(), in_n, 1);
+        for (int i = 0; i < hv; ++i)
+            g[static_cast<size_t>(i)] = quant::sigmoid(g[static_cast<size_t>(i)]);
+        for (int o = 0; o < hidden; ++o) {
+            float *row = o_f.data() + static_cast<size_t>(o) * hv;
+            for (int i = 0; i < hv; ++i)
+                row[i] *= g[static_cast<size_t>(i)];
+        }
+    }
+
+    std::vector<float> qa(static_cast<size_t>(QL > 0 ? QL : hidden));
+    const float *q_in = in_n;
+    if (w_qa && !w_qa->empty() && QL > 0) {
+        w_qa->gemm(qa.data(), in_n, 1);
+        if (qa_ln)
+            quant::rmsnorm(qa.data(), qa_ln, qa.data(), QL, eps);
+        q_in = qa.data();
+    }
+    std::vector<float> q(static_cast<size_t>(H) * QH, 0.f);
+    if (w_qb && !w_qb->empty())
+        w_qb->gemm(q.data(), q_in, 1);
+    else if (w_qa && !w_qa->empty())
+        std::memcpy(q.data(), qa.data(), std::min(q.size(), qa.size()) * sizeof(float));
+
+    float *crow = cache + static_cast<size_t>(pos) * stride;
+    w_kva->gemm(crow, in_n, 1);
+    if (kva_ln)
+        quant::rmsnorm(crow, kva_ln, crow, L, eps);
+    if (R > 0 && !mla.nope && mla.rope_theta > 0.f) {
+        apply_rope(crow + L, R, pos, mla.rope_theta);
+        for (int h = 0; h < H; ++h)
+            apply_rope(q.data() + static_cast<size_t>(h) * QH + QK, R, pos, mla.rope_theta);
+    }
+
+    if (!metal_ops::available())
+        metal_ops::init();
+    const int oh_n = std::max(hidden, hv);
+    std::vector<float> oh(static_cast<size_t>(oh_n), 0.f);
+    metal_ops::MlaAbsorb abs{};
+    abs.q = q.data();
+    abs.cache = cache;
+    abs.w_kt = kt_f.data();
+    abs.w_v = v_f.data();
+    abs.w_o = o_f.data();
+    abs.oh = oh.data();
+    abs.H = H;
+    abs.QK = QK;
+    abs.R = R;
+    abs.Vh = Vh;
+    abs.L = L;
+    abs.stride = stride;
+    abs.T = pos + 1;
+    if (!metal_ops::layer_decode_mla(abs, x, post_ln, hidden, eps, nrm))
+        return false;
+    std::memcpy(y, oh.data(), static_cast<size_t>(hidden) * sizeof(float));
+    return true;
+}
+
 void kda_step(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
               const quant::QuantMat *w_k, const quant::QuantMat *w_v, const quant::QuantMat *w_b,
               const quant::QuantMat *w_fa, const quant::QuantMat *w_fb, const float *dt_bias,

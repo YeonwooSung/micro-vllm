@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/config.hpp"
+#include "../gpu/metal_ops.hpp"
 #include "../quant/weight.hpp"
 #include "../store/block_store.hpp"
 #include "../store/expert_store.hpp"
@@ -277,6 +278,46 @@ void kda_step(const float *x, int hidden, const KdaConfig &kda,
               const float *conv_q = nullptr, const float *conv_k = nullptr,
               const float *conv_v = nullptr, float *win_q = nullptr, float *win_k = nullptr,
               float *win_v = nullptr);
+
+// Q/K/V GEMM + dt/alpha/beta. tok pointers alias the work vectors (must stay alive).
+// False if windows/taps/S are missing or dims are invalid. Does not shift windows.
+bool kda_fill_token(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
+                    const quant::QuantMat *w_k, const quant::QuantMat *w_v,
+                    const quant::QuantMat *w_b, const quant::QuantMat *w_fa,
+                    const quant::QuantMat *w_fb, const float *dt_bias, int dt_n, const float *a_log,
+                    const float *conv_q, const float *conv_k, const float *conv_v, float *win_q,
+                    float *win_k, float *win_v, float *S, std::vector<float> &qt,
+                    std::vector<float> &kt, std::vector<float> &tv, std::vector<float> &alpha,
+                    std::vector<float> &beta, std::vector<float> &oh, metal_ops::KdaToken &tok);
+
+// Per-head o_norm + sigmoid(W_g x) + W_o. oh is fused head output [P]; not mutated.
+void kda_project_out(const float *x, int hidden, const KdaConfig &kda, const quant::QuantMat *w_g,
+                     const quant::QuantMat *w_gb, const quant::QuantMat *w_o, const float *out_norm,
+                     const float *oh, float *y, float eps);
+
+// layer_decode_kda + official W_o. On success x += y and nrm = rmsnorm(x, post_ln).
+// False if windows/taps missing or P < hidden; does not call kda_step or shift windows.
+bool kda_try_layer_decode(const float *in_n, float *x, const float *post_ln, float *nrm, float *y,
+                          int hidden, const KdaConfig &kda, const quant::QuantMat *w_q,
+                          const quant::QuantMat *w_k, const quant::QuantMat *w_v,
+                          const quant::QuantMat *w_b, const quant::QuantMat *w_fa,
+                          const quant::QuantMat *w_fb, const float *dt_bias, int dt_n,
+                          const float *a_log, const quant::QuantMat *w_g,
+                          const quant::QuantMat *w_gb, const quant::QuantMat *w_o,
+                          const float *out_norm, float *S, float eps, const float *conv_q,
+                          const float *conv_k, const float *conv_v, float *win_q, float *win_k,
+                          float *win_v);
+
+// layer_decode_mla after Q/cache/RoPE. On success x += y and nrm = rmsnorm(x, post_ln).
+// False if absorbed KV/cache missing, sparse DSA, or dense Q/O stand-in.
+// Writes the cache row once; does not call mla_step.
+bool mla_try_layer_decode(const float *in_n, float *x, const float *post_ln, float *nrm, float *y,
+                          int hidden, const MlaConfig &mla, const quant::QuantMat *w_qa,
+                          const float *qa_ln, const quant::QuantMat *w_qb,
+                          const quant::QuantMat *w_kva, const float *kva_ln,
+                          const quant::QuantMat *w_kt, const quant::QuantMat *w_v,
+                          const quant::QuantMat *w_o, const quant::QuantMat *w_g, float *cache,
+                          int pos, float eps, const int *selected = nullptr, int n_sel = 0);
 
 // Causal depthwise conv: shift window, write x[p] into the last tap, then x[p] <- taps · window.
 void kda_short_conv(float *x, const float *taps, float *window, int channels, int k);

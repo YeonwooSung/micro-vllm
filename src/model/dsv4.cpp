@@ -263,6 +263,7 @@ public:
         std::vector<int> history;
         std::vector<std::vector<float>> kv, dsa_ikeys, dsa_igates;
         std::vector<float> streams;
+        std::vector<float> last_h;
         int pos = 0;
         bool have = false;
         bool live = false;
@@ -426,13 +427,21 @@ public:
             }
             return best;
         };
-        const bool markov_draft = mtp_env_on() && mtp_markov_ready();
+        const bool fwd_draft = mtp_fwd_ready();
+        const bool markov_draft = !fwd_draft && mtp_env_on() && mtp_markov_ready();
         for (int ntok = 0; ntok < gp.max_new_tokens;) {
             std::vector<int> draft;
             if (dk > 0 && !work->history.empty()) {
                 int prev = work->history.back();
                 for (int i = 0; i < dk && ntok + i < gp.max_new_tokens; ++i) {
-                    const int d = markov_draft ? mtp_markov_next(prev) : bigram_next(prev);
+                    int d = -1;
+                    if (fwd_draft &&
+                        static_cast<int>(work->last_h.size()) == cfg_.hidden)
+                        d = mtp_fwd_next(work->last_h.data(), prev);
+                    else if (markov_draft)
+                        d = mtp_markov_next(prev);
+                    else
+                        d = bigram_next(prev);
                     if (d < 0)
                         break;
                     draft.push_back(d);
@@ -1210,6 +1219,7 @@ private:
         s.pos = 0;
         s.have = false;
         s.live = false;
+        s.last_h.clear();
         s.history.clear();
         s.emitted = 0;
         s.allow.clear();
@@ -1243,6 +1253,38 @@ private:
                     s.dsa_igates[l].resize(ineed, 0.f);
             }
         }
+    }
+
+    void slot_pool_h(const Slot &s, float *dst) const {
+        const int H = cfg_.hidden;
+        const int M = mhc_mult();
+        if (!dst || H <= 0)
+            return;
+        std::memset(dst, 0, static_cast<size_t>(H) * sizeof(float));
+        if (s.streams.empty())
+            return;
+        if (official_hc(0, false) || M > 1) {
+            if (s.streams.size() < static_cast<size_t>(M) * static_cast<size_t>(H))
+                return;
+            for (int m = 0; m < M; ++m)
+                for (int i = 0; i < H; ++i)
+                    dst[i] += s.streams[static_cast<size_t>(m) * H + i];
+            for (int i = 0; i < H; ++i)
+                dst[i] /= static_cast<float>(M);
+        } else {
+            const size_t n = std::min(s.streams.size(), static_cast<size_t>(H));
+            std::memcpy(dst, s.streams.data(), n * sizeof(float));
+        }
+    }
+
+    void slot_snap_h(Slot &s) const {
+        const int H = cfg_.hidden;
+        if (H <= 0) {
+            s.last_h.clear();
+            return;
+        }
+        s.last_h.assign(static_cast<size_t>(H), 0.f);
+        slot_pool_h(s, s.last_h.data());
     }
 
     Status slot_step(Slot &s, int token, std::string &err) {
@@ -1286,6 +1328,7 @@ private:
             }
         }
         ++s.pos;
+        slot_snap_h(s);
         return Status::Ok;
     }
 
@@ -1359,7 +1402,25 @@ private:
         return mtp_markov_w1_.f.size() >= n && mtp_markov_w2_.f.size() >= n;
     }
 
+    bool mtp_fwd_ready() const {
+        if (!mtp_env_on())
+            return false;
+        if (!mtp_main_proj_.empty() && mtp_main_proj_.I > 0 && mtp_main_proj_.O > 0)
+            return true;
+        for (size_t i = 0; i < 3; ++i) {
+            if (i < mtp_wq_a_.size() && !mtp_wq_a_[i].empty())
+                return true;
+            if (i < mtp_conf_.size() && !mtp_conf_[i].empty())
+                return true;
+            if (i < mtp_conf_f32_.size() && !mtp_conf_f32_[i].empty())
+                return true;
+        }
+        return false;
+    }
+
     const char *mtp_mode() const {
+        if (mtp_fwd_ready())
+            return "fwd";
         if (mtp_env_on() && mtp_markov_ready())
             return "markov";
         if (mtp_any_loaded())
@@ -1387,6 +1448,231 @@ private:
             }
         }
         return best;
+    }
+
+    int mtp_argmax(const float *x, int n) const {
+        int best = -1;
+        float best_s = 0.f;
+        for (int i = 0; i < n; ++i) {
+            if (best < 0 || x[i] > best_s) {
+                best_s = x[i];
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    void mtp_scale_out(float *y, const std::vector<float> &sc, int O) const {
+        if (!y || O <= 0 || static_cast<int>(sc.size()) != O)
+            return;
+        for (int i = 0; i < O; ++i)
+            y[i] *= sc[static_cast<size_t>(i)];
+    }
+
+    void mtp_gemm_f32(float *y, const float *x, const float *w, int O, int I) const {
+        if (!y || !x || !w || O <= 0 || I <= 0)
+            return;
+        for (int o = 0; o < O; ++o) {
+            float s = 0.f;
+            const float *row = w + static_cast<size_t>(o) * static_cast<size_t>(I);
+            for (int i = 0; i < I; ++i)
+                s += row[i] * x[i];
+            y[o] = s;
+        }
+    }
+
+    bool mtp_infer_f32(size_t n, int work_w, int *O, int *I) const {
+        if (!O || !I || n == 0)
+            return false;
+        const int V = cfg_.vocab;
+        const int H = cfg_.hidden;
+        if (n == 1) {
+            *O = 1;
+            *I = 1;
+            return true;
+        }
+        if (work_w > 0 && n == static_cast<size_t>(work_w)) {
+            *O = 1;
+            *I = work_w;
+            return true;
+        }
+        if (H > 0 && n == static_cast<size_t>(H)) {
+            *O = 1;
+            *I = H;
+            return true;
+        }
+        if (V > 0 && n % static_cast<size_t>(V) == 0) {
+            const int ii = static_cast<int>(n / static_cast<size_t>(V));
+            if (ii > 0) {
+                *O = V;
+                *I = ii;
+                return true;
+            }
+        }
+        if (work_w > 0 && n % static_cast<size_t>(work_w) == 0) {
+            const int oo = static_cast<int>(n / static_cast<size_t>(work_w));
+            if (oo > 0) {
+                *O = oo;
+                *I = work_w;
+                return true;
+            }
+        }
+        if (H > 0 && n % static_cast<size_t>(H) == 0) {
+            const int oo = static_cast<int>(n / static_cast<size_t>(H));
+            if (oo > 0) {
+                *O = oo;
+                *I = H;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    int mtp_fwd_next(const float *h, int prev_tok) const {
+        const int H = cfg_.hidden;
+        const int V = cfg_.vocab;
+        if (!h || H <= 0)
+            return -1;
+
+        std::vector<float> work(h, h + H);
+        int Ww = H;
+
+        if (!mtp_main_proj_.empty() && mtp_main_proj_.I > 0 && mtp_main_proj_.O > 0) {
+            const int I = mtp_main_proj_.I;
+            const int O = mtp_main_proj_.O;
+            const bool have_emb =
+                prev_tok >= 0 && prev_tok < V && H > 0 &&
+                embed_.size() >= static_cast<size_t>(V) * static_cast<size_t>(H);
+            std::vector<float> xin;
+            bool apply = false;
+            if (I == 2 * H && have_emb) {
+                xin.resize(static_cast<size_t>(I));
+                std::memcpy(xin.data(), work.data(), static_cast<size_t>(H) * sizeof(float));
+                std::memcpy(xin.data() + H,
+                            embed_.data() + static_cast<size_t>(prev_tok) * static_cast<size_t>(H),
+                            static_cast<size_t>(H) * sizeof(float));
+                apply = true;
+            } else if (I == H) {
+                xin.assign(work.begin(), work.begin() + H);
+                apply = true;
+            } else if (O == H && I > 0 && I == Ww) {
+                xin.assign(work.begin(), work.begin() + I);
+                apply = true;
+            }
+            if (apply) {
+                std::vector<float> y(static_cast<size_t>(O), 0.f);
+                mtp_main_proj_.gemm(y.data(), xin.data(), 1);
+                mtp_scale_out(y.data(), mtp_main_proj_scale_, O);
+                work = std::move(y);
+                Ww = O;
+            }
+        }
+        if (Ww <= 0 || work.size() < static_cast<size_t>(Ww))
+            return -1;
+
+        const quant::QuantMat *wqa = nullptr;
+        const std::vector<float> *wqsc = nullptr;
+        for (size_t i = 0; i < mtp_wq_a_.size(); ++i) {
+            if (mtp_wq_a_[i].empty())
+                continue;
+            wqa = &mtp_wq_a_[i];
+            if (i < mtp_wq_a_scale_.size())
+                wqsc = &mtp_wq_a_scale_[i];
+            break;
+        }
+        if (wqa && wqa->I == Ww && wqa->O > 0) {
+            std::vector<float> q(static_cast<size_t>(wqa->O), 0.f);
+            wqa->gemm(q.data(), work.data(), 1);
+            if (wqsc)
+                mtp_scale_out(q.data(), *wqsc, wqa->O);
+            const float *ln = nullptr;
+            for (const auto &row : q_ln_) {
+                if (static_cast<int>(row.size()) == wqa->O) {
+                    ln = row.data();
+                    break;
+                }
+            }
+            if (ln) {
+                quant::rmsnorm(q.data(), ln, q.data(), wqa->O, cfg_.rms_eps);
+            } else {
+                float ss = 0.f;
+                for (int i = 0; i < wqa->O; ++i)
+                    ss += q[static_cast<size_t>(i)] * q[static_cast<size_t>(i)];
+                const float inv = 1.f / (std::sqrt(std::max(ss, 0.f)) + 1e-6f);
+                for (int i = 0; i < wqa->O; ++i)
+                    q[static_cast<size_t>(i)] *= inv;
+            }
+            if (wqa->O == H) {
+                work = std::move(q);
+                Ww = H;
+            }
+        }
+
+        const quant::QuantMat *vocab_qm = nullptr;
+        const float *vocab_f = nullptr;
+        int vocab_I = 0;
+        const quant::QuantMat *score_qm = nullptr;
+        const float *score_f = nullptr;
+        int score_O = 0, score_I = 0;
+        for (size_t i = 0; i < 3; ++i) {
+            int O = 0, I = 0;
+            const quant::QuantMat *qm = nullptr;
+            const float *ff = nullptr;
+            if (i < mtp_conf_.size() && !mtp_conf_[i].empty()) {
+                qm = &mtp_conf_[i];
+                O = qm->O;
+                I = qm->I;
+            } else if (i < mtp_conf_f32_.size() && !mtp_conf_f32_[i].empty()) {
+                if (!mtp_infer_f32(mtp_conf_f32_[i].size(), Ww, &O, &I))
+                    continue;
+                ff = mtp_conf_f32_[i].data();
+            } else {
+                continue;
+            }
+            if (O == V && V > 0 && !vocab_qm && !vocab_f) {
+                vocab_qm = qm;
+                vocab_f = ff;
+                vocab_I = I;
+            } else if (O > 0 && O != V && !score_qm && !score_f) {
+                score_qm = qm;
+                score_f = ff;
+                score_O = O;
+                score_I = I;
+            }
+        }
+
+        if (score_O > 0 && score_I > 0 && score_I <= Ww) {
+            std::vector<float> sc(static_cast<size_t>(score_O), 0.f);
+            if (score_qm)
+                score_qm->gemm(sc.data(), work.data(), 1);
+            else
+                mtp_gemm_f32(sc.data(), work.data(), score_f, score_O, score_I);
+            const float s0 = sc[0];
+            if (std::isfinite(s0) && s0 < 0.f)
+                return -1;
+        }
+
+        if ((vocab_qm || vocab_f) && vocab_I > 0 && vocab_I <= Ww && V > 0) {
+            std::vector<float> logits(static_cast<size_t>(V), 0.f);
+            if (vocab_qm)
+                vocab_qm->gemm(logits.data(), work.data(), 1);
+            else
+                mtp_gemm_f32(logits.data(), work.data(), vocab_f, V, vocab_I);
+            const int tok = mtp_argmax(logits.data(), V);
+            return (tok >= 0 && tok < V) ? tok : -1;
+        }
+
+        if (Ww != H || lm_head_.empty() || lm_head_.I != H || lm_head_.O <= 0 || V <= 0)
+            return -1;
+        std::vector<float> n(static_cast<size_t>(H)), logits(static_cast<size_t>(V), 0.f);
+        if (!norm_.empty() && static_cast<int>(norm_.size()) >= H)
+            quant::rmsnorm(work.data(), norm_.data(), n.data(), H, cfg_.rms_eps);
+        else
+            std::memcpy(n.data(), work.data(), static_cast<size_t>(H) * sizeof(float));
+        lm_head_.gemm(logits.data(), n.data(), 1);
+        const int nlog = std::min(V, lm_head_.O);
+        const int tok = mtp_argmax(logits.data(), nlog);
+        return (tok >= 0 && tok < V) ? tok : -1;
     }
 
     // Layer-major window: C tokens share one activation slab (not prompt-sized).
@@ -1473,6 +1759,7 @@ private:
                 return st;
             i += C;
         }
+        slot_snap_h(s);
         return Status::Ok;
     }
 
@@ -1609,6 +1896,7 @@ private:
             s.history.resize(static_cast<size_t>(n));
         s.pos = n;
         s.have = n > 0;
+        slot_snap_h(s);
     }
 
     const PrefixCkpt *ckpt_lookup(const std::vector<int> &prompt) {
@@ -1901,20 +2189,10 @@ private:
 
     int slot_sample(Slot &s, const GenParams &gp, uint64_t *rng, const uint8_t *allow) {
         const int H = cfg_.hidden;
-        const int M = mhc_mult();
         std::vector<float> n(static_cast<size_t>(H)), logits(static_cast<size_t>(cfg_.vocab)),
             pooled(static_cast<size_t>(H));
-        const float *head_in = s.streams.data();
-        if (official_hc(0, false) || M > 1) {
-            std::fill(pooled.begin(), pooled.end(), 0.f);
-            for (int m = 0; m < M; ++m)
-                for (int i = 0; i < H; ++i)
-                    pooled[static_cast<size_t>(i)] +=
-                        s.streams[static_cast<size_t>(m) * H + i];
-            for (int i = 0; i < H; ++i)
-                pooled[static_cast<size_t>(i)] /= static_cast<float>(M);
-            head_in = pooled.data();
-        }
+        slot_pool_h(s, pooled.data());
+        const float *head_in = pooled.data();
         quant::rmsnorm(head_in, norm_.data(), n.data(), H, cfg_.rms_eps);
         {
             AccTimer t(t_head_);

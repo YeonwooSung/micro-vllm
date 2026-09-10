@@ -931,20 +931,33 @@ private:
         std::vector<float> n(static_cast<size_t>(H)), y(static_cast<size_t>(H), 0.f);
         quant::rmsnorm(hh, in_n_[l].data(), n.data(), H, cfg_.rms_eps);
         bool full = (l < static_cast<int>(cfg_.is_full.size())) ? cfg_.is_full[l] : 0;
+        bool fused = false;
         if (!full && cfg_.kda.heads > 0) {
             AccTimer t(t_attn_);
-            kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l], &wfb_[l],
-                     wdt_[l].data(), static_cast<int>(wdt_[l].size()), alog_[l].data(), &wg_[l],
-                     (l < static_cast<int>(wgb_.size()) && !wgb_[l].empty()) ? &wgb_[l] : nullptr,
-                     &wo_[l], on_[l].empty() ? nullptr : on_[l].data(), s.S[l].data(), y.data(),
-                     cfg_.rms_eps,
-                     l < static_cast<int>(conv_q_.size()) && !conv_q_[l].empty() ? conv_q_[l].data()
-                                                                                : nullptr,
-                     l < static_cast<int>(conv_k_.size()) && !conv_k_[l].empty() ? conv_k_[l].data()
-                                                                                : nullptr,
-                     l < static_cast<int>(conv_v_.size()) && !conv_v_[l].empty() ? conv_v_[l].data()
-                                                                                : nullptr,
-                     s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
+            const float *cq = (l < static_cast<int>(conv_q_.size()) && !conv_q_[l].empty())
+                                  ? conv_q_[l].data()
+                                  : nullptr;
+            const float *ck = (l < static_cast<int>(conv_k_.size()) && !conv_k_[l].empty())
+                                  ? conv_k_[l].data()
+                                  : nullptr;
+            const float *cv = (l < static_cast<int>(conv_v_.size()) && !conv_v_[l].empty())
+                                  ? conv_v_[l].data()
+                                  : nullptr;
+            const quant::QuantMat *wgb =
+                (l < static_cast<int>(wgb_.size()) && !wgb_[l].empty()) ? &wgb_[l] : nullptr;
+            const float *on = on_[l].empty() ? nullptr : on_[l].data();
+            fused = kda_try_layer_decode(n.data(), hh, out_n_[l].data(), n.data(), y.data(), H,
+                                         cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l],
+                                         &wfb_[l], wdt_[l].data(), static_cast<int>(wdt_[l].size()),
+                                         alog_[l].data(), &wg_[l], wgb, &wo_[l], on, s.S[l].data(),
+                                         cfg_.rms_eps, cq, ck, cv, s.winq[l].data(),
+                                         s.wink[l].data(), s.winv[l].data());
+            if (!fused)
+                kda_step(n.data(), H, cfg_.kda, &wq_[l], &wk_[l], &wv_[l], &wb_[l], &wfa_[l],
+                         &wfb_[l], wdt_[l].data(), static_cast<int>(wdt_[l].size()),
+                         alog_[l].data(), &wg_[l], wgb, &wo_[l], on, s.S[l].data(), y.data(),
+                         cfg_.rms_eps, cq, ck, cv, s.winq[l].data(), s.wink[l].data(),
+                         s.winv[l].data());
         } else {
             const int *sel = nullptr;
             int nsel = 0;
@@ -1003,17 +1016,30 @@ private:
             }
             {
                 AccTimer t(t_attn_);
-                mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],
-                         mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
-                         &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
-                         &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
-                         s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at, y.data(),
-                         cfg_.rms_eps, sel, nsel, &t_kvb_);
+                fused = mla_try_layer_decode(
+                    n.data(), hh, out_n_[l].data(), n.data(), y.data(), H, cfg_.mla, &mla_qa_[l],
+                    mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
+                    &mla_kva_[l], mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
+                    &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
+                    s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at, cfg_.rms_eps, sel,
+                    nsel);
+                if (!fused)
+                    mla_step(n.data(), H, cfg_.mla, &mla_qa_[l],
+                             mla_qa_ln_[l].empty() ? nullptr : mla_qa_ln_[l].data(), &mla_qb_[l],
+                             &mla_kva_[l],
+                             mla_kva_ln_[l].empty() ? nullptr : mla_kva_ln_[l].data(),
+                             &mla_kt_[l], &mla_v_[l], &mla_o_[l], &mla_g_[l],
+                             s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), at,
+                             y.data(), cfg_.rms_eps, sel, nsel, &t_kvb_);
             }
         }
-        if (branch)
+        if (branch) {
+            if (fused) {
+                for (int i = 0; i < H; ++i)
+                    hh[i] -= y[i];
+            }
             std::memcpy(branch, y.data(), static_cast<size_t>(H) * sizeof(float));
-        else {
+        } else if (!fused) {
             for (int i = 0; i < H; ++i)
                 hh[i] += y[i];
         }

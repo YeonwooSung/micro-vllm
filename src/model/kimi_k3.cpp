@@ -127,6 +127,35 @@ bool k3_expert_try_coli(float *y, const float *x, int S, const uint8_t *blob, in
     return coli_cuda::matmul_mxfp4(y, gate.data(), w2p, w2s, S, O, I);
 }
 
+// Unpack K3 MXFP4 blob (same geom as k3_expert_try_coli) for moe_block fmt=7.
+bool k3_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, int I, int O,
+                         float b1, float b2) {
+    if (!metal_ops::available() || !y || !x || !blob || S <= 0 || I <= 0 || O <= 0)
+        return false;
+    const K3ExpertGeom g = make_k3_geom(I, O);
+    const uint8_t *w1p = blob;
+    const uint8_t *w1s = w1p + g.w1p;
+    const uint8_t *w2p = w1s + g.w1s;
+    const uint8_t *w2s = w2p + g.w2p;
+    const uint8_t *w3p = w2s + g.w2s;
+    const uint8_t *w3s = w3p + g.w1p;
+    const void *gp = w1p;
+    const void *up = w3p;
+    const void *dp = w2p;
+    const float *gs = reinterpret_cast<const float *>(w1s);
+    const float *us = reinterpret_cast<const float *>(w3s);
+    const float *ds = reinterpret_cast<const float *>(w2s);
+    const int xoff = 0;
+    const int nr = S;
+    std::vector<int> rows(static_cast<size_t>(S));
+    std::vector<float> rw(static_cast<size_t>(S), 1.f);
+    for (int i = 0; i < S; ++i)
+        rows[static_cast<size_t>(i)] = i;
+    std::memset(y, 0, static_cast<size_t>(S) * static_cast<size_t>(I) * sizeof(float));
+    return metal_ops::moe_block(1, I, O, 7, 32, &gp, &up, &dp, &gs, &us, &ds, x, &xoff, &nr,
+                                rows.data(), rw.data(), y, S, metal_ops::Act::Situ, b1, b2);
+}
+
 // x += attn; nrm = rmsnorm(x, post_ln). Shared expert stays on the host (SiTU).
 void k3_resid_post_ln(float *x, const float *attn, const float *post_ln, float *nrm, int H,
                       float eps) {
@@ -394,36 +423,21 @@ public:
                 quant::rmsnorm(h.data(), d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
 
                 bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
+                bool fused = false;
                 if (use_kda) {
                     AccTimer t(t_attn_);
-                    kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
-                             &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
-                             static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
-                             nullptr, &d_.wo[l],
-                             d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
-                             S[l].data(), y.data(),
-                             cfg_.rms_eps,
-                             l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
-                                 ? d_.conv_q[l].data()
-                                 : nullptr,
-                             l < static_cast<int>(d_.conv_k.size()) && !d_.conv_k[l].empty()
-                                 ? d_.conv_k[l].data()
-                                 : nullptr,
-                             l < static_cast<int>(d_.conv_v.size()) && !d_.conv_v[l].empty()
-                                 ? d_.conv_v[l].data()
-                                 : nullptr,
-                             winq[l].data(), wink[l].data(), winv[l].data());
+                    fused = kda_s1(l, h.data(), n.data(), y.data(), S[l].data(), winq[l].data(),
+                                   wink[l].data(), winv[l].data());
                 } else {
                     AccTimer t(t_attn_);
-                    mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
-                             d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
-                             &d_.mla_qb[l], &d_.mla_kva[l],
-                             d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
-                             &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
-                             mla_cache[l].empty() ? nullptr : mla_cache[l].data(), pos, y.data(),
-                             cfg_.rms_eps, nullptr, 0, &t_kvb_);
+                    fused = mla_s1(l, h.data(), n.data(), y.data(),
+                                   mla_cache[l].empty() ? nullptr : mla_cache[l].data(), pos);
                 }
                 if (attnres) {
+                    if (fused) {
+                        for (int i = 0; i < H; ++i)
+                            h[i] -= y[i];
+                    }
                     if (snap)
                         prefix = std::vector<float>(y.begin(), y.end());
                     else {
@@ -434,7 +448,7 @@ public:
                     quant::rmsnorm(h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
                 } else {
                     bool dense_ok = false;
-                    if (l < cfg_.first_dense) {
+                    if (!fused && l < cfg_.first_dense) {
                         std::vector<float> down(static_cast<size_t>(H), 0.f);
                         if (k3_dense_metal(h.data(), y.data(), d_.attn_out_n[l].data(), n.data(),
                                            down.data(), d_.mlp_gate[l], d_.mlp_up[l],
@@ -445,7 +459,7 @@ public:
                             dense_ok = true;
                         }
                     }
-                    if (!dense_ok)
+                    if (!fused && !dense_ok)
                         k3_resid_post_ln(h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
                                          cfg_.rms_eps);
                     if (dense_ok)
@@ -1124,6 +1138,51 @@ private:
                    : nullptr;
     }
 
+    // S=1 KDA. True if layer_decode_kda applied residual (x += y, n = post-LN).
+    bool kda_s1(int l, float *x, float *n, float *y, float *S, float *winq, float *wink,
+                float *winv) {
+        const int H = cfg_.hidden;
+        const float *cq = (l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty())
+                              ? d_.conv_q[l].data()
+                              : nullptr;
+        const float *ck = (l < static_cast<int>(d_.conv_k.size()) && !d_.conv_k[l].empty())
+                              ? d_.conv_k[l].data()
+                              : nullptr;
+        const float *cv = (l < static_cast<int>(d_.conv_v.size()) && !d_.conv_v[l].empty())
+                              ? d_.conv_v[l].data()
+                              : nullptr;
+        const float *on = d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data();
+        if (kda_try_layer_decode(n, x, d_.attn_out_n[l].data(), n, y, H, cfg_.kda, &d_.wq[l],
+                                 &d_.wk[l], &d_.wv[l], &d_.wb[l], &d_.wfa[l], &d_.wfb[l],
+                                 d_.wdt[l].data(), static_cast<int>(d_.wdt[l].size()),
+                                 d_.alog[l].data(), &d_.wg[l], nullptr, &d_.wo[l], on, S,
+                                 cfg_.rms_eps, cq, ck, cv, winq, wink, winv))
+            return true;
+        kda_step(n, H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l], &d_.wfa[l],
+                 &d_.wfb[l], d_.wdt[l].data(), static_cast<int>(d_.wdt[l].size()),
+                 d_.alog[l].data(), &d_.wg[l], nullptr, &d_.wo[l], on, S, y, cfg_.rms_eps, cq, ck,
+                 cv, winq, wink, winv);
+        return false;
+    }
+
+    // S=1 MLA. True if layer_decode_mla applied residual (x += y, n = post-LN).
+    bool mla_s1(int l, float *x, float *n, float *y, float *cache, int pos) {
+        const int H = cfg_.hidden;
+        if (mla_try_layer_decode(n, x, d_.attn_out_n[l].data(), n, y, H, cfg_.mla, &d_.mla_qa[l],
+                                 d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
+                                 &d_.mla_qb[l], &d_.mla_kva[l],
+                                 d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
+                                 &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l], cache,
+                                 pos, cfg_.rms_eps))
+            return true;
+        mla_step(n, H, cfg_.mla, &d_.mla_qa[l],
+                 d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(), &d_.mla_qb[l],
+                 &d_.mla_kva[l], d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
+                 &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l], cache, pos, y,
+                 cfg_.rms_eps, nullptr, 0, &t_kvb_);
+        return false;
+    }
+
     int kv_stride() const {
         return std::max(cfg_.mla.kv_lora, 0) + std::max(cfg_.mla.qk_rope, 0);
     }
@@ -1204,35 +1263,21 @@ private:
             quant::rmsnorm(s.h.data(), d_.attn_in_n[l].data(), n.data(), H, cfg_.rms_eps);
 
             bool use_kda = (l < static_cast<int>(cfg_.is_kda.size())) ? cfg_.is_kda[l] : 1;
+            bool fused = false;
             if (use_kda) {
                 AccTimer t(t_attn_);
-                kda_step(n.data(), H, cfg_.kda, &d_.wq[l], &d_.wk[l], &d_.wv[l], &d_.wb[l],
-                         &d_.wfa[l], &d_.wfb[l], d_.wdt[l].data(),
-                         static_cast<int>(d_.wdt[l].size()), d_.alog[l].data(), &d_.wg[l],
-                         nullptr, &d_.wo[l],
-                         d_.out_norm[l].empty() ? nullptr : d_.out_norm[l].data(),
-                         s.S[l].data(), y.data(), cfg_.rms_eps,
-                         l < static_cast<int>(d_.conv_q.size()) && !d_.conv_q[l].empty()
-                             ? d_.conv_q[l].data()
-                             : nullptr,
-                         l < static_cast<int>(d_.conv_k.size()) && !d_.conv_k[l].empty()
-                             ? d_.conv_k[l].data()
-                             : nullptr,
-                         l < static_cast<int>(d_.conv_v.size()) && !d_.conv_v[l].empty()
-                             ? d_.conv_v[l].data()
-                             : nullptr,
-                         s.winq[l].data(), s.wink[l].data(), s.winv[l].data());
+                fused = kda_s1(l, s.h.data(), n.data(), y.data(), s.S[l].data(), s.winq[l].data(),
+                               s.wink[l].data(), s.winv[l].data());
             } else {
                 AccTimer t(t_attn_);
-                mla_step(n.data(), H, cfg_.mla, &d_.mla_qa[l],
-                         d_.mla_qa_ln[l].empty() ? nullptr : d_.mla_qa_ln[l].data(),
-                         &d_.mla_qb[l], &d_.mla_kva[l],
-                         d_.mla_kva_ln[l].empty() ? nullptr : d_.mla_kva_ln[l].data(),
-                         &d_.mla_kt[l], &d_.mla_v[l], &d_.mla_o[l], &d_.mla_g[l],
-                         s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), s.pos,
-                         y.data(), cfg_.rms_eps, nullptr, 0, &t_kvb_);
+                fused = mla_s1(l, s.h.data(), n.data(), y.data(),
+                               s.mla_cache[l].empty() ? nullptr : s.mla_cache[l].data(), s.pos);
             }
             if (attnres) {
+                if (fused) {
+                    for (int i = 0; i < H; ++i)
+                        s.h[i] -= y[i];
+                }
                 if (snap)
                     prefix = std::vector<float>(y.begin(), y.end());
                 else {
@@ -1243,7 +1288,7 @@ private:
                 quant::rmsnorm(s.h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
             } else {
                 bool dense_ok = false;
-                if (l < cfg_.first_dense) {
+                if (!fused && l < cfg_.first_dense) {
                     std::vector<float> down(static_cast<size_t>(H), 0.f);
                     if (k3_dense_metal(s.h.data(), y.data(), d_.attn_out_n[l].data(), n.data(),
                                        down.data(), d_.mlp_gate[l], d_.mlp_up[l], d_.mlp_down[l], H,
@@ -1254,7 +1299,7 @@ private:
                         dense_ok = true;
                     }
                 }
-                if (!dense_ok)
+                if (!fused && !dense_ok)
                     k3_resid_post_ln(s.h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
                                      cfg_.rms_eps);
                 if (dense_ok)
@@ -1992,8 +2037,11 @@ private:
                 ++n;
             }
             if (n > 0) {
-                if (idot || !k3_expert_try_coli(yb.data(), xb.data(), n, v.data, I, O,
-                                                cfg_.moe.situ_b1, cfg_.moe.situ_b2))
+                if (idot ||
+                    (!k3_expert_try_metal(yb.data(), xb.data(), n, v.data, I, O, cfg_.moe.situ_b1,
+                                          cfg_.moe.situ_b2) &&
+                     !k3_expert_try_coli(yb.data(), xb.data(), n, v.data, I, O, cfg_.moe.situ_b1,
+                                         cfg_.moe.situ_b2)))
                     gpu::k3_expert(yb.data(), xb.data(), n, v.data, I, O, cfg_.moe.situ_b1,
                                    cfg_.moe.situ_b2, idot);
                 for (int i = 0; i < n; ++i) {

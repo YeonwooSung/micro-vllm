@@ -898,16 +898,43 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
     }
     const TensorW *n1w = getc(w, "pre_block.norm1.weight");
     const TensorW *n1b = getc(w, "pre_block.norm1.bias");
+    const TensorW *qkv = getc(w, "pre_block.attn.qkv.weight");
+    const TensorW *qb = getc(w, "pre_block.attn.q_bias");
+    const TensorW *kb = getc(w, "pre_block.attn.zero_k_bias");
+    const TensorW *vb = getc(w, "pre_block.attn.v_bias");
+    const TensorW *apw = getc(w, "pre_block.attn.proj.weight");
+    const TensorW *apb = getc(w, "pre_block.attn.proj.bias");
+    const TensorW *n2w = getc(w, "pre_block.norm2.weight");
+    const TensorW *n2b = getc(w, "pre_block.norm2.bias");
+    const TensorW *nmw = getc(w, "pre_block.mlp.norm.weight");
+    const TensorW *nmb = getc(w, "pre_block.mlp.norm.bias");
+    const TensorW *w0 = getc(w, "pre_block.mlp.w0.weight");
+    const TensorW *b0 = getc(w, "pre_block.mlp.w0.bias");
+    const TensorW *w1 = getc(w, "pre_block.mlp.w1.weight");
+    const TensorW *b1 = getc(w, "pre_block.mlp.w1.bias");
+    const TensorW *w2 = getc(w, "pre_block.mlp.w2.weight");
+    const TensorW *b2 = getc(w, "pre_block.mlp.w2.bias");
+    const int ch = kH3AudioChannels;
+    auto tptr = [](const TensorW *t, int n) -> const float * {
+        return t && static_cast<int>(t->data.size()) == n ? t->data.data() : nullptr;
+    };
+    auto tptr_ge = [](const TensorW *t, int n) -> const float * {
+        return t && static_cast<int>(t->data.size()) >= n ? t->data.data() : nullptr;
+    };
+    if (metal_h3::audio_pre_block(base.data(), seq.data(), B, L, C, ch, w.heads, tptr_ge(n1w, C),
+                                  tptr_ge(n1b, C), tptr(qkv, 3 * C * C), tptr(qb, C), tptr(kb, C),
+                                  tptr(vb, C), tptr(apw, ch * ch), tptr(apb, ch), tptr_ge(n2w, ch),
+                                  tptr_ge(n2b, ch), tptr_ge(nmw, ch), tptr_ge(nmb, ch),
+                                  tptr(w0, 2 * ch * ch), tptr(b0, 2 * ch), tptr(w1, 2 * ch * ch),
+                                  tptr(b1, 2 * ch), tptr(w2, ch * 2 * ch), tptr(b2, ch), 1e-5f)) {
+        // Metal graph consumed attn residual + GELU-gate MLP residual.
+    } else {
     std::vector<float> an = seq;
     layernorm_vec(an.data(), n1w ? n1w->data.data() : nullptr, n1b ? n1b->data.data() : nullptr, rows,
                   C, 1e-5f);
-    const TensorW *qkv = getc(w, "pre_block.attn.qkv.weight");
     if (qkv && static_cast<int>(qkv->data.size()) == 3 * C * C) {
         std::vector<float> qkv_o(static_cast<size_t>(rows) * 3 * C);
         linear(qkv_o.data(), an.data(), qkv->data.data(), nullptr, rows, C, 3 * C);
-        const TensorW *qb = getc(w, "pre_block.attn.q_bias");
-        const TensorW *kb = getc(w, "pre_block.attn.zero_k_bias");
-        const TensorW *vb = getc(w, "pre_block.attn.v_bias");
         std::vector<float> q(static_cast<size_t>(rows) * C), k(static_cast<size_t>(rows) * C),
             v(static_cast<size_t>(rows) * C), att(static_cast<size_t>(rows) * C);
         for (int r = 0; r < rows; ++r) {
@@ -937,8 +964,6 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
             for (int c = 0; c < kH3AudioChannels; ++c)
                 pooled[static_cast<size_t>(r) * kH3AudioChannels + c] =
                     att[static_cast<size_t>(r) * C + (c % C)];
-        const TensorW *apw = getc(w, "pre_block.attn.proj.weight");
-        const TensorW *apb = getc(w, "pre_block.attn.proj.bias");
         std::vector<float> ap(static_cast<size_t>(rows) * kH3AudioChannels, 0.f);
         if (apw && static_cast<int>(apw->data.size()) == kH3AudioChannels * kH3AudioChannels)
             linear(ap.data(), pooled.data(), apw->data.data(),
@@ -952,21 +977,11 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
                              static_cast<int>(base.size()), 1e-5f))
             add_inplace(base.data(), ap.data(), static_cast<int>(base.size()));
     }
-    const TensorW *n2w = getc(w, "pre_block.norm2.weight");
-    const TensorW *n2b = getc(w, "pre_block.norm2.bias");
     std::vector<float> n2 = base;
     layernorm_vec(n2.data(), n2w ? n2w->data.data() : nullptr, n2b ? n2b->data.data() : nullptr, rows,
                   kH3AudioChannels, 1e-5f);
-    const TensorW *nmw = getc(w, "pre_block.mlp.norm.weight");
-    const TensorW *nmb = getc(w, "pre_block.mlp.norm.bias");
     layernorm_vec(n2.data(), nmw ? nmw->data.data() : nullptr, nmb ? nmb->data.data() : nullptr, rows,
                   kH3AudioChannels, 1e-5f);
-    const TensorW *w0 = getc(w, "pre_block.mlp.w0.weight");
-    const TensorW *b0 = getc(w, "pre_block.mlp.w0.bias");
-    const TensorW *w1 = getc(w, "pre_block.mlp.w1.weight");
-    const TensorW *b1 = getc(w, "pre_block.mlp.w1.bias");
-    const TensorW *w2 = getc(w, "pre_block.mlp.w2.weight");
-    const TensorW *b2 = getc(w, "pre_block.mlp.w2.bias");
     if (w0 && w1 && w2 && static_cast<int>(w0->data.size()) == 2 * kH3AudioChannels * kH3AudioChannels) {
         std::vector<float> gate(static_cast<size_t>(rows) * 2 * kH3AudioChannels),
             lin(static_cast<size_t>(rows) * 2 * kH3AudioChannels),
@@ -990,6 +1005,7 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
                              static_cast<int>(base.size()), 1e-5f))
             add_inplace(base.data(), br.data(), static_cast<int>(base.size()));
     }
+    } // host fallback
     std::vector<float> bcl;
     btc_to_bcl(base.data(), B, L, kH3AudioChannels, bcl);
     Conv1d mp;

@@ -42,7 +42,7 @@ bool layer_decode(float *x, const float *attn, const float *post_ln, const float
 // Full decode tail in one CB (S=1): optional in_ln on pre-add x, residual add,
 // post_ln, optional F32 shared expert with Act, optional router GEMM + host top-k.
 // attn is a precomputed attention vector. KDA fused token can share the decode CB
-// via layer_decode_kda; MLA stays on its own kernels.
+// via layer_decode_kda; absorbed MLA uses layer_decode_mla.
 // router_w is F32 [E,D]; rscale multiplies the normalized mix weights.
 // Returns false on bad args. CPU fallback still returns true.
 bool layer_decode_full(float *x, const float *attn, const float *in_ln, const float *post_ln,
@@ -63,7 +63,6 @@ struct KdaToken {
 
 // KDA fused token + decode tail in one CB: op_kda_fused, then x += oh, post-LN,
 // optional F32 shared Act, optional router GEMM + host top-k.
-// KDA fused token can share the decode CB; MLA stays on its own kernels.
 // oh is the residual (attn); P must be >= D. False on bad args; CPU fallback still true.
 bool layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, const float *post_ln,
                       const float *shg, const float *shu, const float *shd, int D, int Iinter,
@@ -71,7 +70,24 @@ bool layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, const f
                       const float *router_bias, int E, int K, float rscale, float *inrm_out,
                       float *nrm_out, float *sh_out, int *idx_out, float *w_out);
 
+// Absorbed MLA: score_j = (W_kt q_nope)·c_j + q_rot·R_j; ctx = W_v (Σ a_j c_j).
+// q [H, QK+R], cache [T, stride], w_kt f32 [H*L, QK], w_v f32 [H*Vh, L].
+// oh [max(D, H*Vh)] caller-provided. Optional w_o f32 [D, H*Vh] so oh is residual [D].
+struct MlaAbsorb {
+    const float *q, *cache, *w_kt, *w_v, *w_o;
+    float *oh;
+    int H, QK, R, Vh, L, stride, T;
+};
+
+// Absorbed MLA + decode tail: absorb, optional W_o, x += oh[:D], post-LN → nrm_out.
+// No shared/router this fire. False on bad args (T<1, missing ptrs, stride < L+R, D<1).
+// CPU fallback still returns true.
+bool layer_decode_mla(const MlaAbsorb &mla, float *x, const float *post_ln, int D, float eps,
+                      float *nrm_out);
+
 // Batched routed-expert SwiGLU. fmt 0 = F32 [O,I], fmt 4 = int4-g64 (qgs along I).
+// fmt 7 = MXFP4: g/u/d packed uint8 [O,(I+1)/2]; gs/us/ds are UE8M0 uint8*
+// (reinterpret_cast through the float* slots). qgs unused (group is 32).
 // For expert e: nr[e] rows of xg starting at xoff[e]; hh = down(act(gate,up));
 // scatter-add rw[row]*hh into out[S,D]. One command buffer on Metal.
 bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,

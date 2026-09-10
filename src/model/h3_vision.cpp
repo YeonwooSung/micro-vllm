@@ -390,9 +390,25 @@ void run_block(const BlockW &b, float *hidden, int rows, const H3VisionConfig &c
     if (H <= 0 || rows <= 0)
         return;
 
-    std::vector<float> norm(static_cast<size_t>(rows) * H);
+    ensure_metal_h3();
     const float *n1w = b.norm1_w.size() >= static_cast<size_t>(H) ? b.norm1_w.data() : nullptr;
     const float *n1b = b.norm1_b.size() >= static_cast<size_t>(H) ? b.norm1_b.data() : nullptr;
+    const float *n2w = b.norm2_w.size() >= static_cast<size_t>(H) ? b.norm2_w.data() : nullptr;
+    const float *n2b = b.norm2_b.size() >= static_cast<size_t>(H) ? b.norm2_b.data() : nullptr;
+    const float *qkv = weight_ok(b.qkv_w, 3 * H, H) ? b.qkv_w.data() : nullptr;
+    const float *qkv_b = b.qkv_b.size() >= static_cast<size_t>(3 * H) ? b.qkv_b.data() : nullptr;
+    const float *proj = weight_ok(b.proj_w, H, H) ? b.proj_w.data() : nullptr;
+    const float *proj_b = b.proj_b.size() >= static_cast<size_t>(H) ? b.proj_b.data() : nullptr;
+    const float *fc1 = (I > 0 && weight_ok(b.fc1_w, I, H)) ? b.fc1_w.data() : nullptr;
+    const float *fc1_b = b.fc1_b.size() >= static_cast<size_t>(I) ? b.fc1_b.data() : nullptr;
+    const float *fc2 = (I > 0 && weight_ok(b.fc2_w, H, I)) ? b.fc2_w.data() : nullptr;
+    const float *fc2_b = b.fc2_b.size() >= static_cast<size_t>(H) ? b.fc2_b.data() : nullptr;
+    if (metal_h3::vision_block(hidden, rows, H, heads, hd, I, n1w, n1b, qkv, qkv_b, proj, proj_b,
+                               n2w, n2b, fc1, fc1_b, fc2, fc2_b, rope_cos, rope_sin, rope_half,
+                               cfg.ln_eps))
+        return;
+
+    std::vector<float> norm(static_cast<size_t>(rows) * H);
     for (int r = 0; r < rows; ++r)
         layernorm(hidden + static_cast<size_t>(r) * H, n1w, n1b, norm.data() + static_cast<size_t>(r) * H, H,
                   cfg.ln_eps);
@@ -421,8 +437,6 @@ void run_block(const BlockW &b, float *hidden, int rows, const H3VisionConfig &c
         }
     }
 
-    const float *n2w = b.norm2_w.size() >= static_cast<size_t>(H) ? b.norm2_w.data() : nullptr;
-    const float *n2b = b.norm2_b.size() >= static_cast<size_t>(H) ? b.norm2_b.data() : nullptr;
     for (int r = 0; r < rows; ++r)
         layernorm(hidden + static_cast<size_t>(r) * H, n2w, n2b, norm.data() + static_cast<size_t>(r) * H, H,
                   cfg.ln_eps);

@@ -6,6 +6,7 @@
 #include "../model/family.hpp"
 #include "../quant/quant.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -27,6 +28,7 @@ id<MTLComputePipelineState> g_p_act = nil;
 id<MTLComputePipelineState> g_p_kda = nil;
 id<MTLComputePipelineState> g_p_gemm_f32 = nil;
 id<MTLComputePipelineState> g_p_gemm_i4 = nil;
+id<MTLComputePipelineState> g_p_gemm_mx = nil;
 
 static const char *kMetalSrc = R"MSL(
 #include <metal_stdlib>
@@ -259,6 +261,37 @@ kernel void op_gemm_int4_g64(device const float *x [[buffer(0)]],
     }
     y[(ulong)s * (uint)a.O + o] = acc;
 }
+
+constant float MX4_LUT[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+kernel void op_gemm_mxfp4(device const float *x [[buffer(0)]],
+                          device const uchar *packed [[buffer(1)]],
+                          device const uchar *scales [[buffer(2)]],
+                          device float *y [[buffer(3)]],
+                          constant GemmArgs &a [[buffer(4)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint o = gid.x;
+    uint s = gid.y;
+    if (o >= (uint)a.O || s >= (uint)a.S) return;
+    const int I = a.I;
+    const int stride = (I + 1) / 2;
+    const int ng = (I + 31) / 32;
+    const device float *xs = x + (ulong)s * (uint)I;
+    const device uchar *prow = packed + (ulong)o * (uint)stride;
+    const device uchar *srow = scales + (ulong)o * (uint)ng;
+    float acc = 0.0f;
+    for (int i = 0; i < I; ++i) {
+        uchar b = prow[i >> 1];
+        uint nib = (i & 1) ? (b >> 4) : (b & 0x0f);
+        uint e = srow[i / 32];
+        float scale = as_type<float>(e << 23);
+        acc += xs[i] * (MX4_LUT[nib] * scale);
+    }
+    y[(ulong)s * (uint)a.O + o] = acc;
+}
 )MSL";
 
 struct RmsArgs {
@@ -448,6 +481,73 @@ void cpu_layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, con
                           idx_out, w_out);
 }
 
+bool mla_args_ok(const MlaAbsorb &m, const float *x, const float *post_ln, int D,
+                 const float *nrm_out) {
+    return m.q && m.cache && m.w_kt && m.w_v && m.oh && x && post_ln && nrm_out && m.H >= 1 &&
+           m.QK >= 1 && m.Vh >= 1 && m.L >= 1 && m.R >= 0 && m.T >= 1 && m.stride >= m.L + m.R &&
+           D >= 1;
+}
+
+// score_j = (W_kt q_nope)·c_j + q_rot·R_j; ctx = W_v (Σ a_j c_j).
+void cpu_mla_absorb(float *ctx, const MlaAbsorb &m) {
+    const int QH = m.QK + m.R;
+    const float scale = 1.f / std::sqrt(static_cast<float>(QH > 0 ? QH : 1));
+    std::vector<float> qabs(static_cast<size_t>(m.L));
+    std::vector<float> scores(static_cast<size_t>(m.T));
+    std::vector<float> pooled(static_cast<size_t>(m.L));
+    for (int h = 0; h < m.H; ++h) {
+        const float *qh = m.q + static_cast<size_t>(h) * QH;
+        const float *wkt = m.w_kt + static_cast<size_t>(h) * m.L * m.QK;
+        for (int k = 0; k < m.L; ++k) {
+            float acc = 0.f;
+            const float *row = wkt + static_cast<size_t>(k) * m.QK;
+            for (int i = 0; i < m.QK; ++i)
+                acc += row[i] * qh[i];
+            qabs[static_cast<size_t>(k)] = acc;
+        }
+        for (int t = 0; t < m.T; ++t) {
+            const float *ct = m.cache + static_cast<size_t>(t) * m.stride;
+            float s = 0.f;
+            for (int i = 0; i < m.L; ++i)
+                s += qabs[static_cast<size_t>(i)] * ct[i];
+            for (int i = 0; i < m.R; ++i)
+                s += qh[m.QK + i] * ct[m.L + i];
+            scores[static_cast<size_t>(t)] = s * scale;
+        }
+        quant::softmax_inplace(scores.data(), m.T);
+        std::fill(pooled.begin(), pooled.end(), 0.f);
+        for (int t = 0; t < m.T; ++t) {
+            const float *ct = m.cache + static_cast<size_t>(t) * m.stride;
+            const float a = scores[static_cast<size_t>(t)];
+            for (int i = 0; i < m.L; ++i)
+                pooled[static_cast<size_t>(i)] += a * ct[i];
+        }
+        float *ch = ctx + static_cast<size_t>(h) * m.Vh;
+        const float *wv = m.w_v + static_cast<size_t>(h) * m.Vh * m.L;
+        for (int v = 0; v < m.Vh; ++v) {
+            float acc = 0.f;
+            const float *row = wv + static_cast<size_t>(v) * m.L;
+            for (int i = 0; i < m.L; ++i)
+                acc += row[i] * pooled[static_cast<size_t>(i)];
+            ch[v] = acc;
+        }
+    }
+}
+
+void cpu_layer_decode_mla(const MlaAbsorb &m, float *x, const float *post_ln, int D, float eps,
+                          float *nrm_out) {
+    const int hv = m.H * m.Vh;
+    std::vector<float> ctx(static_cast<size_t>(std::max(hv, D)), 0.f);
+    cpu_mla_absorb(ctx.data(), m);
+    if (m.w_o)
+        quant::matmul_f32(m.oh, ctx.data(), m.w_o, 1, hv, D);
+    else
+        std::memcpy(m.oh, ctx.data(), static_cast<size_t>(std::max(hv, D)) * sizeof(float));
+    cpu_layer_decode_full(x, m.oh, nullptr, post_ln, nullptr, nullptr, nullptr, D, 0, eps,
+                          Act::Silu, 0.f, 0.f, nullptr, nullptr, 0, 0, 1.f, nullptr, nrm_out,
+                          nullptr, nullptr, nullptr);
+}
+
 void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
                    const void *const *u, const void *const *d, const float *const *gs,
                    const float *const *us, const float *const *ds, const float *xg, const int *xoff,
@@ -464,7 +564,7 @@ void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *cons
             base += nre;
             continue;
         }
-        if (fmt == 4 && (!gs || !us || !ds || !gs[e] || !us[e] || !ds[e])) {
+        if ((fmt == 4 || fmt == 7) && (!gs || !us || !ds || !gs[e] || !us[e] || !ds[e])) {
             base += nre;
             continue;
         }
@@ -478,6 +578,17 @@ void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *cons
             apply_act(gate.data(), up.data(), nre * Iinter, act, act_a, act_b);
             quant::matmul_f32(hh.data(), gate.data(), static_cast<const float *>(d[e]), nre, Iinter,
                               D);
+        } else if (fmt == 7) {
+            const uint8_t *gsc = reinterpret_cast<const uint8_t *>(gs[e]);
+            const uint8_t *usc = reinterpret_cast<const uint8_t *>(us[e]);
+            const uint8_t *dsc = reinterpret_cast<const uint8_t *>(ds[e]);
+            quant::matmul_mxfp4(gate.data(), xe, static_cast<const uint8_t *>(g[e]), gsc, nre, D,
+                                Iinter);
+            quant::matmul_mxfp4(up.data(), xe, static_cast<const uint8_t *>(u[e]), usc, nre, D,
+                                Iinter);
+            apply_act(gate.data(), up.data(), nre * Iinter, act, act_a, act_b);
+            quant::matmul_mxfp4(hh.data(), gate.data(), static_cast<const uint8_t *>(d[e]), dsc, nre,
+                                Iinter, D);
         } else {
             quant::matmul_int4_g64(gate.data(), xe, static_cast<const uint8_t *>(g[e]), gs[e], nre,
                                    D, Iinter);
@@ -561,6 +672,7 @@ void drop_metal() {
     g_p_kda = nil;
     g_p_gemm_f32 = nil;
     g_p_gemm_i4 = nil;
+    g_p_gemm_mx = nil;
     g_queue = nil;
     g_dev = nil;
     g_use_metal = false;
@@ -603,6 +715,7 @@ bool init() {
         g_p_kda = pso("op_kda_fused");
         g_p_gemm_f32 = pso("op_gemm_f32");
         g_p_gemm_i4 = pso("op_gemm_int4_g64");
+        g_p_gemm_mx = pso("op_gemm_mxfp4");
         if (g_p_rms && g_p_add && g_p_silu)
             g_use_metal = true;
         else
@@ -1051,19 +1164,75 @@ bool layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, const f
     return true;
 }
 
+bool layer_decode_mla(const MlaAbsorb &mla, float *x, const float *post_ln, int D, float eps,
+                      float *nrm_out) {
+    if (!mla_args_ok(mla, x, post_ln, D, nrm_out))
+        return false;
+    const int hv = mla.H * mla.Vh;
+    const bool want_wo = mla.w_o != nullptr;
+    if (!g_use_metal || !g_p_add || !g_p_rms || (want_wo && !g_p_gemm_f32)) {
+        cpu_layer_decode_mla(mla, x, post_ln, D, eps, nrm_out);
+        return true;
+    }
+    std::vector<float> ctx(static_cast<size_t>(std::max(hv, D)), 0.f);
+    cpu_mla_absorb(ctx.data(), mla);
+    if (!want_wo)
+        std::memcpy(mla.oh, ctx.data(), static_cast<size_t>(std::max(hv, D)) * sizeof(float));
+    @autoreleasepool {
+        const size_t db = sizeof(float) * static_cast<size_t>(D);
+        const size_t hb = sizeof(float) * static_cast<size_t>(hv);
+        const size_t wob = want_wo ? sizeof(float) * static_cast<size_t>(D) * hv : 0;
+        id<MTLBuffer> bx = buf_bytes(x, db);
+        id<MTLBuffer> bw = buf_bytes(post_ln, db);
+        id<MTLBuffer> bn = buf_empty(db);
+        id<MTLBuffer> bctx = want_wo ? buf_bytes(ctx.data(), hb) : buf_bytes(mla.oh, db);
+        id<MTLBuffer> bwo = want_wo ? buf_bytes(mla.w_o, wob) : nil;
+        id<MTLBuffer> boh = want_wo ? buf_empty(db) : bctx;
+        if (!bx || !bw || !bn || !bctx || (want_wo && (!bwo || !boh))) {
+            cpu_layer_decode_mla(mla, x, post_ln, D, eps, nrm_out);
+            return true;
+        }
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+        if (!cb || !enc) {
+            cpu_layer_decode_mla(mla, x, post_ln, D, eps, nrm_out);
+            return true;
+        }
+        if (want_wo) {
+            GemmArgs go{1, hv, D, 0};
+            dispatch2(enc, g_p_gemm_f32, static_cast<uint>(D), 1u, @[ bctx, bwo, boh ], &go,
+                      sizeof(go));
+        }
+        ElemArgs ea{D};
+        dispatch1(enc, g_p_add, static_cast<uint>(D), @[ bx, boh ], &ea, sizeof(ea));
+        RmsArgs ra{1, D, eps, 1};
+        dispatch1(enc, g_p_rms, 1u, @[ bx, bw, bn ], &ra, sizeof(ra));
+        if (!commit_wait(cb, enc)) {
+            cpu_layer_decode_mla(mla, x, post_ln, D, eps, nrm_out);
+            return true;
+        }
+        std::memcpy(mla.oh, [boh contents], db);
+        std::memcpy(x, [bx contents], db);
+        std::memcpy(nrm_out, [bn contents], db);
+    }
+    return true;
+}
+
 bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
                const void *const *u, const void *const *d, const float *const *gs,
                const float *const *us, const float *const *ds, const float *xg, const int *xoff,
                const int *nr, const int *rows, const float *rw, float *out, int S, Act act,
                float act_a, float act_b) {
-    if (nb < 1 || D < 1 || !out || !xg || (fmt != 0 && fmt != 4))
+    if (nb < 1 || D < 1 || !out || !xg || (fmt != 0 && fmt != 4 && fmt != 7))
         return false;
     if (!xoff || !nr)
         return false;
     const bool use_i4 = fmt == 4;
+    const bool use_mx = fmt == 7;
     const bool need_act = act != Act::Silu;
     const bool metal_ok = g_use_metal && (need_act ? g_p_act : g_p_silu) &&
-                          ((use_i4 && g_p_gemm_i4) || (!use_i4 && g_p_gemm_f32));
+                          ((use_i4 && g_p_gemm_i4) || (use_mx && g_p_gemm_mx) ||
+                           (!use_i4 && !use_mx && g_p_gemm_f32));
     if (!metal_ok || Iinter < 1) {
         cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, S,
                       act, act_a, act_b);
@@ -1103,6 +1272,8 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
         const size_t pack_d = static_cast<size_t>(D) * static_cast<size_t>((Iinter + 1) / 2);
         const size_t sc_d =
             sizeof(float) * static_cast<size_t>(D) * static_cast<size_t>((Iinter + group - 1) / group);
+        const size_t mx_sc_go = static_cast<size_t>(Iinter) * static_cast<size_t>((D + 31) / 32);
+        const size_t mx_sc_d = static_cast<size_t>(D) * static_cast<size_t>((Iinter + 31) / 32);
         const size_t f32_go = sizeof(float) * static_cast<size_t>(Iinter) * static_cast<size_t>(D);
         const size_t f32_d = sizeof(float) * static_cast<size_t>(D) * static_cast<size_t>(Iinter);
 
@@ -1115,7 +1286,7 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
             if (nre <= 0)
                 continue;
             if (!g || !u || !d || !g[e] || !u[e] || !d[e] ||
-                (use_i4 && (!gs || !us || !ds || !gs[e] || !us[e] || !ds[e]))) {
+                ((use_i4 || use_mx) && (!gs || !us || !ds || !gs[e] || !us[e] || !ds[e]))) {
                 base += nre;
                 continue;
             }
@@ -1134,12 +1305,20 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
                 bgs = buf_bytes(gs[e], sc_go);
                 bus = buf_bytes(us[e], sc_go);
                 bds = buf_bytes(ds[e], sc_d);
+            } else if (use_mx) {
+                bg = buf_bytes(g[e], pack_go);
+                bu = buf_bytes(u[e], pack_go);
+                bd = buf_bytes(d[e], pack_d);
+                bgs = buf_bytes(gs[e], mx_sc_go);
+                bus = buf_bytes(us[e], mx_sc_go);
+                bds = buf_bytes(ds[e], mx_sc_d);
             } else {
                 bg = buf_bytes(g[e], f32_go);
                 bu = buf_bytes(u[e], f32_go);
                 bd = buf_bytes(d[e], f32_d);
             }
-            if (!bxe || !bgate || !bup || !bhh || !bg || !bu || !bd || (use_i4 && (!bgs || !bus || !bds))) {
+            if (!bxe || !bgate || !bup || !bhh || !bg || !bu || !bd ||
+                ((use_i4 || use_mx) && (!bgs || !bus || !bds))) {
                 ok = false;
                 break;
             }
@@ -1149,7 +1328,7 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
             keep.push_back(bg);
             keep.push_back(bu);
             keep.push_back(bd);
-            if (use_i4) {
+            if (use_i4 || use_mx) {
                 keep.push_back(bgs);
                 keep.push_back(bus);
                 keep.push_back(bds);
@@ -1160,6 +1339,11 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
                 dispatch2(enc, g_p_gemm_i4, static_cast<uint>(Iinter), static_cast<uint>(nre),
                           @[ bxe, bg, bgs, bgate ], &ag, sizeof(ag));
                 dispatch2(enc, g_p_gemm_i4, static_cast<uint>(Iinter), static_cast<uint>(nre),
+                          @[ bxe, bu, bus, bup ], &ag, sizeof(ag));
+            } else if (use_mx) {
+                dispatch2(enc, g_p_gemm_mx, static_cast<uint>(Iinter), static_cast<uint>(nre),
+                          @[ bxe, bg, bgs, bgate ], &ag, sizeof(ag));
+                dispatch2(enc, g_p_gemm_mx, static_cast<uint>(Iinter), static_cast<uint>(nre),
                           @[ bxe, bu, bus, bup ], &ag, sizeof(ag));
             } else {
                 dispatch2(enc, g_p_gemm_f32, static_cast<uint>(Iinter), static_cast<uint>(nre),
@@ -1178,6 +1362,9 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
             }
             if (use_i4) {
                 dispatch2(enc, g_p_gemm_i4, static_cast<uint>(D), static_cast<uint>(nre),
+                          @[ bgate, bd, bds, bhh ], &ad, sizeof(ad));
+            } else if (use_mx) {
+                dispatch2(enc, g_p_gemm_mx, static_cast<uint>(D), static_cast<uint>(nre),
                           @[ bgate, bd, bds, bhh ], &ad, sizeof(ad));
             } else {
                 dispatch2(enc, g_p_gemm_f32, static_cast<uint>(D), static_cast<uint>(nre),

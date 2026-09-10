@@ -575,6 +575,32 @@ void apply_block(float *x, int N, int hidden, int heads, int hd, const std::vect
                  const std::vector<float> &scale1, const std::vector<float> &norm2,
                  const std::vector<float> &w1, const std::vector<float> &b1, const std::vector<float> &w2,
                  const std::vector<float> &b2, const std::vector<float> &scale2) {
+    int ffn = 0;
+    if (!w1.empty() && hidden > 0 && (static_cast<int>(w1.size()) % hidden) == 0) {
+        const int w1o = static_cast<int>(w1.size() / hidden);
+        if (w1o >= 2 && (w1o % 2) == 0)
+            ffn = w1o / 2;
+    }
+    ensure_metal_h3();
+    if (metal_h3::vae_transformer_block(
+            x, N, hidden, heads, hd,
+            norm1.size() == static_cast<size_t>(hidden) ? norm1.data() : nullptr,
+            (!qkv_w.empty() && static_cast<int>(qkv_w.size()) == 3 * hidden * hidden) ? qkv_w.data()
+                                                                                     : nullptr,
+            qkv_b.size() == static_cast<size_t>(3 * hidden) ? qkv_b.data() : nullptr,
+            (!out_w.empty() && static_cast<int>(out_w.size()) == hidden * hidden) ? out_w.data()
+                                                                                 : nullptr,
+            out_b.size() == static_cast<size_t>(hidden) ? out_b.data() : nullptr,
+            scale1.size() == static_cast<size_t>(hidden) ? scale1.data() : nullptr,
+            norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr,
+            ffn > 0 ? w1.data() : nullptr,
+            (ffn > 0 && b1.size() == static_cast<size_t>(2 * ffn)) ? b1.data() : nullptr,
+            (ffn > 0 && !w2.empty() && static_cast<int>(w2.size()) == hidden * ffn) ? w2.data()
+                                                                                   : nullptr,
+            (ffn > 0 && b2.size() == static_cast<size_t>(hidden)) ? b2.data() : nullptr,
+            scale2.size() == static_cast<size_t>(hidden) ? scale2.data() : nullptr, ffn, kRmsEps))
+        return;
+
     std::vector<float> nrm(static_cast<size_t>(N) * hidden);
     const float *nw = norm1.size() == static_cast<size_t>(hidden) ? norm1.data() : nullptr;
     rmsnorm_rows(x, nw, nrm.data(), N, hidden, kRmsEps);

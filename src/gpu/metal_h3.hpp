@@ -32,5 +32,43 @@ bool nax_mlp(float *y, const float *x, const float *w_up, const float *w_down, i
 // via a separate buffer; here y is nrm_out and x is updated.
 bool vae_rms_add(float *x, const float *skip, const float *w, float *y, int n, float eps);
 
+// VAE transformer block matching host apply_block: RMS → QKV SDPA → out →
+// residual RMS → SwiGLU FFN. x is [tokens, hidden]. QKV/out/w1/w2 are F32 [O,I]
+// row-major (quant::matmul_f32). QKV is packed [q|k|v] per row, size [3*hidden,
+// hidden]. Official [seq,heads,3,hd]+rope is not handled (returns false).
+// Optional biases / scale1 / scale2 may be null. w1 is [2*ffn, hidden], w2 is
+// [hidden, ffn]. Returns false on bad args / size mismatch.
+bool vae_transformer_block(float *x, int tokens, int hidden, int heads, int hd,
+                           const float *norm1, const float *qkv_w, const float *qkv_b,
+                           const float *out_w, const float *out_b, const float *scale1,
+                           const float *norm2, const float *w1, const float *b1,
+                           const float *w2, const float *b2, const float *scale2, int ffn,
+                           float eps);
+
+// Vision tower block matching host run_block: LN → QKV → optional RoPE →
+// SDPA → proj → residual → LN → GELU-tanh MLP → residual. x is [rows,
+// hidden]. QKV/proj/fc are F32 [O,I]. LN weights/biases and linear biases
+// may be null. rope_cos/sin are [rows, rope_half] or null. Returns false on
+// bad args / heads*hd != hidden / missing qkv.
+bool vision_block(float *x, int rows, int hidden, int heads, int hd, int intermediate,
+                  const float *norm1_w, const float *norm1_b, const float *qkv_w,
+                  const float *qkv_b, const float *proj_w, const float *proj_b,
+                  const float *norm2_w, const float *norm2_b, const float *fc1_w,
+                  const float *fc1_b, const float *fc2_w, const float *fc2_b,
+                  const float *rope_cos, const float *rope_sin, int rope_half, float eps);
+
+// Audio VAE pre_block: LN(seq) → QKV (+q/k/v bias) → causal SDPA over B
+// batches of length L → pool first `ch` of each row → proj → base += attn
+// → LN → LN → GELU-gate MLP → base += mlp. seq is [B*L, C], base is
+// [B*L, ch]. QKV is [3C,C], proj [ch,ch], w0/w1 [2ch,ch], w2 [ch,2ch].
+// Returns false on bad args / missing qkv / heads do not divide C.
+bool audio_pre_block(float *base, const float *seq, int B, int L, int C, int ch, int heads,
+                     const float *norm1_w, const float *norm1_b, const float *qkv_w,
+                     const float *q_bias, const float *k_bias, const float *v_bias,
+                     const float *proj_w, const float *proj_b, const float *norm2_w,
+                     const float *norm2_b, const float *mlp_norm_w, const float *mlp_norm_b,
+                     const float *w0, const float *b0, const float *w1, const float *b1,
+                     const float *w2, const float *b2, float eps);
+
 } // namespace metal_h3
 } // namespace mvllm
