@@ -56,16 +56,18 @@ no `--family` flag.
 `--device cpu|metal|cuda` (or `MVLLM_DEVICE`) selects the compute backend.
 Default is `cpu` so tests stay deterministic.
 
-- K3 / GLM: Metal residual + post-LN (`layer_decode`). GLM may also batch
-  routed experts with `moe_block` when `swiglu_limit<=0` (plain SiLU).
-  Official GLM Flash keeps clamped-SwiGLU on the host. K3 never uses
-  `moe_block` (SiTU-GLU).
-- H3: Metal AdaLN residual when present (`info` has `h3gpu=`).
+- K3 / GLM: Metal residual + post-LN (`layer_decode`). S=1 decode may fuse
+  KDA (`layer_decode_kda`) or absorbed MLA (`layer_decode_mla`) into that
+  tail. GLM routed int4 uses `moe_block` with clamped-SwiGLU. K3 F32
+  dense/shared uses SiTU; routed MXFP4 uses `moe_block` fmt 7 (SiTU)
+  before `coli_cuda` / host.
+- H3: Metal AdaLN residual (`h3gpu=`), plus VAE / vision / audio blocks
+  when the op matches (`int8=` / `nax=`).
 - CUDA (`-DMVLLM_GPU_CUDA=ON`): K3/GLM expert GEMM via `coli_cuda`; DSV4
   route / mHC / sparse attn via `dsv4_cuda` when shapes match.
 
 `info` tags: `coli=cpu|cuda|off`, `metal=cpu|metal|off`, `tier=cpu|cuda|off`
-(DSV4), `h3gpu=…`, `ckpt=N hits=M`.
+(DSV4), `h3gpu=…`, `mtp=off|loaded|markov|fwd`, `ckpt=N hits=M`.
 
 Also: `--expert-gb N`, `--kv-slots N` (serve/mux, 1–16).
 
@@ -94,7 +96,8 @@ HF snapshot or colibri pack. Official MXFP4 expert shards load as-is
 - LRU RAM: `MVLLM_EXPERT_GB` / `K3_EXPERT_GB` or `--expert-gb`. Dense bits:
   `MVLLM_BITS` / `K3_BITS`.
 - `info` includes `coli=` and `metal=`. `--device metal` runs residual +
-  post-LN on Metal; experts stay MXFP4 + SiTU on host/`coli_cuda`.
+  post-LN, optional fused KDA/MLA, F32 SiTU dense/shared, and routed
+  MXFP4 via `moe_block` fmt 7. Fallback is host / `coli_cuda`.
 
 Empty / fixture dirs (`fixtures/kimi_k3_tiny`) use a synthetic expert pack.
 
@@ -116,6 +119,8 @@ image token is in the prompt.
 - Chat: `[gMASK]<sop><|user|>…<|assistant|><think>`.
 - Experts on disk: `gate/up/down_proj.weight` + `.qs` scales.
 - Env: `GLM53_EXPERT_GB`, `GLM53_BITS`. `info` includes `coli=` and `metal=`.
+- `--device metal` runs residual + post-LN, fused KDA/MLA when it fits,
+  and routed int4 `moe_block` with clamped-SwiGLU (including `swiglu_limit>0`).
 - GLM-5.2 HF trees (same `glm*` / `text_config` markers) use this engine.
 
 ## DeepSeek V4 Flash
@@ -134,6 +139,10 @@ to a synthetic pack so tiny dirs still `generate`.
 - Prefix checkpoints: `V4_PREFIX_CKPT` (default on), disk under
   `<model>/.coli_ckpt/`. Aliases `MVLLM_PREFIX_CKPT*`. `info` shows
   `ckpt=N hits=M` and `tier=cpu|cuda|off`.
+- Prefill chunks: `COLI_PREFILL_CHUNK` / `V4_PREFILL_CHUNK` (layer-major).
+- Draft: `V4_DRAFT` / `MVLLM_V4_DRAFT` (prompt bigram). `V4_MTP` uses
+  loaded markov heads when `[V,rank]` matches, else `main_proj`/`wq_a`/
+  confidence (`info` has `mtp=` / `draft=` / `dacc=`).
 - With CUDA: top-6 `route`, mHC pre, and sparse attn (zero sinks) go
   through `dsv4_cuda`; otherwise the host kernels. Indexer stays on host.
 - Dump env: `MVLLM_DUMP_DSV4` / `COLI_DUMP_DSV4`.
@@ -152,7 +161,9 @@ Not an LLM. Use `video` or `POST /v1/videos/generations`.
 
 - Layout: `FL2VA/{transformer,video_vae,audio_vae,text_encoder}` or the model root.
 - DiT blocks stream four BF16 matrices through a 2-slot SSD window.
-- `--device metal` runs AdaLN residual on Metal when available (`info` has `h3gpu=`).
+- `--device metal` runs AdaLN residual, VAE transformer blocks, vision
+  LN/SDPA/GELU, and audio pre-blocks when the tensors match (`info` has
+  `h3gpu=` / `int8=` / `nax=`).
 - WAV/MP4 via ffmpeg when present; otherwise a written WAV/raw path still works in tests.
 
 ## Llama

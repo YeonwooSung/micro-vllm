@@ -2376,6 +2376,143 @@ static void test_metal_ops_tier() {
         CHECK_NEAR(metal_ops_moe_out[2], metal_ops_moe_ref[2], 1e-4);
         CHECK_NEAR(metal_ops_moe_out[3], metal_ops_moe_ref[3], 1e-4);
     }
+
+    {
+        const int metal_ops_ldk_H = 2, metal_ops_ldk_hd = 4, metal_ops_ldk_K = 4, metal_ops_ldk_P = 8;
+        std::vector<float> metal_ops_ldk_wq(static_cast<size_t>(metal_ops_ldk_P) * metal_ops_ldk_K, 0.f);
+        std::vector<float> metal_ops_ldk_wk(static_cast<size_t>(metal_ops_ldk_P) * metal_ops_ldk_K, 0.f);
+        std::vector<float> metal_ops_ldk_wv(static_cast<size_t>(metal_ops_ldk_P) * metal_ops_ldk_K, 0.f);
+        std::vector<float> metal_ops_ldk_qt(metal_ops_ldk_P, 0.1f);
+        std::vector<float> metal_ops_ldk_kt(metal_ops_ldk_P, 0.2f);
+        std::vector<float> metal_ops_ldk_tv(metal_ops_ldk_P, 0.3f);
+        std::vector<float> metal_ops_ldk_tq(static_cast<size_t>(metal_ops_ldk_P) * metal_ops_ldk_K, 0.f);
+        std::vector<float> metal_ops_ldk_tk(static_cast<size_t>(metal_ops_ldk_P) * metal_ops_ldk_K, 0.f);
+        std::vector<float> metal_ops_ldk_tvp(static_cast<size_t>(metal_ops_ldk_P) * metal_ops_ldk_K, 0.f);
+        for (int p = 0; p < metal_ops_ldk_P; ++p) {
+            metal_ops_ldk_tq[static_cast<size_t>(p) * metal_ops_ldk_K + (metal_ops_ldk_K - 1)] = 1.f;
+            metal_ops_ldk_tk[static_cast<size_t>(p) * metal_ops_ldk_K + (metal_ops_ldk_K - 1)] = 1.f;
+            metal_ops_ldk_tvp[static_cast<size_t>(p) * metal_ops_ldk_K + (metal_ops_ldk_K - 1)] = 1.f;
+        }
+        std::vector<float> metal_ops_ldk_S(
+            static_cast<size_t>(metal_ops_ldk_H) * metal_ops_ldk_hd * metal_ops_ldk_hd, 0.f);
+        std::vector<float> metal_ops_ldk_al(static_cast<size_t>(metal_ops_ldk_H) * metal_ops_ldk_hd, 1.f);
+        std::vector<float> metal_ops_ldk_be(metal_ops_ldk_H, 0.5f);
+        std::vector<float> metal_ops_ldk_oh(static_cast<size_t>(metal_ops_ldk_P), 0.f);
+        KdaToken metal_ops_ldk_tok{};
+        metal_ops_ldk_tok.win_q = metal_ops_ldk_wq.data();
+        metal_ops_ldk_tok.qt = metal_ops_ldk_qt.data();
+        metal_ops_ldk_tok.win_k = metal_ops_ldk_wk.data();
+        metal_ops_ldk_tok.kt = metal_ops_ldk_kt.data();
+        metal_ops_ldk_tok.win_v = metal_ops_ldk_wv.data();
+        metal_ops_ldk_tok.tv = metal_ops_ldk_tv.data();
+        metal_ops_ldk_tok.taps_q = metal_ops_ldk_tq.data();
+        metal_ops_ldk_tok.taps_k = metal_ops_ldk_tk.data();
+        metal_ops_ldk_tok.taps_v = metal_ops_ldk_tvp.data();
+        metal_ops_ldk_tok.S = metal_ops_ldk_S.data();
+        metal_ops_ldk_tok.alpha = metal_ops_ldk_al.data();
+        metal_ops_ldk_tok.beta = metal_ops_ldk_be.data();
+        metal_ops_ldk_tok.oh = metal_ops_ldk_oh.data();
+        metal_ops_ldk_tok.P = metal_ops_ldk_P;
+        metal_ops_ldk_tok.K = metal_ops_ldk_K;
+        metal_ops_ldk_tok.H = metal_ops_ldk_H;
+        metal_ops_ldk_tok.hd = metal_ops_ldk_hd;
+        float metal_ops_ldk_x[8] = {1.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        const float metal_ops_ldk_post[8] = {1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f};
+        float metal_ops_ldk_nrm[8] = {};
+        const bool metal_ops_ldk =
+            layer_decode_kda(metal_ops_ldk_tok, metal_ops_ldk_x, nullptr, metal_ops_ldk_post, nullptr,
+                             nullptr, nullptr, 8, 0, 1e-6f, Act::Silu, 0.f, 0.f, nullptr, nullptr, 0,
+                             0, 1.f, nullptr, metal_ops_ldk_nrm, nullptr, nullptr, nullptr);
+        CHECK(metal_ops_ldk);
+        bool metal_ops_ldk_fin = std::isfinite(metal_ops_ldk_nrm[0]) && std::isfinite(metal_ops_ldk_oh[0]);
+        for (int i = 1; i < 8; ++i)
+            metal_ops_ldk_fin = metal_ops_ldk_fin && std::isfinite(metal_ops_ldk_nrm[i]) &&
+                                std::isfinite(metal_ops_ldk_oh[i]);
+        CHECK(metal_ops_ldk_fin);
+        CHECK(metal_ops_ldk_x[0] != 0.f);
+    }
+
+    {
+        const int metal_ops_ldm_H = 1, metal_ops_ldm_QK = 2, metal_ops_ldm_R = 0, metal_ops_ldm_V = 2,
+                  metal_ops_ldm_L = 2, metal_ops_ldm_D = 2;
+        const float metal_ops_ldm_q[2] = {0.5f, -0.25f};
+        const float metal_ops_ldm_c[2] = {1.f, 0.f};
+        const float metal_ops_ldm_kt[4] = {1.f, 0.f, 0.f, 1.f};
+        const float metal_ops_ldm_v[4] = {1.f, 0.f, 0.f, 1.f};
+        const float metal_ops_ldm_o[4] = {1.f, 0.f, 0.f, 1.f};
+        float metal_ops_ldm_oh[2] = {};
+        MlaAbsorb metal_ops_ldm_abs{};
+        metal_ops_ldm_abs.q = metal_ops_ldm_q;
+        metal_ops_ldm_abs.cache = metal_ops_ldm_c;
+        metal_ops_ldm_abs.w_kt = metal_ops_ldm_kt;
+        metal_ops_ldm_abs.w_v = metal_ops_ldm_v;
+        metal_ops_ldm_abs.w_o = metal_ops_ldm_o;
+        metal_ops_ldm_abs.oh = metal_ops_ldm_oh;
+        metal_ops_ldm_abs.H = metal_ops_ldm_H;
+        metal_ops_ldm_abs.QK = metal_ops_ldm_QK;
+        metal_ops_ldm_abs.R = metal_ops_ldm_R;
+        metal_ops_ldm_abs.Vh = metal_ops_ldm_V;
+        metal_ops_ldm_abs.L = metal_ops_ldm_L;
+        metal_ops_ldm_abs.stride = metal_ops_ldm_L + metal_ops_ldm_R;
+        metal_ops_ldm_abs.T = 1;
+        float metal_ops_ldm_x[2] = {0.f, 0.f};
+        const float metal_ops_ldm_post[2] = {1.f, 1.f};
+        float metal_ops_ldm_nrm[2] = {};
+        const bool metal_ops_ldm =
+            layer_decode_mla(metal_ops_ldm_abs, metal_ops_ldm_x, metal_ops_ldm_post, metal_ops_ldm_D,
+                             1e-6f, metal_ops_ldm_nrm);
+        CHECK(metal_ops_ldm);
+        CHECK(std::isfinite(metal_ops_ldm_nrm[0]) && std::isfinite(metal_ops_ldm_nrm[1]));
+        CHECK(std::isfinite(metal_ops_ldm_oh[0]) && std::isfinite(metal_ops_ldm_x[0]));
+    }
+
+    {
+        const int metal_ops_mx_I = 32, metal_ops_mx_O = 32;
+        std::vector<float> metal_ops_mx_wf(static_cast<size_t>(metal_ops_mx_O) * metal_ops_mx_I, 0.f);
+        for (int i = 0; i < metal_ops_mx_I; ++i)
+            metal_ops_mx_wf[static_cast<size_t>(i) * metal_ops_mx_I + i] = 0.5f;
+        const int metal_ops_mx_pb = metal_ops_mx_O * ((metal_ops_mx_I + 1) / 2);
+        const int metal_ops_mx_sb = metal_ops_mx_O * ((metal_ops_mx_I + 31) / 32);
+        std::vector<uint8_t> metal_ops_mx_gp(static_cast<size_t>(metal_ops_mx_pb));
+        std::vector<uint8_t> metal_ops_mx_up(static_cast<size_t>(metal_ops_mx_pb));
+        std::vector<uint8_t> metal_ops_mx_dp(static_cast<size_t>(metal_ops_mx_pb));
+        std::vector<uint8_t> metal_ops_mx_gs(static_cast<size_t>(metal_ops_mx_sb));
+        std::vector<uint8_t> metal_ops_mx_us(static_cast<size_t>(metal_ops_mx_sb));
+        std::vector<uint8_t> metal_ops_mx_ds(static_cast<size_t>(metal_ops_mx_sb));
+        mvllm::quant::pack_mxfp4(metal_ops_mx_wf.data(), metal_ops_mx_O, metal_ops_mx_I,
+                                 metal_ops_mx_gp.data(), metal_ops_mx_gs.data());
+        mvllm::quant::pack_mxfp4(metal_ops_mx_wf.data(), metal_ops_mx_O, metal_ops_mx_I,
+                                 metal_ops_mx_up.data(), metal_ops_mx_us.data());
+        mvllm::quant::pack_mxfp4(metal_ops_mx_wf.data(), metal_ops_mx_I, metal_ops_mx_O,
+                                 metal_ops_mx_dp.data(), metal_ops_mx_ds.data());
+        const void *metal_ops_mx_g[1] = {metal_ops_mx_gp.data()};
+        const void *metal_ops_mx_u[1] = {metal_ops_mx_up.data()};
+        const void *metal_ops_mx_d[1] = {metal_ops_mx_dp.data()};
+        const float *metal_ops_mx_gsp[1] = {reinterpret_cast<const float *>(metal_ops_mx_gs.data())};
+        const float *metal_ops_mx_usp[1] = {reinterpret_cast<const float *>(metal_ops_mx_us.data())};
+        const float *metal_ops_mx_dsp[1] = {reinterpret_cast<const float *>(metal_ops_mx_ds.data())};
+        std::vector<float> metal_ops_mx_x(static_cast<size_t>(metal_ops_mx_I), 0.f);
+        metal_ops_mx_x[0] = 1.f;
+        const int metal_ops_mx_xoff[1] = {0};
+        const int metal_ops_mx_nr[1] = {1};
+        const int metal_ops_mx_rows[1] = {0};
+        const float metal_ops_mx_rw[1] = {1.f};
+        std::vector<float> metal_ops_mx_out(static_cast<size_t>(metal_ops_mx_I), 0.f);
+        const bool metal_ops_mx =
+            moe_block(1, metal_ops_mx_I, metal_ops_mx_O, 7, 32, metal_ops_mx_g, metal_ops_mx_u,
+                      metal_ops_mx_d, metal_ops_mx_gsp, metal_ops_mx_usp, metal_ops_mx_dsp,
+                      metal_ops_mx_x.data(), metal_ops_mx_xoff, metal_ops_mx_nr, metal_ops_mx_rows,
+                      metal_ops_mx_rw, metal_ops_mx_out.data(), 1, Act::Situ, 4.f, 25.f);
+        CHECK(metal_ops_mx);
+        bool metal_ops_mx_fin = true;
+        float metal_ops_mx_e = 0.f;
+        for (float v : metal_ops_mx_out) {
+            metal_ops_mx_fin = metal_ops_mx_fin && std::isfinite(v);
+            metal_ops_mx_e += v * v;
+        }
+        CHECK(metal_ops_mx_fin);
+        CHECK(metal_ops_mx_e > 0.f);
+    }
 }
 
 static void test_metal_h3_tier() {
@@ -2439,6 +2576,82 @@ static void test_metal_h3_tier() {
         CHECK(metal_h3_vae);
         CHECK(metal_h3_vx[0] != 0.f && metal_h3_vx[1] != 0.f);
         CHECK(std::isfinite(metal_h3_vy[0]));
+    }
+
+    {
+        const int metal_h3_vb_rows = 2, metal_h3_vb_H = 4, metal_h3_vb_heads = 2, metal_h3_vb_hd = 2,
+                  metal_h3_vb_I = 4;
+        std::vector<float> metal_h3_vb_x(static_cast<size_t>(metal_h3_vb_rows) * metal_h3_vb_H, 0.1f);
+        metal_h3_vb_x[0] = 1.f;
+        std::vector<float> metal_h3_vb_qkv(static_cast<size_t>(3 * metal_h3_vb_H) * metal_h3_vb_H, 0.f);
+        std::vector<float> metal_h3_vb_proj(static_cast<size_t>(metal_h3_vb_H) * metal_h3_vb_H, 0.f);
+        std::vector<float> metal_h3_vb_fc1(static_cast<size_t>(metal_h3_vb_I) * metal_h3_vb_H, 0.f);
+        std::vector<float> metal_h3_vb_fc2(static_cast<size_t>(metal_h3_vb_H) * metal_h3_vb_I, 0.f);
+        for (int i = 0; i < metal_h3_vb_H; ++i) {
+            metal_h3_vb_proj[static_cast<size_t>(i) * metal_h3_vb_H + i] = 1.f;
+            metal_h3_vb_qkv[static_cast<size_t>(i) * metal_h3_vb_H + i] = 0.2f;
+            metal_h3_vb_fc1[static_cast<size_t>(i) * metal_h3_vb_H + i] = 0.2f;
+            metal_h3_vb_fc2[static_cast<size_t>(i) * metal_h3_vb_I + i] = 0.2f;
+        }
+        const bool metal_h3_vb = vision_block(
+            metal_h3_vb_x.data(), metal_h3_vb_rows, metal_h3_vb_H, metal_h3_vb_heads, metal_h3_vb_hd,
+            metal_h3_vb_I, nullptr, nullptr, metal_h3_vb_qkv.data(), nullptr, metal_h3_vb_proj.data(),
+            nullptr, nullptr, nullptr, metal_h3_vb_fc1.data(), nullptr, metal_h3_vb_fc2.data(),
+            nullptr, nullptr, nullptr, 0, 1e-6f);
+        CHECK(metal_h3_vb);
+        CHECK(std::isfinite(metal_h3_vb_x[0]) && std::isfinite(metal_h3_vb_x[1]));
+    }
+
+    {
+        const int metal_h3_ap_B = 1, metal_h3_ap_L = 2, metal_h3_ap_C = 4, metal_h3_ap_ch = 4,
+                  metal_h3_ap_heads = 2;
+        std::vector<float> metal_h3_ap_seq(static_cast<size_t>(metal_h3_ap_B * metal_h3_ap_L) *
+                                               metal_h3_ap_C,
+                                           0.1f);
+        metal_h3_ap_seq[0] = 1.f;
+        std::vector<float> metal_h3_ap_base(metal_h3_ap_seq.size(), 0.f);
+        std::vector<float> metal_h3_ap_qkv(static_cast<size_t>(3 * metal_h3_ap_C) * metal_h3_ap_C, 0.f);
+        std::vector<float> metal_h3_ap_proj(static_cast<size_t>(metal_h3_ap_ch) * metal_h3_ap_ch, 0.f);
+        std::vector<float> metal_h3_ap_w0(static_cast<size_t>(2 * metal_h3_ap_ch) * metal_h3_ap_ch, 0.f);
+        std::vector<float> metal_h3_ap_w1(static_cast<size_t>(2 * metal_h3_ap_ch) * metal_h3_ap_ch, 0.f);
+        std::vector<float> metal_h3_ap_w2(static_cast<size_t>(metal_h3_ap_ch) * (2 * metal_h3_ap_ch),
+                                          0.f);
+        for (int i = 0; i < metal_h3_ap_C; ++i) {
+            metal_h3_ap_qkv[static_cast<size_t>(i) * metal_h3_ap_C + i] = 0.2f;
+            metal_h3_ap_proj[static_cast<size_t>(i) * metal_h3_ap_ch + i] = 1.f;
+        }
+        const bool metal_h3_ap = audio_pre_block(
+            metal_h3_ap_base.data(), metal_h3_ap_seq.data(), metal_h3_ap_B, metal_h3_ap_L,
+            metal_h3_ap_C, metal_h3_ap_ch, metal_h3_ap_heads, nullptr, nullptr,
+            metal_h3_ap_qkv.data(), nullptr, nullptr, nullptr, metal_h3_ap_proj.data(), nullptr,
+            nullptr, nullptr, nullptr, nullptr, metal_h3_ap_w0.data(), nullptr,
+            metal_h3_ap_w1.data(), nullptr, metal_h3_ap_w2.data(), nullptr, 1e-6f);
+        CHECK(metal_h3_ap);
+        CHECK(std::isfinite(metal_h3_ap_base[0]) && std::isfinite(metal_h3_ap_base[1]));
+    }
+
+    {
+        const int metal_h3_vt_T = 2, metal_h3_vt_H = 4, metal_h3_vt_heads = 2, metal_h3_vt_hd = 2,
+                  metal_h3_vt_ffn = 4;
+        std::vector<float> metal_h3_vt_x(static_cast<size_t>(metal_h3_vt_T) * metal_h3_vt_H, 0.1f);
+        metal_h3_vt_x[0] = 1.f;
+        std::vector<float> metal_h3_vt_qkv(static_cast<size_t>(3 * metal_h3_vt_H) * metal_h3_vt_H, 0.f);
+        std::vector<float> metal_h3_vt_out(static_cast<size_t>(metal_h3_vt_H) * metal_h3_vt_H, 0.f);
+        std::vector<float> metal_h3_vt_w1(static_cast<size_t>(2 * metal_h3_vt_ffn) * metal_h3_vt_H, 0.f);
+        std::vector<float> metal_h3_vt_w2(static_cast<size_t>(metal_h3_vt_H) * metal_h3_vt_ffn, 0.f);
+        for (int i = 0; i < metal_h3_vt_H; ++i) {
+            metal_h3_vt_qkv[static_cast<size_t>(i) * metal_h3_vt_H + i] = 0.2f;
+            metal_h3_vt_out[static_cast<size_t>(i) * metal_h3_vt_H + i] = 1.f;
+            metal_h3_vt_w1[static_cast<size_t>(i) * metal_h3_vt_H + i] = 0.2f;
+            metal_h3_vt_w2[static_cast<size_t>(i) * metal_h3_vt_ffn + i] = 0.2f;
+        }
+        const bool metal_h3_vt = vae_transformer_block(
+            metal_h3_vt_x.data(), metal_h3_vt_T, metal_h3_vt_H, metal_h3_vt_heads, metal_h3_vt_hd,
+            nullptr, metal_h3_vt_qkv.data(), nullptr, metal_h3_vt_out.data(), nullptr, nullptr,
+            nullptr, metal_h3_vt_w1.data(), nullptr, metal_h3_vt_w2.data(), nullptr, nullptr,
+            metal_h3_vt_ffn, 1e-6f);
+        CHECK(metal_h3_vt);
+        CHECK(std::isfinite(metal_h3_vt_x[0]) && std::isfinite(metal_h3_vt_x[1]));
     }
 }
 

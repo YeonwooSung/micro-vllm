@@ -196,7 +196,8 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
   (`describe()` has `draft=` / `dacc=`). Official MTP tensors overlay when
   present (`mtp.N.main_proj` / `attn.wq_a` / `confidence_head` / `markov_head`).
   `V4_MTP` / `MVLLM_V4_MTP` plus matching markov `[V,rank]` uses markov draft;
-  else bigram. `describe()` has `mtp=off|loaded|markov`.
+  else bigram. When `main_proj` / `wq_a` / confidence overlay, `mtp=fwd`.
+  `describe()` has `mtp=off|loaded|markov|fwd`.
 - Prefix checkpoints stay on the host.
 - Optional device kernels in `src/gpu/dsv4_cuda.cu` + `dsv4_cuda_device.hpp`
   compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
@@ -215,10 +216,11 @@ Metal ops (`mvllm::metal_ops`):
   windows/taps are present.
 - K3/GLM `describe()` may show `metal=cpu|metal`. `layer_decode_full` is
   residual + post-LN + optional F32 shared expert + router GEMM/top-k in
-  one command buffer. `layer_decode_kda` puts `op_kda_fused` in that same
-  CB (`x += oh`); MLA stays on its own kernels. `moe_block` takes
-  `Act::Silu|ClampSwiGLU|Situ`. GLM routed int4 uses ClampSwiGLU; K3
-  shared/dense F32 uses SiTU. K3 routed MXFP4 stays on `coli_cuda`.
+  one command buffer. S=1 decode calls `layer_decode_kda` (`op_kda_fused`
+  then `x += oh`) or `layer_decode_mla` (absorb + optional `W_o` + post-LN).
+  `moe_block` takes `Act::Silu|ClampSwiGLU|Situ`. GLM routed int4 uses
+  ClampSwiGLU. K3 F32 dense/shared uses SiTU. K3 routed MXFP4 uses
+  `moe_block` fmt 7 (`op_gemm_mxfp4` + SiTU) before `coli_cuda` / host.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 
@@ -226,9 +228,10 @@ H3 Metal residual (`mvllm::metal_h3::dit_residual`):
   Metal `metal_h3.mm` when `APPLE AND MVLLM_METAL`.
 - AdaLN + SDPA + SwiGLU. H3 engine prefers this over `gpu::dit_block`
   when AdaLN / RoPE is present. `gemm_int8` / `nax_mlp` / `vae_rms_add`
-  have Metal kernels (CPU fallback). VAE official residual+RMS uses
-  `vae_rms_add`; audio/vision residual adds call the same helper when the
-  op matches. `describe()` shows `int8=` / `nax=`.
+  have Metal kernels (CPU fallback). VAE `apply_block` tries
+  `vae_transformer_block`; vision `run_block` tries `vision_block`;
+  audio pre tries `audio_pre_block`. Residual-only sites still use
+  `vae_rms_add`. `describe()` shows `int8=` / `nax=`.
 
 `micro-vllm smoke --model DIR` walks shard headers and, when expert / DiT
 tensors exist, `pread`s one expert slot (or a small H3 vector). Counted
