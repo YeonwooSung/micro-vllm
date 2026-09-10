@@ -1,6 +1,7 @@
 #include "family.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/dsv4_cuda.hpp"
+#include "../gpu/vk_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -336,6 +337,7 @@ public:
             trace_.open(tpath, terr);
         }
         dsv4_cuda::init(nullptr, 0);
+        vk_ops::init();
         return Status::Ok;
     }
 
@@ -433,45 +435,70 @@ public:
             std::vector<int> draft;
             if (dk > 0 && !work->history.empty()) {
                 int prev = work->history.back();
+                std::vector<float> dh;
+                if (fwd_draft && static_cast<int>(work->last_h.size()) == cfg_.hidden)
+                    dh = work->last_h;
                 for (int i = 0; i < dk && ntok + i < gp.max_new_tokens; ++i) {
                     int d = -1;
-                    if (fwd_draft &&
-                        static_cast<int>(work->last_h.size()) == cfg_.hidden)
-                        d = mtp_fwd_next(work->last_h.data(), prev);
-                    else if (markov_draft)
+                    float conf = 1.f;
+                    if (fwd_draft && static_cast<int>(dh.size()) == cfg_.hidden) {
+                        std::vector<float> dh2(static_cast<size_t>(cfg_.hidden), 0.f);
+                        d = mtp_fwd_step(dh.data(), prev, dh2.data(), &conf);
+                        if (d >= 0 && !(std::isfinite(conf) && conf < 0.f))
+                            dh.swap(dh2);
+                    } else if (markov_draft)
                         d = mtp_markov_next(prev);
                     else
                         d = bigram_next(prev);
-                    if (d < 0)
+                    if (d < 0 || (std::isfinite(conf) && conf < 0.f))
                         break;
                     draft.push_back(d);
                     prev = d;
                 }
             }
-            int accepted = 0;
-            const int rounds = draft.empty() ? 1 : static_cast<int>(draft.size());
+            int next = slot_sample(*work, gp, &rng, allow.empty() ? nullptr : allow.data());
             bool stopped = false;
-            for (int r = 0; r < rounds && ntok < gp.max_new_tokens; ++r) {
-                int next = slot_sample(*work, gp, &rng, allow.empty() ? nullptr : allow.data());
-                if (!draft.empty() && next == draft[static_cast<size_t>(r)])
-                    ++accepted;
-                else if (!draft.empty())
-                    draft.clear();
+            if (!draft.empty() && next == draft[0] &&
+                static_cast<int>(work->last_h.size()) == cfg_.hidden) {
+                int A = 1;
+                if (fwd_draft)
+                    A = mtp_verify_tail(work->last_h.data(), work->history.back(), draft.data(),
+                                        static_cast<int>(draft.size()));
+                if (A < 1)
+                    A = 1;
+                if (A > static_cast<int>(draft.size()))
+                    A = static_cast<int>(draft.size());
+                if (A > gp.max_new_tokens - ntok)
+                    A = gp.max_new_tokens - ntok;
+                for (int i = 0; i < A; ++i) {
+                    stopped = emit_one(draft[static_cast<size_t>(i)]);
+                    ++ntok;
+                    if (stopped)
+                        break;
+                }
+                if (!stopped) {
+                    Status st = slot_prefill_window(*work, draft.data(), A, err);
+                    if (st != Status::Ok)
+                        return st;
+                    if (g.ready() && gp.token_text) {
+                        allow.assign(static_cast<size_t>(cfg_.vocab), 0);
+                        g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+                    }
+                }
+                draft_acc_ += static_cast<uint64_t>(A);
+            } else {
                 stopped = emit_one(next);
                 ++ntok;
-                if (stopped)
-                    break;
-                Status st = slot_step(*work, next, err);
-                if (st != Status::Ok)
-                    return st;
-                if (g.ready() && gp.token_text) {
-                    allow.assign(static_cast<size_t>(cfg_.vocab), 0);
-                    g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+                if (!stopped) {
+                    Status st = slot_step(*work, next, err);
+                    if (st != Status::Ok)
+                        return st;
+                    if (g.ready() && gp.token_text) {
+                        allow.assign(static_cast<size_t>(cfg_.vocab), 0);
+                        g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+                    }
                 }
-                if (draft.empty())
-                    break;
             }
-            draft_acc_ += static_cast<uint64_t>(accepted);
             if (stopped)
                 break;
         }
@@ -502,7 +529,8 @@ public:
            << " ckpt=" << ckpts_.size() << " hits=" << ckpt_hits_
            << " draft=" << draft_depth() << " dacc=" << draft_acc_
            << " mtp=" << mtp_mode()
-           << " tier=" << (dsv4_cuda::available() ? dsv4_cuda::backend_name() : "off");
+           << " tier=" << (dsv4_cuda::available() ? dsv4_cuda::backend_name() : "off")
+           << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off");
         return os.str();
     }
 
@@ -1362,6 +1390,14 @@ private:
             return std::max(std::atoi(e), 0);
         if (const char *e = std::getenv("MVLLM_V4_DRAFT"); e && e[0])
             return std::max(std::atoi(e), 0);
+        if (mtp_env_on()) {
+            int m = 0;
+            if (const char *e = std::getenv("V4_MTP"); e && e[0])
+                m = std::atoi(e);
+            else if (const char *e = std::getenv("MVLLM_V4_MTP"); e && e[0])
+                m = std::atoi(e);
+            return m > 1 ? m : 3;
+        }
         return 0;
     }
 
@@ -1529,8 +1565,19 @@ private:
     }
 
     int mtp_fwd_next(const float *h, int prev_tok) const {
+        return mtp_fwd_step(h, prev_tok, nullptr, nullptr);
+    }
+
+    // One MTP step: main_proj ([h, embed(prev)] or h) → optional wq_a →
+    // confidence (reject if score[0] < 0) → vocab / lm_head. Writes h_out
+    // when main_proj/wq_a produce hidden-sized state (else copies h_in).
+    int mtp_fwd_step(const float *h, int prev_tok, float *h_out, float *conf_out) const {
         const int H = cfg_.hidden;
         const int V = cfg_.vocab;
+        if (conf_out)
+            *conf_out = 1.f;
+        if (h_out && h && H > 0)
+            std::memcpy(h_out, h, static_cast<size_t>(H) * sizeof(float));
         if (!h || H <= 0)
             return -1;
 
@@ -1607,6 +1654,8 @@ private:
                 Ww = H;
             }
         }
+        if (h_out && Ww == H && static_cast<int>(work.size()) >= H)
+            std::memcpy(h_out, work.data(), static_cast<size_t>(H) * sizeof(float));
 
         const quant::QuantMat *vocab_qm = nullptr;
         const float *vocab_f = nullptr;
@@ -1648,6 +1697,8 @@ private:
             else
                 mtp_gemm_f32(sc.data(), work.data(), score_f, score_O, score_I);
             const float s0 = sc[0];
+            if (conf_out)
+                *conf_out = s0;
             if (std::isfinite(s0) && s0 < 0.f)
                 return -1;
         }
@@ -1673,6 +1724,32 @@ private:
         const int nlog = std::min(V, lm_head_.O);
         const int tok = mtp_argmax(logits.data(), nlog);
         return (tok >= 0 && tok < V) ? tok : -1;
+    }
+
+    // draft[0] already matches the main sample. Roll hidden through that
+    // token, then accept draft[i] while MTP pred==draft[i] and conf>=0.
+    int mtp_verify_tail(const float *h0, int prev0, const int *draft, int n) const {
+        const int H = cfg_.hidden;
+        if (!h0 || !draft || n < 1 || H <= 0)
+            return 0;
+        std::vector<float> h(h0, h0 + H), h2(static_cast<size_t>(H), 0.f);
+        int prev = prev0;
+        float conf = 1.f;
+        const int pred0 = mtp_fwd_step(h.data(), prev, h2.data(), &conf);
+        (void)pred0;
+        h.swap(h2);
+        prev = draft[0];
+        int acc = 1;
+        for (int i = 1; i < n; ++i) {
+            conf = 1.f;
+            const int pred = mtp_fwd_step(h.data(), prev, h2.data(), &conf);
+            if (pred != draft[i] || (std::isfinite(conf) && conf < 0.f))
+                break;
+            ++acc;
+            h.swap(h2);
+            prev = draft[i];
+        }
+        return acc;
     }
 
     // Layer-major window: C tokens share one activation slab (not prompt-sized).
@@ -1744,6 +1821,7 @@ private:
             std::memcpy(s.streams.data(), acts.data() + static_cast<size_t>(C - 1) * MH,
                         static_cast<size_t>(MH) * sizeof(float));
         s.pos = pos0 + C;
+        slot_snap_h(s);
         return Status::Ok;
     }
 

@@ -195,9 +195,12 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
   `MVLLM_V4_DRAFT` is a prompt-bigram draft verified by the main sample
   (`describe()` has `draft=` / `dacc=`). Official MTP tensors overlay when
   present (`mtp.N.main_proj` / `attn.wq_a` / `confidence_head` / `markov_head`).
-  `V4_MTP` / `MVLLM_V4_MTP` plus matching markov `[V,rank]` uses markov draft;
-  else bigram. When `main_proj` / `wq_a` / confidence overlay, `mtp=fwd`.
-  `describe()` has `mtp=off|loaded|markov|fwd`.
+  `V4_MTP` / `MVLLM_V4_MTP` (default draft depth 3) plus matching markov
+  `[V,rank]` uses markov draft; else bigram. When `main_proj` / `wq_a` /
+  confidence overlay, `mtp=fwd`: rolling-hidden draft, then a one-shot
+  `mtp_verify_tail` (pred + conf>=0) after the main sample agrees on
+  `draft[0]`; the accepted prefix is consumed with `slot_prefill_window`.
+  `describe()` has `mtp=off|loaded|markov|fwd` and `vk=cpu|off`.
 - Prefix checkpoints stay on the host.
 - Optional device kernels in `src/gpu/dsv4_cuda.cu` + `dsv4_cuda_device.hpp`
   compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
@@ -221,6 +224,12 @@ Metal ops (`mvllm::metal_ops`):
   `moe_block` takes `Act::Silu|ClampSwiGLU|Situ`. GLM routed int4 uses
   ClampSwiGLU. K3 F32 dense/shared uses SiTU. K3 routed MXFP4 uses
   `moe_block` fmt 7 (`op_gemm_mxfp4` + SiTU) before `coli_cuda` / host.
+
+Vulkan ops (`mvllm::vk_ops`):
+
+- Host API: `src/gpu/vk_ops.hpp` + `vk_ops.cpp`. Always CPU (`backend_name`
+  is `"cpu"`). No Vulkan SDK. Surface: `init` / `rmsnorm` / `add` /
+  `gemm_f32`. Device kernels can replace this TU later.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 

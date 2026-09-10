@@ -113,6 +113,7 @@ set(MVLLM_HOST_SOURCES
     src/gpu/coli_cuda.cpp
     src/gpu/metal_ops.cpp
     src/gpu/metal_h3.cpp
+    src/gpu/vk_ops.cpp
 )
 
 if(APPLE AND MVLLM_METAL)

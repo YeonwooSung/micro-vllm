@@ -5,6 +5,7 @@
 #include "gpu/dsv4_cuda.hpp"
 #include "gpu/metal_ops.hpp"
 #include "gpu/metal_h3.hpp"
+#include "gpu/vk_ops.hpp"
 #include "legacy/llama_dims.hpp"
 #include "io/dump_env.hpp"
 #include "io/file_io.hpp"
@@ -1175,6 +1176,22 @@ static void test_dsv4_tiny() {
         setenv("COLI_PREFILL_CHUNK", dsv4_chunk_prev.c_str(), 1);
     else
         unsetenv("COLI_PREFILL_CHUNK");
+    const char *dsv4_mtp_old = std::getenv("V4_MTP");
+    const std::string dsv4_mtp_prev = dsv4_mtp_old ? dsv4_mtp_old : "";
+    setenv("V4_MTP", "1", 1);
+    unsetenv("V4_DRAFT");
+    GenResult gr_m;
+    const bool dsv4_mtp_ok = e.generate("hi", gp, gr_m, err) == Status::Ok;
+    CHECK(dsv4_mtp_ok);
+    CHECK(gr_m.completion_tokens > 0);
+    const std::string dsv4_mtp_info = e.info();
+    CHECK(dsv4_mtp_info.find("draft=3") != std::string::npos);
+    CHECK(dsv4_mtp_info.find("mtp=") != std::string::npos);
+    CHECK(dsv4_mtp_info.find("vk=") != std::string::npos);
+    if (!dsv4_mtp_prev.empty())
+        setenv("V4_MTP", dsv4_mtp_prev.c_str(), 1);
+    else
+        unsetenv("V4_MTP");
 
     FamilyEngine *fe = e.family_impl();
     CHECK(fe != nullptr);
@@ -2190,6 +2207,44 @@ static void test_coli_cuda_tier() {
     const bool coli_cu_reavail = available();
     CHECK(coli_cu_reavail);
     shutdown();
+}
+
+static void test_vk_ops_tier() {
+    using namespace mvllm;
+    using namespace mvllm::vk_ops;
+
+    const bool vk_ops_init = init();
+    CHECK(vk_ops_init);
+    const bool vk_ops_avail = available();
+    CHECK(vk_ops_avail);
+    const char *vk_ops_bn = backend_name();
+    CHECK(vk_ops_bn && std::strcmp(vk_ops_bn, "cpu") == 0);
+
+    const float vk_ops_x[4] = {1.f, 0.f, 0.f, 0.f};
+    const float vk_ops_w[4] = {1.f, 1.f, 1.f, 1.f};
+    float vk_ops_y[4] = {};
+    const bool vk_ops_rms = rmsnorm(vk_ops_y, vk_ops_x, vk_ops_w, 1, 4, 1e-6f);
+    CHECK(vk_ops_rms);
+    CHECK(std::isfinite(vk_ops_y[0]) && std::isfinite(vk_ops_y[1]));
+
+    float vk_ops_acc[2] = {1.f, 2.f};
+    const float vk_ops_addend[2] = {3.f, 4.f};
+    const bool vk_ops_add = add(vk_ops_acc, vk_ops_addend, 2);
+    CHECK(vk_ops_add);
+    CHECK_NEAR(vk_ops_acc[0], 4.f, 1e-5);
+    CHECK_NEAR(vk_ops_acc[1], 6.f, 1e-5);
+
+    const float vk_ops_id[4] = {1.f, 0.f, 0.f, 1.f};
+    const float vk_ops_in[2] = {0.5f, -0.25f};
+    float vk_ops_out[2] = {};
+    const bool vk_ops_g = gemm_f32(vk_ops_out, vk_ops_in, vk_ops_id, 1, 2, 2);
+    CHECK(vk_ops_g);
+    CHECK_NEAR(vk_ops_out[0], 0.5f, 1e-5);
+    CHECK_NEAR(vk_ops_out[1], -0.25f, 1e-5);
+
+    shutdown();
+    const bool vk_ops_off = !available();
+    CHECK(vk_ops_off);
 }
 
 static void test_metal_ops_tier() {
@@ -4472,6 +4527,7 @@ int main() {
     test_dsv4_prefix_ckpt();
     test_dsv4_cuda_tier();
     test_coli_cuda_tier();
+    test_vk_ops_tier();
     test_metal_ops_tier();
     test_metal_h3_tier();
     test_llama_dims_helpers();

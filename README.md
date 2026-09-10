@@ -140,9 +140,12 @@ to a synthetic pack so tiny dirs still `generate`.
   `<model>/.coli_ckpt/`. Aliases `MVLLM_PREFIX_CKPT*`. `info` shows
   `ckpt=N hits=M` and `tier=cpu|cuda|off`.
 - Prefill chunks: `COLI_PREFILL_CHUNK` / `V4_PREFILL_CHUNK` (layer-major).
-- Draft: `V4_DRAFT` / `MVLLM_V4_DRAFT` (prompt bigram). `V4_MTP` uses
-  loaded markov heads when `[V,rank]` matches, else `main_proj`/`wq_a`/
-  confidence (`info` has `mtp=` / `draft=` / `dacc=`).
+- Draft: `V4_DRAFT` / `MVLLM_V4_DRAFT` (prompt bigram). `V4_MTP` /
+  `MVLLM_V4_MTP` defaults draft depth to 3. Loaded `main_proj` / `wq_a` /
+  confidence (`mtp=fwd`) draft with a rolling hidden, then verify the
+  prefix in one pass after the main sample agrees on the first token.
+  Markov `[V,rank]` is `mtp=markov`. `info` has `mtp=` / `draft=` /
+  `dacc=` / `vk=`.
 - With CUDA: top-6 `route`, mHC pre, and sparse attn (zero sinks) go
   through `dsv4_cuda`; otherwise the host kernels. Indexer stays on host.
 - Dump env: `MVLLM_DUMP_DSV4` / `COLI_DUMP_DSV4`.
