@@ -21,5 +21,16 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin);
 
+// y[S,O] = x[S,I] @ W[O,I]^T with int8-row weights and per-row scales.
+bool gemm_int8(float *y, const float *x, const int8_t *w, const float *scale, int S, int I, int O);
+
+// Neighborhood-style gated MLP used by H3 NAX: y += down(silu(up(x))).
+// w_up is F32 [I, D], w_down is F32 [D, I].
+bool nax_mlp(float *y, const float *x, const float *w_up, const float *w_down, int S, int D, int I);
+
+// VAE residual: x += skip; y = rmsnorm(x, w). y may alias x when w is applied in place
+// via a separate buffer; here y is nrm_out and x is updated.
+bool vae_rms_add(float *x, const float *skip, const float *w, float *y, int n, float eps);
+
 } // namespace metal_h3
 } // namespace mvllm

@@ -1,4 +1,5 @@
 #include "h3_vae.hpp"
+#include "../gpu/metal_h3.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 
@@ -262,6 +263,27 @@ void rmsnorm_rows(const float *x, const float *w, float *y, int S, int H, float 
         quant::rmsnorm(x + static_cast<size_t>(s) * H, w, y + static_cast<size_t>(s) * H, H, eps);
 }
 
+void ensure_metal_h3() {
+    static const bool inited = metal_h3::init();
+    (void)inited;
+}
+
+// x += skip; y = rmsnorm(x, w). Per-row Metal; CPU if a call fails.
+void residual_rmsnorm_rows(float *x, const float *skip, const float *w, float *y, int S, int H,
+                           float eps) {
+    ensure_metal_h3();
+    for (int s = 0; s < S; ++s) {
+        float *xr = x + static_cast<size_t>(s) * H;
+        const float *sr = skip + static_cast<size_t>(s) * H;
+        float *yr = y + static_cast<size_t>(s) * H;
+        if (metal_h3::vae_rms_add(xr, sr, w, yr, H, eps))
+            continue;
+        for (int i = 0; i < H; ++i)
+            xr[i] += sr[i];
+        quant::rmsnorm(xr, w, yr, H, eps);
+    }
+}
+
 void sdpa(const float *q, const float *k, const float *v, float *out, int seq, int heads, int hd) {
     const float scale = 1.f / std::sqrt(static_cast<float>(hd > 0 ? hd : 1));
     std::vector<float> scores(static_cast<size_t>(seq));
@@ -400,15 +422,16 @@ void apply_block_official(float *x, int N, int hidden, int heads, int hd, const 
                    hidden);
         else if (inner == hidden)
             ao = attn;
-        for (int i = 0; i < N * hidden; ++i) {
-            float s = (static_cast<int>(scale1.size()) == hidden) ? scale1[static_cast<size_t>(i % hidden)]
-                                                                  : 1.f;
-            x[i] += ao[static_cast<size_t>(i)] * s;
+        if (static_cast<int>(scale1.size()) == hidden) {
+            for (int i = 0; i < N * hidden; ++i)
+                ao[static_cast<size_t>(i)] *= scale1[static_cast<size_t>(i % hidden)];
         }
+        nw = norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr;
+        residual_rmsnorm_rows(x, ao.data(), nw, nrm.data(), N, hidden, kRmsEps);
+    } else {
+        nw = norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr;
+        rmsnorm_rows(x, nw, nrm.data(), N, hidden, kRmsEps);
     }
-
-    nw = norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr;
-    rmsnorm_rows(x, nw, nrm.data(), N, hidden, kRmsEps);
     if (!w1.empty() && hidden > 0 && (static_cast<int>(w1.size()) % hidden) == 0) {
         const int w1o = static_cast<int>(w1.size() / hidden);
         if (w1o >= 2 && (w1o % 2) == 0) {
@@ -590,15 +613,16 @@ void apply_block(float *x, int N, int hidden, int heads, int hd, const std::vect
         } else {
             ao.swap(attn);
         }
-        for (int i = 0; i < N * hidden; ++i) {
-            float s = (static_cast<int>(scale1.size()) == hidden) ? scale1[static_cast<size_t>(i % hidden)]
-                                                                  : 1.f;
-            x[i] += ao[static_cast<size_t>(i)] * s;
+        if (static_cast<int>(scale1.size()) == hidden) {
+            for (int i = 0; i < N * hidden; ++i)
+                ao[static_cast<size_t>(i)] *= scale1[static_cast<size_t>(i % hidden)];
         }
+        nw = norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr;
+        residual_rmsnorm_rows(x, ao.data(), nw, nrm.data(), N, hidden, kRmsEps);
+    } else {
+        nw = norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr;
+        rmsnorm_rows(x, nw, nrm.data(), N, hidden, kRmsEps);
     }
-
-    nw = norm2.size() == static_cast<size_t>(hidden) ? norm2.data() : nullptr;
-    rmsnorm_rows(x, nw, nrm.data(), N, hidden, kRmsEps);
 
     if (!w1.empty() && hidden > 0 && (static_cast<int>(w1.size()) % hidden) == 0) {
         const int w1o = static_cast<int>(w1.size() / hidden);

@@ -103,27 +103,78 @@ bool kda_args_ok(const float *win_q, const float *qt, const float *win_k, const 
            beta && oh && P == H * hd && K >= 1 && H >= 1 && hd >= 1;
 }
 
+void apply_act(float *g, const float *u, int n, Act act, float a, float b) {
+    if (!g || !u || n < 1)
+        return;
+    if (act == Act::ClampSwiGLU) {
+        for (int i = 0; i < n; ++i)
+            g[i] = quant::clamped_swiglu(g[i], u[i], a);
+        return;
+    }
+    if (act == Act::Situ) {
+        for (int i = 0; i < n; ++i)
+            g[i] = quant::situ_glu(g[i], u[i], a, b);
+        return;
+    }
+    quant::silu_mul(g, u, n);
+}
+
+void cpu_route(const float *nrm, const float *router_w, const float *router_bias, int D, int E,
+               int K, float rscale, int *idx_out, float *w_out) {
+    if (!nrm || !router_w || !idx_out || !w_out || D < 1 || E < 1 || K < 1)
+        return;
+    std::vector<float> scores(static_cast<size_t>(E), 0.f);
+    std::vector<float> choice(static_cast<size_t>(E), 0.f);
+    quant::matmul_f32(scores.data(), nrm, router_w, 1, D, E);
+    for (int i = 0; i < E; ++i) {
+        scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+        const float b = router_bias && i >= 0 ? (i < E ? router_bias[i] : 0.f) : 0.f;
+        choice[static_cast<size_t>(i)] = scores[static_cast<size_t>(i)] + b;
+    }
+    moe_topk(choice.data(), E, K, idx_out, w_out, scores.data());
+    if (rscale != 1.f) {
+        const int kk = K > E ? E : K;
+        for (int i = 0; i < kk; ++i)
+            w_out[i] *= rscale;
+    }
+}
+
+void cpu_layer_decode_full(float *x, const float *attn, const float *in_ln, const float *post_ln,
+                           const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                           float eps, Act act, float act_a, float act_b, const float *router_w,
+                           const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                           float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    if (in_ln && inrm_out)
+        quant::rmsnorm(x, in_ln, inrm_out, D, eps);
+    if (attn) {
+        for (int i = 0; i < D; ++i)
+            x[i] += attn[i];
+    }
+    quant::rmsnorm(x, post_ln, nrm_out, D, eps);
+    if (shg && shu && shd && Iinter > 0 && sh_out) {
+        std::vector<float> gate(static_cast<size_t>(Iinter));
+        std::vector<float> up(static_cast<size_t>(Iinter));
+        quant::matmul_f32(gate.data(), nrm_out, shg, 1, D, Iinter);
+        quant::matmul_f32(up.data(), nrm_out, shu, 1, D, Iinter);
+        apply_act(gate.data(), up.data(), Iinter, act, act_a, act_b);
+        quant::matmul_f32(sh_out, gate.data(), shd, 1, Iinter, D);
+    }
+    cpu_route(nrm_out, router_w, router_bias, D, E, K, rscale, idx_out, w_out);
+}
+
 void cpu_layer_decode(float *x, const float *attn, const float *post_ln, const float *shg,
                       const float *shu, const float *shd, int D, int Iinter, float eps,
                       float *nrm_out, float *sh_out) {
-    for (int i = 0; i < D; ++i)
-        x[i] += attn[i];
-    quant::rmsnorm(x, post_ln, nrm_out, D, eps);
-    if (!shg || !shu || !shd || Iinter < 1)
-        return;
-    std::vector<float> gate(static_cast<size_t>(Iinter));
-    std::vector<float> up(static_cast<size_t>(Iinter));
-    quant::matmul_f32(gate.data(), nrm_out, shg, 1, D, Iinter);
-    quant::matmul_f32(up.data(), nrm_out, shu, 1, D, Iinter);
-    quant::silu_mul(gate.data(), up.data(), Iinter);
-    if (sh_out)
-        quant::matmul_f32(sh_out, gate.data(), shd, 1, Iinter, D);
+    cpu_layer_decode_full(x, attn, nullptr, post_ln, shg, shu, shd, D, Iinter, eps, Act::Silu, 0.f,
+                          0.f, nullptr, nullptr, 0, 0, 1.f, nullptr, nrm_out, sh_out, nullptr,
+                          nullptr);
 }
 
 void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
                    const void *const *u, const void *const *d, const float *const *gs,
                    const float *const *us, const float *const *ds, const float *xg, const int *xoff,
-                   const int *nr, const int *rows, const float *rw, float *out, int S) {
+                   const int *nr, const int *rows, const float *rw, float *out, int S, Act act,
+                   float act_a, float act_b) {
     (void)qgs;
     int base = 0;
     std::vector<float> gate, up, hh;
@@ -146,7 +197,7 @@ void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *cons
         if (fmt == 0) {
             quant::matmul_f32(gate.data(), xe, static_cast<const float *>(g[e]), nre, D, Iinter);
             quant::matmul_f32(up.data(), xe, static_cast<const float *>(u[e]), nre, D, Iinter);
-            quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+            apply_act(gate.data(), up.data(), nre * Iinter, act, act_a, act_b);
             quant::matmul_f32(hh.data(), gate.data(), static_cast<const float *>(d[e]), nre, Iinter,
                               D);
         } else {
@@ -154,7 +205,7 @@ void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *cons
                                    D, Iinter);
             quant::matmul_int4_g64(up.data(), xe, static_cast<const uint8_t *>(u[e]), us[e], nre, D,
                                    Iinter);
-            quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+            apply_act(gate.data(), up.data(), nre * Iinter, act, act_a, act_b);
             quant::matmul_int4_g64(hh.data(), gate.data(), static_cast<const uint8_t *>(d[e]), ds[e],
                                    nre, Iinter, D);
         }
@@ -223,21 +274,52 @@ bool kda_fused_token(float *win_q, float *qt, float *win_k, float *kt, float *wi
 bool layer_decode(float *x, const float *attn, const float *post_ln, const float *shg,
                   const float *shu, const float *shd, int D, int Iinter, float eps, float *nrm_out,
                   float *sh_out) {
-    if (!x || !attn || !post_ln || !nrm_out || D < 1)
+    return layer_decode_full(x, attn, nullptr, post_ln, shg, shu, shd, D, Iinter, eps, Act::Silu,
+                             0.f, 0.f, nullptr, nullptr, 0, 0, 1.f, nullptr, nrm_out, sh_out,
+                             nullptr, nullptr);
+}
+
+bool layer_decode_full(float *x, const float *attn, const float *in_ln, const float *post_ln,
+                       const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                       float eps, Act act, float act_a, float act_b, const float *router_w,
+                       const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                       float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    if (!x || !post_ln || !nrm_out || D < 1)
         return false;
-    cpu_layer_decode(x, attn, post_ln, shg, shu, shd, D, Iinter, eps, nrm_out, sh_out);
+    cpu_layer_decode_full(x, attn, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a, act_b,
+                          router_w, router_bias, E, K, rscale, inrm_out, nrm_out, sh_out, idx_out,
+                          w_out);
+    return true;
+}
+
+bool layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, const float *post_ln,
+                      const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                      float eps, Act act, float act_a, float act_b, const float *router_w,
+                      const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                      float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    if (!kda_args_ok(kda.win_q, kda.qt, kda.win_k, kda.kt, kda.win_v, kda.tv, kda.taps_q, kda.taps_k,
+                     kda.taps_v, kda.S, kda.alpha, kda.beta, kda.oh, kda.P, kda.K, kda.H, kda.hd) ||
+        !x || !post_ln || !nrm_out || D < 1 || kda.P < D)
+        return false;
+    cpu_kda_fused(kda.win_q, kda.qt, kda.win_k, kda.kt, kda.win_v, kda.tv, kda.taps_q, kda.taps_k,
+                  kda.taps_v, kda.S, kda.alpha, kda.beta, kda.oh, kda.P, kda.K, kda.H, kda.hd);
+    cpu_layer_decode_full(x, kda.oh, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                          act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out, sh_out,
+                          idx_out, w_out);
     return true;
 }
 
 bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
                const void *const *u, const void *const *d, const float *const *gs,
                const float *const *us, const float *const *ds, const float *xg, const int *xoff,
-               const int *nr, const int *rows, const float *rw, float *out, int S) {
+               const int *nr, const int *rows, const float *rw, float *out, int S, Act act,
+               float act_a, float act_b) {
     if (nb < 1 || D < 1 || !out || !xg || (fmt != 0 && fmt != 4))
         return false;
     if (!xoff || !nr)
         return false;
-    cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, S);
+    cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, S, act,
+                  act_a, act_b);
     return true;
 }
 

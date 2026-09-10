@@ -389,8 +389,8 @@ public:
         work->history = prompt;
         work->token_lps.clear();
         work->top_lps.clear();
-        for (int ntok = 0; ntok < gp.max_new_tokens; ++ntok) {
-            int next = slot_sample(*work, gp, &rng, allow.empty() ? nullptr : allow.data());
+        const int dk = draft_depth();
+        auto emit_one = [&](int next) -> bool {
             out.tokens.push_back(next);
             work->history.push_back(next);
             if (g.ready() && gp.token_text)
@@ -405,15 +405,66 @@ public:
                     out.stopped_by_stop = true;
                 }
             }
-            if (stop)
-                break;
-            Status st = slot_step(*work, next, err);
-            if (st != Status::Ok)
-                return st;
-            if (g.ready() && gp.token_text) {
-                allow.assign(static_cast<size_t>(cfg_.vocab), 0);
-                g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+            return stop;
+        };
+        auto bigram_next = [&](int prev) -> int {
+            if (prev < 0 || work->history.size() < 2)
+                return -1;
+            int best = -1, best_n = 0;
+            for (size_t i = 1; i < work->history.size(); ++i) {
+                if (work->history[i - 1] != prev)
+                    continue;
+                const int cand = work->history[i];
+                int n = 0;
+                for (size_t j = 1; j < work->history.size(); ++j)
+                    if (work->history[j - 1] == prev && work->history[j] == cand)
+                        ++n;
+                if (n > best_n) {
+                    best_n = n;
+                    best = cand;
+                }
             }
+            return best;
+        };
+        const bool markov_draft = mtp_env_on() && mtp_markov_ready();
+        for (int ntok = 0; ntok < gp.max_new_tokens;) {
+            std::vector<int> draft;
+            if (dk > 0 && !work->history.empty()) {
+                int prev = work->history.back();
+                for (int i = 0; i < dk && ntok + i < gp.max_new_tokens; ++i) {
+                    const int d = markov_draft ? mtp_markov_next(prev) : bigram_next(prev);
+                    if (d < 0)
+                        break;
+                    draft.push_back(d);
+                    prev = d;
+                }
+            }
+            int accepted = 0;
+            const int rounds = draft.empty() ? 1 : static_cast<int>(draft.size());
+            bool stopped = false;
+            for (int r = 0; r < rounds && ntok < gp.max_new_tokens; ++r) {
+                int next = slot_sample(*work, gp, &rng, allow.empty() ? nullptr : allow.data());
+                if (!draft.empty() && next == draft[static_cast<size_t>(r)])
+                    ++accepted;
+                else if (!draft.empty())
+                    draft.clear();
+                stopped = emit_one(next);
+                ++ntok;
+                if (stopped)
+                    break;
+                Status st = slot_step(*work, next, err);
+                if (st != Status::Ok)
+                    return st;
+                if (g.ready() && gp.token_text) {
+                    allow.assign(static_cast<size_t>(cfg_.vocab), 0);
+                    g.allow_mask(gp.token_text, allow.data(), cfg_.vocab);
+                }
+                if (draft.empty())
+                    break;
+            }
+            draft_acc_ += static_cast<uint64_t>(accepted);
+            if (stopped)
+                break;
         }
         out.completion_tokens = static_cast<int>(out.tokens.size());
         out.token_logprobs = work->token_lps;
@@ -440,6 +491,8 @@ public:
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic")
            << " bits=" << rt_.dense_bits << " prefix=" << (prefix_.empty() ? "-" : prefix_)
            << " ckpt=" << ckpts_.size() << " hits=" << ckpt_hits_
+           << " draft=" << draft_depth() << " dacc=" << draft_acc_
+           << " mtp=" << mtp_mode()
            << " tier=" << (dsv4_cuda::available() ? dsv4_cuda::backend_name() : "off");
         return os.str();
     }
@@ -1247,13 +1300,178 @@ private:
         return Status::Ok;
     }
 
+    int prefill_chunk() const {
+        if (const char *e = std::getenv("COLI_PREFILL_CHUNK"); e && e[0]) {
+            const int n = std::atoi(e);
+            if (n > 0)
+                return n;
+        }
+        if (const char *e = std::getenv("V4_PREFILL_CHUNK"); e && e[0]) {
+            const int n = std::atoi(e);
+            if (n > 0)
+                return n;
+        }
+        return rt_.prefill_chunk > 0 ? rt_.prefill_chunk : 32;
+    }
+
+    int draft_depth() const {
+        if (const char *e = std::getenv("V4_DRAFT"); e && e[0])
+            return std::max(std::atoi(e), 0);
+        if (const char *e = std::getenv("MVLLM_V4_DRAFT"); e && e[0])
+            return std::max(std::atoi(e), 0);
+        return 0;
+    }
+
+    bool mtp_env_on() const {
+        if (const char *e = std::getenv("V4_MTP"); e && e[0])
+            return std::atoi(e) != 0;
+        if (const char *e = std::getenv("MVLLM_V4_MTP"); e && e[0])
+            return std::atoi(e) != 0;
+        return false;
+    }
+
+    bool mtp_any_loaded() const {
+        if (!mtp_main_proj_.empty() || !mtp_main_proj_scale_.empty())
+            return true;
+        if (!mtp_markov_w1_.empty() || !mtp_markov_w2_.empty())
+            return true;
+        for (size_t i = 0; i < 3; ++i) {
+            if (i < mtp_wq_a_.size() && !mtp_wq_a_[i].empty())
+                return true;
+            if (i < mtp_wq_a_scale_.size() && !mtp_wq_a_scale_[i].empty())
+                return true;
+            if (i < mtp_conf_.size() && !mtp_conf_[i].empty())
+                return true;
+            if (i < mtp_conf_f32_.size() && !mtp_conf_f32_[i].empty())
+                return true;
+        }
+        return false;
+    }
+
+    bool mtp_markov_ready() const {
+        if (mtp_markov_w1_.empty() || mtp_markov_w2_.empty())
+            return false;
+        if (mtp_markov_w1_.O != mtp_markov_w2_.O || mtp_markov_w1_.I != mtp_markov_w2_.I)
+            return false;
+        if (mtp_markov_w1_.O != cfg_.vocab || mtp_markov_w1_.I <= 0)
+            return false;
+        const size_t n = static_cast<size_t>(mtp_markov_w1_.O) * static_cast<size_t>(mtp_markov_w1_.I);
+        return mtp_markov_w1_.f.size() >= n && mtp_markov_w2_.f.size() >= n;
+    }
+
+    const char *mtp_mode() const {
+        if (mtp_env_on() && mtp_markov_ready())
+            return "markov";
+        if (mtp_any_loaded())
+            return "loaded";
+        return "off";
+    }
+
+    int mtp_markov_next(int prev) const {
+        if (!mtp_markov_ready() || prev < 0 || prev >= mtp_markov_w1_.O)
+            return -1;
+        const int V = mtp_markov_w1_.O;
+        const int R = mtp_markov_w1_.I;
+        const float *u = mtp_markov_w1_.f.data() + static_cast<size_t>(prev) * static_cast<size_t>(R);
+        std::vector<float> scores(static_cast<size_t>(V), 0.f);
+        mtp_markov_w2_.gemm(scores.data(), u, 1);
+        int best = -1;
+        float best_s = 0.f;
+        for (int v = 0; v < V; ++v) {
+            if (v >= cfg_.vocab)
+                continue;
+            const float s = scores[static_cast<size_t>(v)];
+            if (best < 0 || s > best_s) {
+                best_s = s;
+                best = v;
+            }
+        }
+        return best;
+    }
+
+    // Layer-major window: C tokens share one activation slab (not prompt-sized).
+    Status slot_prefill_window(Slot &s, const int *ids, int C, std::string &err) {
+        if (C <= 0)
+            return Status::Ok;
+        if (C == 1)
+            return slot_step(s, ids[0], err);
+        const int H = cfg_.hidden;
+        const int L = cfg_.n_layers;
+        const int M = mhc_mult();
+        const int MH = M * H;
+        std::vector<float> acts(static_cast<size_t>(C) * static_cast<size_t>(std::max(MH, 1)), 0.f);
+        const int pos0 = s.pos;
+        for (int c = 0; c < C; ++c) {
+            slot_embed(s, ids[c]);
+            if (MH > 0)
+                std::memcpy(acts.data() + static_cast<size_t>(c) * MH, s.streams.data(),
+                            static_cast<size_t>(MH) * sizeof(float));
+        }
+        for (int l = 0; l < L; ++l) {
+            for (int c = 0; c < C; ++c) {
+                if (MH > 0)
+                    std::memcpy(s.streams.data(), acts.data() + static_cast<size_t>(c) * MH,
+                                static_cast<size_t>(MH) * sizeof(float));
+                s.pos = pos0 + c;
+                float *h = s.streams.data();
+                if (official_hc(l, false)) {
+                    std::vector<float> collapsed(static_cast<size_t>(H)),
+                        post(static_cast<size_t>(M)), comb(static_cast<size_t>(M) * M),
+                        branch(static_cast<size_t>(H), 0.f);
+                    hc_enter(s.streams.data(), l, false, collapsed.data(), post.data(),
+                             comb.data());
+                    attn_one(s, collapsed.data(), s.pos, l, branch.data());
+                    mhc_post(s.streams.data(), branch.data(), s.streams.data(), post.data(),
+                             comb.data(), M, H);
+                } else {
+                    apply_mhc(s.streams.data(), l);
+                    attn_one(s, h, s.pos, l, nullptr);
+                }
+                if (official_hc(l, true)) {
+                    std::vector<float> collapsed(static_cast<size_t>(H)),
+                        post(static_cast<size_t>(M)), comb(static_cast<size_t>(M) * M),
+                        branch(static_cast<size_t>(H), 0.f);
+                    hc_enter(s.streams.data(), l, true, collapsed.data(), post.data(), comb.data());
+                    std::vector<float> n(static_cast<size_t>(H));
+                    quant::rmsnorm(collapsed.data(), out_n_[l].data(), n.data(), H, cfg_.rms_eps);
+                    if (l < cfg_.first_dense)
+                        dense_mlp(l, n.data(), branch.data());
+                    else {
+                        Status st = moe_layer(l, n.data(), branch.data(), err);
+                        if (st != Status::Ok)
+                            return st;
+                    }
+                    mhc_post(s.streams.data(), branch.data(), s.streams.data(), post.data(),
+                             comb.data(), M, H);
+                } else {
+                    Status st = ffn_one(h, l, err);
+                    if (st != Status::Ok)
+                        return st;
+                    apply_mhc(s.streams.data(), l);
+                }
+                if (MH > 0)
+                    std::memcpy(acts.data() + static_cast<size_t>(c) * MH, s.streams.data(),
+                                static_cast<size_t>(MH) * sizeof(float));
+            }
+        }
+        if (MH > 0 && C > 0)
+            std::memcpy(s.streams.data(), acts.data() + static_cast<size_t>(C - 1) * MH,
+                        static_cast<size_t>(MH) * sizeof(float));
+        s.pos = pos0 + C;
+        return Status::Ok;
+    }
+
     Status slot_prefill(Slot &s, const std::vector<int> &ids, int start, std::string &err) {
         if (start < 0)
             start = 0;
-        for (int i = start; i < static_cast<int>(ids.size()); ++i) {
-            Status st = slot_step(s, ids[static_cast<size_t>(i)], err);
+        const int n = static_cast<int>(ids.size());
+        const int chunk = prefill_chunk();
+        for (int i = start; i < n;) {
+            const int C = std::min(chunk, n - i);
+            Status st = slot_prefill_window(s, ids.data() + i, C, err);
             if (st != Status::Ok)
                 return st;
+            i += C;
         }
         return Status::Ok;
     }
@@ -1821,6 +2039,66 @@ private:
         return false;
     }
 
+    std::vector<std::string> mtp_names(const std::string &P, const std::string &leaf) const {
+        std::vector<std::string> n;
+        n.push_back(P + leaf);
+        if (!P.empty())
+            n.push_back(leaf);
+        return n;
+    }
+
+    void clear_mtp() {
+        mtp_main_proj_.clear();
+        mtp_main_proj_scale_.clear();
+        mtp_wq_a_.assign(3, {});
+        mtp_wq_a_scale_.assign(3, {});
+        mtp_conf_.assign(3, {});
+        mtp_conf_f32_.assign(3, {});
+        mtp_markov_w1_.clear();
+        mtp_markov_w2_.clear();
+    }
+
+    // Official Flash/DSpark names, with and without prefix_. Missing is fine.
+    void load_mtp_heads(const std::vector<io::StFile> &files, const std::string &P,
+                        std::string &err) {
+        clear_mtp();
+        const int bits = rt_.dense_bits;
+        const int hbits = rt_.head_bits;
+        const int mbits = rt_.mla_bits;
+        const int V = cfg_.vocab;
+        try_overlay_mat(files, mtp_names(P, "mtp.0.main_proj.weight"), mtp_main_proj_, bits, err);
+        try_overlay_f32(files, mtp_names(P, "mtp.0.main_proj.scale"), mtp_main_proj_scale_, 0, err);
+        for (int n = 0; n < 3; ++n) {
+            const std::string ns = std::to_string(n);
+            try_overlay_mat(files, mtp_names(P, "mtp." + ns + ".attn.wq_a.weight"), mtp_wq_a_[n],
+                            mbits, err);
+            try_overlay_f32(files, mtp_names(P, "mtp." + ns + ".attn.wq_a.scale"),
+                            mtp_wq_a_scale_[n], 0, err);
+            if (!try_overlay_mat(files, mtp_names(P, "mtp." + ns + ".confidence_head.proj.weight"),
+                                 mtp_conf_[n], hbits, err))
+                try_overlay_f32(files, mtp_names(P, "mtp." + ns + ".confidence_head.proj.weight"),
+                                mtp_conf_f32_[n], 0, err);
+            quant::QuantMat w1, w2;
+            const bool got1 =
+                try_overlay_mat(files, mtp_names(P, "mtp." + ns + ".markov_head.markov_w1.weight"),
+                                w1, 32, err);
+            const bool got2 =
+                try_overlay_mat(files, mtp_names(P, "mtp." + ns + ".markov_head.markov_w2.weight"),
+                                w2, 32, err);
+            if (got1 && got2 && w1.O == w2.O && w1.I == w2.I && w1.I > 0 &&
+                (w1.O == V || mtp_markov_w1_.empty())) {
+                mtp_markov_w1_ = std::move(w1);
+                mtp_markov_w2_ = std::move(w2);
+            } else if ((got1 || got2) && mtp_markov_w1_.empty() && mtp_markov_w2_.empty()) {
+                if (got1)
+                    mtp_markov_w1_ = std::move(w1);
+                if (got2)
+                    mtp_markov_w2_ = std::move(w2);
+            }
+        }
+        err.clear();
+    }
+
     bool find_expert(const std::vector<io::StFile> &files, const std::string &P, int layer,
                      int expert, const MxGeom &geom, ExpertLoc &loc) {
         const std::string L = std::to_string(layer);
@@ -2016,6 +2294,7 @@ private:
             }
         }
         err.clear();
+        load_mtp_heads(files, P, err);
 
         const int probe_l = cfg_.first_dense < L ? cfg_.first_dense : 0;
         const auto geom = make_mx_geom(H, cfg_.moe.intermediate);
@@ -2289,6 +2568,7 @@ private:
         dsa_knw_.resize(static_cast<size_t>(L));
         dsa_knb_.resize(static_cast<size_t>(L));
         dsa_ape_.resize(static_cast<size_t>(L));
+        clear_mtp();
         const int M = mhc_mult();
         for (int l = 0; l < L; ++l) {
             ones(in_n_[l], H);
@@ -2365,8 +2645,16 @@ private:
     std::vector<PrefixCkpt> ckpts_;
     uint64_t ckpt_tick_ = 1;
     uint64_t ckpt_hits_ = 0;
+    uint64_t draft_acc_ = 0;
     std::vector<int> last_fresh_prompt_;
     bool ckpt_disk_loaded_ = false;
+    quant::QuantMat mtp_main_proj_;
+    std::vector<float> mtp_main_proj_scale_;
+    std::vector<quant::QuantMat> mtp_wq_a_;
+    std::vector<std::vector<float>> mtp_wq_a_scale_;
+    std::vector<quant::QuantMat> mtp_conf_;
+    std::vector<std::vector<float>> mtp_conf_f32_;
+    quant::QuantMat mtp_markov_w1_, mtp_markov_w2_;
 };
 
 std::unique_ptr<FamilyEngine> make_dsv4() { return std::make_unique<Dsv4Engine>(); }

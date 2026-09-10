@@ -129,8 +129,9 @@ bool glm_pack_int4_g64(const uint8_t *blob, int H, int O, const void **g, const 
     return true;
 }
 
-// moe_block is plain SiLU. Caller must only use this when swiglu_limit <= 0.
-bool glm_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, int H, int O) {
+// moe_block uses ClampSwiGLU so official Flash (limit>0) can stay on Metal.
+bool glm_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, int H, int O,
+                          float limit) {
     if (!metal_ops::available() || !y || !x || S <= 0)
         return false;
     const void *g = nullptr, *u = nullptr, *d = nullptr;
@@ -145,7 +146,8 @@ bool glm_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, 
         rows[static_cast<size_t>(i)] = i;
     std::memset(y, 0, static_cast<size_t>(S) * static_cast<size_t>(H) * sizeof(float));
     return metal_ops::moe_block(1, H, O, 4, 64, &g, &u, &d, &gs, &us, &ds, x, &xoff, &nr,
-                                rows.data(), rw.data(), y, S);
+                                rows.data(), rw.data(), y, S, metal_ops::Act::ClampSwiGLU, limit,
+                                0.f);
 }
 
 // x += attn; nrm = rmsnorm(x, post_ln). Shared expert stays on the host (clamped SwiGLU).
@@ -1930,9 +1932,8 @@ private:
                 ++n;
             }
             if (n > 0) {
-                bool ran = false;
-                if (cfg_.moe.swiglu_limit <= 0.f)
-                    ran = glm_expert_try_metal(yb.data(), xb.data(), n, v.data, H, O);
+                bool ran = glm_expert_try_metal(yb.data(), xb.data(), n, v.data, H, O,
+                                                cfg_.moe.swiglu_limit);
                 if (!ran && !glm_expert_try_coli(yb.data(), xb.data(), n, v.data, H, O,
                                                  cfg_.moe.swiglu_limit))
                     gpu::glm_expert(yb.data(), xb.data(), n, v.data, H, O, cfg_.moe.swiglu_limit);
@@ -1959,12 +1960,30 @@ private:
             for (int i = 0; i < H; ++i)
                 h[i] += ac[i] * cfg_.moe.routed_scale;
             if (!shared_gate_[layer].empty()) {
-                std::vector<float> sg(O), su(O), sd(H);
-                shared_gate_[layer].gemm(sg.data(), x, 1);
-                shared_up_[layer].gemm(su.data(), x, 1);
-                for (int i = 0; i < O; ++i)
-                    sg[i] = quant::clamped_swiglu(sg[i], su[i], cfg_.moe.swiglu_limit);
-                shared_down_[layer].gemm(sd.data(), sg.data(), 1);
+                std::vector<float> sd(static_cast<size_t>(H), 0.f);
+                bool ran = false;
+                if (shared_gate_[layer].fmt == 0 && shared_up_[layer].fmt == 0 &&
+                    shared_down_[layer].fmt == 0 && metal_ops::available()) {
+                    const void *g = shared_gate_[layer].f.data();
+                    const void *u = shared_up_[layer].f.data();
+                    const void *d = shared_down_[layer].f.data();
+                    const int xoff = 0;
+                    const int nr = 1;
+                    const int row = 0;
+                    const float rw = 1.f;
+                    ran = metal_ops::moe_block(1, H, O, 0, 0, &g, &u, &d, nullptr, nullptr, nullptr,
+                                               x, &xoff, &nr, &row, &rw, sd.data(), 1,
+                                               metal_ops::Act::ClampSwiGLU, cfg_.moe.swiglu_limit,
+                                               0.f);
+                }
+                if (!ran) {
+                    std::vector<float> sg(O), su(O);
+                    shared_gate_[layer].gemm(sg.data(), x, 1);
+                    shared_up_[layer].gemm(su.data(), x, 1);
+                    for (int i = 0; i < O; ++i)
+                        sg[i] = quant::clamped_swiglu(sg[i], su[i], cfg_.moe.swiglu_limit);
+                    shared_down_[layer].gemm(sd.data(), sg.data(), 1);
+                }
                 for (int i = 0; i < H; ++i)
                     h[i] += sd[i];
             }

@@ -190,6 +190,13 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
 - `dsv4_cuda::route` when `topk==6` (host applies `moe.routed_scale` after).
   `mhc_pre` when official tensors/sizes/iters match; else host `mhc_pre`.
   `sparse_attn_batch` after the host indexer when every sink is 0.
+- Prefill walks `COLI_PREFILL_CHUNK` / `V4_PREFILL_CHUNK` / `rt.prefill_chunk`
+  tokens layer-major (activation slab is chunk-sized). `V4_DRAFT` /
+  `MVLLM_V4_DRAFT` is a prompt-bigram draft verified by the main sample
+  (`describe()` has `draft=` / `dacc=`). Official MTP tensors overlay when
+  present (`mtp.N.main_proj` / `attn.wq_a` / `confidence_head` / `markov_head`).
+  `V4_MTP` / `MVLLM_V4_MTP` plus matching markov `[V,rank]` uses markov draft;
+  else bigram. `describe()` has `mtp=off|loaded|markov`.
 - Prefix checkpoints stay on the host.
 - Optional device kernels in `src/gpu/dsv4_cuda.cu` + `dsv4_cuda_device.hpp`
   compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
@@ -206,16 +213,22 @@ Metal ops (`mvllm::metal_ops`):
   F32 shared SwiGLU). `moe_block` is batched routed SwiGLU in one Metal
   command buffer (CPU scatter). `kda_step` uses `kda_fused_token` when
   windows/taps are present.
-- K3/GLM `describe()` may show `metal=cpu|metal`. `layer_decode` is used
-  for residual + post-LN when it fits. GLM may use `moe_block` only if
-  `swiglu_limit<=0`.
+- K3/GLM `describe()` may show `metal=cpu|metal`. `layer_decode_full` is
+  residual + post-LN + optional F32 shared expert + router GEMM/top-k in
+  one command buffer. `layer_decode_kda` puts `op_kda_fused` in that same
+  CB (`x += oh`); MLA stays on its own kernels. `moe_block` takes
+  `Act::Silu|ClampSwiGLU|Situ`. GLM routed int4 uses ClampSwiGLU; K3
+  shared/dense F32 uses SiTU. K3 routed MXFP4 stays on `coli_cuda`.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 
 - Host API: `src/gpu/metal_h3.hpp`. CPU fallback TU (`metal_h3.cpp`) or
   Metal `metal_h3.mm` when `APPLE AND MVLLM_METAL`.
 - AdaLN + SDPA + SwiGLU. H3 engine prefers this over `gpu::dit_block`
-  when AdaLN / RoPE is present.
+  when AdaLN / RoPE is present. `gemm_int8` / `nax_mlp` / `vae_rms_add`
+  have Metal kernels (CPU fallback). VAE official residual+RMS uses
+  `vae_rms_add`; audio/vision residual adds call the same helper when the
+  op matches. `describe()` shows `int8=` / `nax=`.
 
 `micro-vllm smoke --model DIR` walks shard headers and, when expert / DiT
 tensors exist, `pread`s one expert slot (or a small H3 vector). Counted

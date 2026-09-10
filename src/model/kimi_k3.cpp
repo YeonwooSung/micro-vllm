@@ -138,6 +138,39 @@ void k3_resid_post_ln(float *x, const float *attn, const float *post_ln, float *
     quant::rmsnorm(x, post_ln, nrm, H, eps);
 }
 
+// Residual + post-LN + F32 SiTU MLP in one CB. sh is added onto x by the caller.
+bool k3_dense_metal(float *x, const float *attn, const float *post_ln, float *nrm, float *sh,
+                    const quant::QuantMat &gate, const quant::QuantMat &up,
+                    const quant::QuantMat &down, int H, int I, float eps, float b1, float b2) {
+    if (!metal_ops::available() || gate.fmt != 0 || up.fmt != 0 || down.fmt != 0)
+        return false;
+    if (gate.f.empty() || up.f.empty() || down.f.empty() || I < 1)
+        return false;
+    return metal_ops::layer_decode_full(x, attn, nullptr, post_ln, gate.f.data(), up.f.data(),
+                                        down.f.data(), H, I, eps, metal_ops::Act::Situ, b1, b2,
+                                        nullptr, nullptr, 0, 0, 1.f, nullptr, nrm, sh, nullptr,
+                                        nullptr);
+}
+
+bool k3_shared_metal(float *y, const float *x, const quant::QuantMat &gate,
+                     const quant::QuantMat &up, const quant::QuantMat &down, int H, int I, float b1,
+                     float b2) {
+    if (!metal_ops::available() || gate.fmt != 0 || up.fmt != 0 || down.fmt != 0 || I < 1)
+        return false;
+    if (gate.f.empty() || up.f.empty() || down.f.empty())
+        return false;
+    const void *g = gate.f.data();
+    const void *u = up.f.data();
+    const void *d = down.f.data();
+    const int xoff = 0;
+    const int nr = 1;
+    const int row = 0;
+    const float rw = 1.f;
+    std::memset(y, 0, static_cast<size_t>(H) * sizeof(float));
+    return metal_ops::moe_block(1, H, I, 0, 0, &g, &u, &d, nullptr, nullptr, nullptr, x, &xoff, &nr,
+                                &row, &rw, y, 1, metal_ops::Act::Situ, b1, b2);
+}
+
 const char *k3_expert_mats[3] = {"w1", "w2", "w3"};
 const char *k3_expert_half[2] = {"packed", "scale"};
 
@@ -400,8 +433,23 @@ public:
                     attnres_mix(snaps, prefix.data(), sw_mlp(l), nullptr, h.data(), H, cfg_.rms_eps);
                     quant::rmsnorm(h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
                 } else {
-                    k3_resid_post_ln(h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
-                                     cfg_.rms_eps);
+                    bool dense_ok = false;
+                    if (l < cfg_.first_dense) {
+                        std::vector<float> down(static_cast<size_t>(H), 0.f);
+                        if (k3_dense_metal(h.data(), y.data(), d_.attn_out_n[l].data(), n.data(),
+                                           down.data(), d_.mlp_gate[l], d_.mlp_up[l],
+                                           d_.mlp_down[l], H, cfg_.dense_intermediate, cfg_.rms_eps,
+                                           cfg_.moe.situ_b1, cfg_.moe.situ_b2)) {
+                            for (int i = 0; i < H; ++i)
+                                h[i] += down[i];
+                            dense_ok = true;
+                        }
+                    }
+                    if (!dense_ok)
+                        k3_resid_post_ln(h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
+                                         cfg_.rms_eps);
+                    if (dense_ok)
+                        continue;
                 }
                 if (l < cfg_.first_dense) {
                     std::vector<float> g(cfg_.dense_intermediate), u(cfg_.dense_intermediate),
@@ -1194,8 +1242,23 @@ private:
                 attnres_mix(snaps, prefix.data(), sw_mlp(l), nullptr, s.h.data(), H, cfg_.rms_eps);
                 quant::rmsnorm(s.h.data(), d_.attn_out_n[l].data(), n.data(), H, cfg_.rms_eps);
             } else {
-                k3_resid_post_ln(s.h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
-                                 cfg_.rms_eps);
+                bool dense_ok = false;
+                if (l < cfg_.first_dense) {
+                    std::vector<float> down(static_cast<size_t>(H), 0.f);
+                    if (k3_dense_metal(s.h.data(), y.data(), d_.attn_out_n[l].data(), n.data(),
+                                       down.data(), d_.mlp_gate[l], d_.mlp_up[l], d_.mlp_down[l], H,
+                                       cfg_.dense_intermediate, cfg_.rms_eps, cfg_.moe.situ_b1,
+                                       cfg_.moe.situ_b2)) {
+                        for (int i = 0; i < H; ++i)
+                            s.h[i] += down[i];
+                        dense_ok = true;
+                    }
+                }
+                if (!dense_ok)
+                    k3_resid_post_ln(s.h.data(), y.data(), d_.attn_out_n[l].data(), n.data(), H,
+                                     cfg_.rms_eps);
+                if (dense_ok)
+                    continue;
             }
             if (l < cfg_.first_dense) {
                 std::vector<float> g(cfg_.dense_intermediate), u(cfg_.dense_intermediate),
@@ -1967,12 +2030,17 @@ private:
                 h[i] += uph[i] * cfg_.moe.routed_scale;
             if (cfg_.moe.n_shared > 0 && !d_.shared_gate[layer].empty()) {
                 int inter = cfg_.dense_intermediate > 0 ? cfg_.dense_intermediate : O * 2;
-                std::vector<float> sg(inter), su(inter), sd(H);
-                d_.shared_gate[layer].gemm(sg.data(), x, 1);
-                d_.shared_up[layer].gemm(su.data(), x, 1);
-                for (int i = 0; i < inter; ++i)
-                    sg[i] = quant::situ_glu(sg[i], su[i], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
-                d_.shared_down[layer].gemm(sd.data(), sg.data(), 1);
+                std::vector<float> sd(static_cast<size_t>(H), 0.f);
+                if (!k3_shared_metal(sd.data(), x, d_.shared_gate[layer], d_.shared_up[layer],
+                                     d_.shared_down[layer], H, inter, cfg_.moe.situ_b1,
+                                     cfg_.moe.situ_b2)) {
+                    std::vector<float> sg(static_cast<size_t>(inter)), su(static_cast<size_t>(inter));
+                    d_.shared_gate[layer].gemm(sg.data(), x, 1);
+                    d_.shared_up[layer].gemm(su.data(), x, 1);
+                    for (int i = 0; i < inter; ++i)
+                        sg[i] = quant::situ_glu(sg[i], su[i], cfg_.moe.situ_b1, cfg_.moe.situ_b2);
+                    d_.shared_down[layer].gemm(sd.data(), sg.data(), 1);
+                }
                 for (int i = 0; i < H; ++i)
                     h[i] += sd[i];
             }

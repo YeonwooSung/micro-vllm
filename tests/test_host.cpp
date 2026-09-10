@@ -1155,6 +1155,26 @@ static void test_dsv4_tiny() {
     CHECK(gr.completion_tokens > 0);
     CHECK(gr.completion_tokens <= 4);
     CHECK(gr.prompt_tokens > 0);
+    const char *dsv4_draft_old = std::getenv("V4_DRAFT");
+    const char *dsv4_chunk_old = std::getenv("COLI_PREFILL_CHUNK");
+    const std::string dsv4_draft_prev = dsv4_draft_old ? dsv4_draft_old : "";
+    const std::string dsv4_chunk_prev = dsv4_chunk_old ? dsv4_chunk_old : "";
+    setenv("V4_DRAFT", "2", 1);
+    setenv("COLI_PREFILL_CHUNK", "2", 1);
+    GenResult gr_d;
+    const bool dsv4_draft_ok = e.generate("hi", gp, gr_d, err) == Status::Ok;
+    CHECK(dsv4_draft_ok);
+    CHECK(gr_d.completion_tokens > 0);
+    const std::string dsv4_draft_info = e.info();
+    CHECK(dsv4_draft_info.find("draft=2") != std::string::npos);
+    if (!dsv4_draft_prev.empty())
+        setenv("V4_DRAFT", dsv4_draft_prev.c_str(), 1);
+    else
+        unsetenv("V4_DRAFT");
+    if (!dsv4_chunk_prev.empty())
+        setenv("COLI_PREFILL_CHUNK", dsv4_chunk_prev.c_str(), 1);
+    else
+        unsetenv("COLI_PREFILL_CHUNK");
 
     FamilyEngine *fe = e.family_impl();
     CHECK(fe != nullptr);
@@ -2306,6 +2326,56 @@ static void test_metal_ops_tier() {
         CHECK_NEAR(metal_ops_moe_out[2], metal_ops_moe_exp[2], 1e-4);
         CHECK_NEAR(metal_ops_moe_out[3], metal_ops_moe_exp[3], 1e-4);
     }
+
+    {
+        float metal_ops_ldf_x[4] = {1.f, 0.f, 0.f, 0.f};
+        const float metal_ops_ldf_attn[4] = {0.f, 1.f, 0.f, 0.f};
+        const float metal_ops_ldf_post[4] = {1.f, 1.f, 1.f, 1.f};
+        const float metal_ops_ldf_id[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                                            0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const float metal_ops_ldf_rw[8] = {0.2f, 0.1f, 0.1f, 0.1f, 0.3f, 0.1f, 0.1f, 0.1f};
+        float metal_ops_ldf_nrm[4] = {};
+        float metal_ops_ldf_sh[4] = {};
+        int metal_ops_ldf_idx[2] = {-1, -1};
+        float metal_ops_ldf_w[2] = {};
+        const bool metal_ops_ldf = layer_decode_full(
+            metal_ops_ldf_x, metal_ops_ldf_attn, nullptr, metal_ops_ldf_post, metal_ops_ldf_id,
+            metal_ops_ldf_id, metal_ops_ldf_id, 4, 4, 1e-6f, Act::Situ, 4.f, 25.f,
+            metal_ops_ldf_rw, nullptr, 2, 2, 1.f, nullptr, metal_ops_ldf_nrm, metal_ops_ldf_sh,
+            metal_ops_ldf_idx, metal_ops_ldf_w);
+        CHECK(metal_ops_ldf);
+        CHECK(std::isfinite(metal_ops_ldf_sh[0]) && std::isfinite(metal_ops_ldf_sh[1]));
+        CHECK(metal_ops_ldf_idx[0] >= 0 && metal_ops_ldf_idx[0] < 2);
+        CHECK(metal_ops_ldf_w[0] >= 0.f);
+    }
+
+    {
+        const float metal_ops_moe_id[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
+                                            0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 0.f, 1.f};
+        const void *metal_ops_moe_g[1] = {metal_ops_moe_id};
+        const void *metal_ops_moe_u[1] = {metal_ops_moe_id};
+        const void *metal_ops_moe_d[1] = {metal_ops_moe_id};
+        const float metal_ops_moe_x[4] = {0.5f, -0.25f, 1.f, -1.f};
+        const int metal_ops_moe_xoff[1] = {0};
+        const int metal_ops_moe_nr[1] = {1};
+        const int metal_ops_moe_rows[1] = {0};
+        const float metal_ops_moe_rw[1] = {1.f};
+        float metal_ops_moe_out[4] = {};
+        const bool metal_ops_moe_c =
+            moe_block(1, 4, 4, 0, 0, metal_ops_moe_g, metal_ops_moe_u, metal_ops_moe_d, nullptr,
+                      nullptr, nullptr, metal_ops_moe_x, metal_ops_moe_xoff, metal_ops_moe_nr,
+                      metal_ops_moe_rows, metal_ops_moe_rw, metal_ops_moe_out, 1, Act::ClampSwiGLU,
+                      10.f, 0.f);
+        CHECK(metal_ops_moe_c);
+        CHECK(std::isfinite(metal_ops_moe_out[0]) && std::isfinite(metal_ops_moe_out[1]));
+        float metal_ops_moe_ref[4];
+        for (int i = 0; i < 4; ++i)
+            metal_ops_moe_ref[i] = mvllm::quant::clamped_swiglu(metal_ops_moe_x[i], metal_ops_moe_x[i], 10.f);
+        CHECK_NEAR(metal_ops_moe_out[0], metal_ops_moe_ref[0], 1e-4);
+        CHECK_NEAR(metal_ops_moe_out[1], metal_ops_moe_ref[1], 1e-4);
+        CHECK_NEAR(metal_ops_moe_out[2], metal_ops_moe_ref[2], 1e-4);
+        CHECK_NEAR(metal_ops_moe_out[3], metal_ops_moe_ref[3], 1e-4);
+    }
 }
 
 static void test_metal_h3_tier() {
@@ -2340,6 +2410,36 @@ static void test_metal_h3_tier() {
         metal_h3_x_ok = metal_h3_x_ok && std::isfinite(v);
     const bool metal_h3_dit_fin = metal_h3_x_ok;
     CHECK(metal_h3_dit_fin);
+
+    {
+        const int8_t metal_h3_iw[4] = {1, -1, 2, 0};
+        const float metal_h3_is[2] = {0.5f, 0.25f};
+        const float metal_h3_ix[2] = {1.f, 2.f};
+        float metal_h3_iy[2] = {};
+        const bool metal_h3_i8 = gemm_int8(metal_h3_iy, metal_h3_ix, metal_h3_iw, metal_h3_is, 1, 2, 2);
+        CHECK(metal_h3_i8);
+        CHECK_NEAR(metal_h3_iy[0], (1.f * 1 + 2.f * -1) * 0.5f, 1e-5);
+        CHECK_NEAR(metal_h3_iy[1], (1.f * 2 + 2.f * 0) * 0.25f, 1e-5);
+    }
+    {
+        const float metal_h3_up[8] = {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 1.f, 0.f};
+        const float metal_h3_dn[8] = {1.f, 0.f, 0.f, 1.f, 0.f, 1.f, 1.f, 0.f};
+        float metal_h3_nx[4] = {0.2f, -0.1f, 0.3f, 0.f};
+        float metal_h3_ny[4] = {0.f, 0.f, 0.f, 0.f};
+        const bool metal_h3_nax = nax_mlp(metal_h3_ny, metal_h3_nx, metal_h3_up, metal_h3_dn, 1, 4, 2);
+        CHECK(metal_h3_nax);
+        CHECK(std::isfinite(metal_h3_ny[0]) && std::isfinite(metal_h3_ny[1]));
+    }
+    {
+        float metal_h3_vx[4] = {1.f, 0.f, 0.f, 0.f};
+        const float metal_h3_sk[4] = {0.f, 1.f, 0.f, 0.f};
+        const float metal_h3_vw[4] = {1.f, 1.f, 1.f, 1.f};
+        float metal_h3_vy[4] = {};
+        const bool metal_h3_vae = vae_rms_add(metal_h3_vx, metal_h3_sk, metal_h3_vw, metal_h3_vy, 4, 1e-6f);
+        CHECK(metal_h3_vae);
+        CHECK(metal_h3_vx[0] != 0.f && metal_h3_vx[1] != 0.f);
+        CHECK(std::isfinite(metal_h3_vy[0]));
+    }
 }
 
 static void test_llama_dims_helpers() {

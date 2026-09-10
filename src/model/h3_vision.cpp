@@ -1,5 +1,6 @@
 #include "h3_vision.hpp"
 #include "family.hpp"
+#include "../gpu/metal_h3.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 
@@ -95,6 +96,19 @@ int pick_heads(int hidden) {
             best_pref = h;
     }
     return best_pref > 0 ? best_pref : best_any;
+}
+
+void ensure_metal_h3() {
+    static const bool inited = metal_h3::init();
+    (void)inited;
+}
+
+// Residual + RMS: x += skip; y = rmsnorm(x, w). False unless the site is RMS.
+bool try_vae_rms_add(float *x, const float *skip, const float *w, float *y, int n, float eps) {
+    ensure_metal_h3();
+    if (!x || !y || !w || n < 1)
+        return false;
+    return metal_h3::vae_rms_add(x, skip, w, y, n, eps);
 }
 
 void add_bias(float *y, const float *b, int S, int O) {
@@ -400,8 +414,11 @@ void run_block(const BlockW &b, float *hidden, int rows, const H3VisionConfig &c
                    b.proj_b.size() >= static_cast<size_t>(H) ? b.proj_b.data() : nullptr, rows, H, H);
         else
             std::memcpy(branch.data(), attn.data(), static_cast<size_t>(rows) * H * sizeof(float));
-        for (size_t i = 0; i < static_cast<size_t>(rows) * H; ++i)
-            hidden[i] += branch[i];
+        // Attn residual then LayerNorm (mean/var + bias) — not RMS.
+        if (!try_vae_rms_add(hidden, branch.data(), nullptr, nullptr, rows * H, cfg.ln_eps)) {
+            for (size_t i = 0; i < static_cast<size_t>(rows) * H; ++i)
+                hidden[i] += branch[i];
+        }
     }
 
     const float *n2w = b.norm2_w.size() >= static_cast<size_t>(H) ? b.norm2_w.data() : nullptr;
@@ -417,8 +434,11 @@ void run_block(const BlockW &b, float *hidden, int rows, const H3VisionConfig &c
         gelu_rows(fc1.data(), rows * I, true);
         linear(branch.data(), fc1.data(), b.fc2_w.data(),
                b.fc2_b.size() >= static_cast<size_t>(H) ? b.fc2_b.data() : nullptr, rows, I, H);
-        for (size_t i = 0; i < static_cast<size_t>(rows) * H; ++i)
-            hidden[i] += branch[i];
+        // GELU MLP residual then LayerNorm — not nax / RMS.
+        if (!try_vae_rms_add(hidden, branch.data(), nullptr, nullptr, rows * H, cfg.ln_eps)) {
+            for (size_t i = 0; i < static_cast<size_t>(rows) * H; ++i)
+                hidden[i] += branch[i];
+        }
     }
 }
 
@@ -719,6 +739,7 @@ Status H3VisionEncoder::load(const std::string &model_dir, std::string &err) {
 }
 
 void H3VisionEncoder::encode(const float *rgb_hwc, int frames, int height, int width, H3VisionOut &out) const {
+    ensure_metal_h3();
     out = H3VisionOut{};
     if (!ready_ || !rgb_hwc)
         return;

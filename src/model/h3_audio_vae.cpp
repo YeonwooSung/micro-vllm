@@ -1,5 +1,6 @@
 #include "h3_audio_vae.hpp"
 #include "h3_vae.hpp"
+#include "../gpu/metal_h3.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 
@@ -519,6 +520,19 @@ void add_inplace(float *a, const float *b, int n, float sa = 1.f, float sb = 1.f
         a[i] = sa * a[i] + sb * b[i];
 }
 
+void ensure_metal_h3() {
+    static const bool inited = metal_h3::init();
+    (void)inited;
+}
+
+// Residual + RMS: x += skip; y = rmsnorm(x, w). False unless the site is RMS.
+bool try_vae_rms_add(float *x, const float *skip, const float *w, float *y, int n, float eps) {
+    ensure_metal_h3();
+    if (!x || !y || !w || n < 1)
+        return false;
+    return metal_h3::vae_rms_add(x, skip, w, y, n, eps);
+}
+
 } // namespace
 
 int h3_audio_t(int frames) {
@@ -766,6 +780,7 @@ Status H3AudioVae::load(const std::string &model_dir, std::string &err) {
 }
 
 void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, int &audio_t) const {
+    ensure_metal_h3();
     const AudioW *wp = awc(this);
     AudioW local;
     if (!wp) {
@@ -932,7 +947,10 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
                    rows, kH3AudioChannels, kH3AudioChannels);
         else
             ap.swap(pooled);
-        add_inplace(base.data(), ap.data(), static_cast<int>(base.size()));
+        // Attn residual then LayerNorm — not RMS.
+        if (!try_vae_rms_add(base.data(), ap.data(), nullptr, nullptr,
+                             static_cast<int>(base.size()), 1e-5f))
+            add_inplace(base.data(), ap.data(), static_cast<int>(base.size()));
     }
     const TensorW *n2w = getc(w, "pre_block.norm2.weight");
     const TensorW *n2b = getc(w, "pre_block.norm2.bias");
@@ -967,7 +985,10 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
         linear(br.data(), gg.data(), w2->data.data(),
                b2 && static_cast<int>(b2->data.size()) == kH3AudioChannels ? b2->data.data() : nullptr,
                rows, 2 * kH3AudioChannels, kH3AudioChannels);
-        add_inplace(base.data(), br.data(), static_cast<int>(base.size()));
+        // GELU-gate MLP residual then LayerNorm — not nax / RMS.
+        if (!try_vae_rms_add(base.data(), br.data(), nullptr, nullptr,
+                             static_cast<int>(base.size()), 1e-5f))
+            add_inplace(base.data(), br.data(), static_cast<int>(base.size()));
     }
     std::vector<float> bcl;
     btc_to_bcl(base.data(), B, L, kH3AudioChannels, bcl);
@@ -994,6 +1015,7 @@ void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, in
 }
 
 void H3AudioVae::decode(const float *z, int audio_t, std::vector<float> &pcm) const {
+    ensure_metal_h3();
     const AudioW *wp = awc(this);
     AudioW local;
     if (!wp) {

@@ -892,7 +892,9 @@ public:
            << " ch=" << vae_.geom.latent_ch
            << " audio=" << (avae_.from_checkpoint ? "real" : "synth")
            << " vision=" << (vision_.from_checkpoint() ? "qwen" : "off")
-           << " h3gpu=" << metal_h3::backend_name();
+           << " h3gpu=" << metal_h3::backend_name()
+           << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
+           << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off");
         return os.str();
     }
 

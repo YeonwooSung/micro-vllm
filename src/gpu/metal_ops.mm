@@ -23,6 +23,7 @@ id<MTLCommandQueue> g_queue = nil;
 id<MTLComputePipelineState> g_p_rms = nil;
 id<MTLComputePipelineState> g_p_add = nil;
 id<MTLComputePipelineState> g_p_silu = nil;
+id<MTLComputePipelineState> g_p_act = nil;
 id<MTLComputePipelineState> g_p_kda = nil;
 id<MTLComputePipelineState> g_p_gemm_f32 = nil;
 id<MTLComputePipelineState> g_p_gemm_i4 = nil;
@@ -33,6 +34,7 @@ using namespace metal;
 
 struct RmsArgs { int nrows; int D; float eps; int has_w; };
 struct ElemArgs { int n; };
+struct ActArgs { int n; float a; float b; int kind; };
 struct KdaArgs { int P; int K; int H; int hd; };
 struct GemmArgs { int S; int I; int O; int qgs; };
 
@@ -94,6 +96,45 @@ kernel void op_silu_mul(device float *g [[buffer(0)]],
                         uint gid [[thread_position_in_grid]]) {
     if (gid >= (uint)e.n) return;
     g[gid] = silu_from(g[gid]) * u[gid];
+}
+
+kernel void op_act_mul(device float *g [[buffer(0)]],
+                       device const float *u [[buffer(1)]],
+                       constant ActArgs &e [[buffer(2)]],
+                       uint gid [[thread_position_in_grid]]) {
+    if (gid >= (uint)e.n) return;
+    float gv = g[gid];
+    float uv = u[gid];
+    if (e.kind == 1) {
+        float lim = e.a;
+        if (lim > 0.0f && gv > lim)
+            gv = lim;
+        float s = silu_from(gv);
+        if (lim > 0.0f) {
+            if (uv > lim)
+                uv = lim;
+            if (uv < -lim)
+                uv = -lim;
+        }
+        g[gid] = s * uv;
+    } else if (e.kind == 2) {
+        float b1 = e.a;
+        float b2 = e.b;
+        if (b1 == 0.0f)
+            b1 = 1.0f;
+        if (b2 == 0.0f)
+            b2 = 1.0f;
+        float sg;
+        if (gv >= 0.0f)
+            sg = 1.0f / (1.0f + exp(-gv));
+        else {
+            float z = exp(gv);
+            sg = z / (1.0f + z);
+        }
+        g[gid] = b1 * tanh(gv / b1) * sg * b2 * tanh(uv / b2);
+    } else {
+        g[gid] = silu_from(gv) * uv;
+    }
 }
 
 kernel void op_kda_fused(device float *win_q [[buffer(0)]],
@@ -228,6 +269,11 @@ struct RmsArgs {
 struct ElemArgs {
     int n;
 };
+struct ActArgs {
+    int n;
+    float a, b;
+    int kind;
+};
 struct KdaArgs {
     int P, K, H, hd;
 };
@@ -323,27 +369,90 @@ bool kda_args_ok(const float *win_q, const float *qt, const float *win_k, const 
            beta && oh && P == H * hd && K >= 1 && H >= 1 && hd >= 1;
 }
 
+void apply_act(float *g, const float *u, int n, Act act, float a, float b) {
+    if (!g || !u || n < 1)
+        return;
+    if (act == Act::ClampSwiGLU) {
+        for (int i = 0; i < n; ++i)
+            g[i] = quant::clamped_swiglu(g[i], u[i], a);
+        return;
+    }
+    if (act == Act::Situ) {
+        for (int i = 0; i < n; ++i)
+            g[i] = quant::situ_glu(g[i], u[i], a, b);
+        return;
+    }
+    quant::silu_mul(g, u, n);
+}
+
+void cpu_route(const float *nrm, const float *router_w, const float *router_bias, int D, int E,
+               int K, float rscale, int *idx_out, float *w_out) {
+    if (!nrm || !router_w || !idx_out || !w_out || D < 1 || E < 1 || K < 1)
+        return;
+    std::vector<float> scores(static_cast<size_t>(E), 0.f);
+    std::vector<float> choice(static_cast<size_t>(E), 0.f);
+    quant::matmul_f32(scores.data(), nrm, router_w, 1, D, E);
+    for (int i = 0; i < E; ++i) {
+        scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+        const float b = router_bias ? router_bias[i] : 0.f;
+        choice[static_cast<size_t>(i)] = scores[static_cast<size_t>(i)] + b;
+    }
+    moe_topk(choice.data(), E, K, idx_out, w_out, scores.data());
+    if (rscale != 1.f) {
+        const int kk = K > E ? E : K;
+        for (int i = 0; i < kk; ++i)
+            w_out[i] *= rscale;
+    }
+}
+
+void cpu_layer_decode_full(float *x, const float *attn, const float *in_ln, const float *post_ln,
+                           const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                           float eps, Act act, float act_a, float act_b, const float *router_w,
+                           const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                           float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    if (in_ln && inrm_out)
+        quant::rmsnorm(x, in_ln, inrm_out, D, eps);
+    if (attn) {
+        for (int i = 0; i < D; ++i)
+            x[i] += attn[i];
+    }
+    quant::rmsnorm(x, post_ln, nrm_out, D, eps);
+    if (shg && shu && shd && Iinter > 0 && sh_out) {
+        std::vector<float> gate(static_cast<size_t>(Iinter));
+        std::vector<float> up(static_cast<size_t>(Iinter));
+        quant::matmul_f32(gate.data(), nrm_out, shg, 1, D, Iinter);
+        quant::matmul_f32(up.data(), nrm_out, shu, 1, D, Iinter);
+        apply_act(gate.data(), up.data(), Iinter, act, act_a, act_b);
+        quant::matmul_f32(sh_out, gate.data(), shd, 1, Iinter, D);
+    }
+    cpu_route(nrm_out, router_w, router_bias, D, E, K, rscale, idx_out, w_out);
+}
+
 void cpu_layer_decode(float *x, const float *attn, const float *post_ln, const float *shg,
                       const float *shu, const float *shd, int D, int Iinter, float eps,
                       float *nrm_out, float *sh_out) {
-    for (int i = 0; i < D; ++i)
-        x[i] += attn[i];
-    quant::rmsnorm(x, post_ln, nrm_out, D, eps);
-    if (!shg || !shu || !shd || Iinter < 1)
-        return;
-    std::vector<float> gate(static_cast<size_t>(Iinter));
-    std::vector<float> up(static_cast<size_t>(Iinter));
-    quant::matmul_f32(gate.data(), nrm_out, shg, 1, D, Iinter);
-    quant::matmul_f32(up.data(), nrm_out, shu, 1, D, Iinter);
-    quant::silu_mul(gate.data(), up.data(), Iinter);
-    if (sh_out)
-        quant::matmul_f32(sh_out, gate.data(), shd, 1, Iinter, D);
+    cpu_layer_decode_full(x, attn, nullptr, post_ln, shg, shu, shd, D, Iinter, eps, Act::Silu, 0.f,
+                          0.f, nullptr, nullptr, 0, 0, 1.f, nullptr, nrm_out, sh_out, nullptr,
+                          nullptr);
+}
+
+void cpu_layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, const float *post_ln,
+                          const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                          float eps, Act act, float act_a, float act_b, const float *router_w,
+                          const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                          float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    cpu_kda_fused(kda.win_q, kda.qt, kda.win_k, kda.kt, kda.win_v, kda.tv, kda.taps_q, kda.taps_k,
+                  kda.taps_v, kda.S, kda.alpha, kda.beta, kda.oh, kda.P, kda.K, kda.H, kda.hd);
+    cpu_layer_decode_full(x, kda.oh, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                          act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out, sh_out,
+                          idx_out, w_out);
 }
 
 void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
                    const void *const *u, const void *const *d, const float *const *gs,
                    const float *const *us, const float *const *ds, const float *xg, const int *xoff,
-                   const int *nr, const int *rows, const float *rw, float *out, int S) {
+                   const int *nr, const int *rows, const float *rw, float *out, int S, Act act,
+                   float act_a, float act_b) {
     (void)qgs;
     int base = 0;
     std::vector<float> gate, up, hh;
@@ -366,7 +475,7 @@ void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *cons
         if (fmt == 0) {
             quant::matmul_f32(gate.data(), xe, static_cast<const float *>(g[e]), nre, D, Iinter);
             quant::matmul_f32(up.data(), xe, static_cast<const float *>(u[e]), nre, D, Iinter);
-            quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+            apply_act(gate.data(), up.data(), nre * Iinter, act, act_a, act_b);
             quant::matmul_f32(hh.data(), gate.data(), static_cast<const float *>(d[e]), nre, Iinter,
                               D);
         } else {
@@ -374,7 +483,7 @@ void cpu_moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *cons
                                    D, Iinter);
             quant::matmul_int4_g64(up.data(), xe, static_cast<const uint8_t *>(u[e]), us[e], nre, D,
                                    Iinter);
-            quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+            apply_act(gate.data(), up.data(), nre * Iinter, act, act_a, act_b);
             quant::matmul_int4_g64(hh.data(), gate.data(), static_cast<const uint8_t *>(d[e]), ds[e],
                                    nre, Iinter, D);
         }
@@ -448,6 +557,7 @@ void drop_metal() {
     g_p_rms = nil;
     g_p_add = nil;
     g_p_silu = nil;
+    g_p_act = nil;
     g_p_kda = nil;
     g_p_gemm_f32 = nil;
     g_p_gemm_i4 = nil;
@@ -489,6 +599,7 @@ bool init() {
         g_p_rms = pso("op_rmsnorm");
         g_p_add = pso("op_add");
         g_p_silu = pso("op_silu_mul");
+        g_p_act = pso("op_act_mul");
         g_p_kda = pso("op_kda_fused");
         g_p_gemm_f32 = pso("op_gemm_f32");
         g_p_gemm_i4 = pso("op_gemm_int4_g64");
@@ -682,18 +793,37 @@ bool kda_fused_token(float *win_q, float *qt, float *win_k, float *kt, float *wi
 bool layer_decode(float *x, const float *attn, const float *post_ln, const float *shg,
                   const float *shu, const float *shd, int D, int Iinter, float eps, float *nrm_out,
                   float *sh_out) {
-    if (!x || !attn || !post_ln || !nrm_out || D < 1)
+    return layer_decode_full(x, attn, nullptr, post_ln, shg, shu, shd, D, Iinter, eps, Act::Silu,
+                             0.f, 0.f, nullptr, nullptr, 0, 0, 1.f, nullptr, nrm_out, sh_out,
+                             nullptr, nullptr);
+}
+
+bool layer_decode_full(float *x, const float *attn, const float *in_ln, const float *post_ln,
+                       const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                       float eps, Act act, float act_a, float act_b, const float *router_w,
+                       const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                       float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    if (!x || !post_ln || !nrm_out || D < 1)
         return false;
     const bool want_sh = shg && shu && shd && Iinter > 0 && sh_out;
-    if (!g_use_metal || !g_p_add || !g_p_rms || (want_sh && !g_p_gemm_f32)) {
-        cpu_layer_decode(x, attn, post_ln, shg, shu, shd, D, Iinter, eps, nrm_out, sh_out);
+    const bool want_rt = router_w && E > 0 && K > 0 && idx_out && w_out;
+    const bool need_act = want_sh && act != Act::Silu;
+    if (!attn || !g_use_metal || !g_p_add || !g_p_rms || (want_sh && !g_p_gemm_f32) ||
+        (need_act && !g_p_act) || (want_rt && !g_p_gemm_f32)) {
+        cpu_layer_decode_full(x, attn, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                              act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out, sh_out,
+                              idx_out, w_out);
         return true;
     }
+    if (in_ln && inrm_out)
+        quant::rmsnorm(x, in_ln, inrm_out, D, eps);
     @autoreleasepool {
         const size_t db = sizeof(float) * static_cast<size_t>(D);
         const size_t ib = want_sh ? sizeof(float) * static_cast<size_t>(Iinter) : 0;
         const size_t shg_b = want_sh ? sizeof(float) * static_cast<size_t>(Iinter) * D : 0;
         const size_t shd_b = want_sh ? sizeof(float) * static_cast<size_t>(D) * Iinter : 0;
+        const size_t rb = want_rt ? sizeof(float) * static_cast<size_t>(E) * D : 0;
+        const size_t sb = want_rt ? sizeof(float) * static_cast<size_t>(E) : 0;
         id<MTLBuffer> bx = buf_bytes(x, db);
         id<MTLBuffer> ba = buf_bytes(attn, db);
         id<MTLBuffer> bw = buf_bytes(post_ln, db);
@@ -704,14 +834,22 @@ bool layer_decode(float *x, const float *attn, const float *post_ln, const float
         id<MTLBuffer> bgate = want_sh ? buf_empty(ib) : nil;
         id<MTLBuffer> bup = want_sh ? buf_empty(ib) : nil;
         id<MTLBuffer> bsho = want_sh ? buf_empty(db) : nil;
-        if (!bx || !ba || !bw || !bn || (want_sh && (!bshg || !bshu || !bshd || !bgate || !bup || !bsho))) {
-            cpu_layer_decode(x, attn, post_ln, shg, shu, shd, D, Iinter, eps, nrm_out, sh_out);
+        id<MTLBuffer> brw = want_rt ? buf_bytes(router_w, rb) : nil;
+        id<MTLBuffer> bsc = want_rt ? buf_empty(sb) : nil;
+        if (!bx || !ba || !bw || !bn ||
+            (want_sh && (!bshg || !bshu || !bshd || !bgate || !bup || !bsho)) ||
+            (want_rt && (!brw || !bsc))) {
+            cpu_layer_decode_full(x, attn, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                                  act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out,
+                                  sh_out, idx_out, w_out);
             return true;
         }
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
         if (!cb || !enc) {
-            cpu_layer_decode(x, attn, post_ln, shg, shu, shd, D, Iinter, eps, nrm_out, sh_out);
+            cpu_layer_decode_full(x, attn, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                                  act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out,
+                                  sh_out, idx_out, w_out);
             return true;
         }
         ElemArgs ea{D};
@@ -724,20 +862,191 @@ bool layer_decode(float *x, const float *attn, const float *post_ln, const float
                       sizeof(g1));
             dispatch2(enc, g_p_gemm_f32, static_cast<uint>(Iinter), 1u, @[ bn, bshu, bup ], &g1,
                       sizeof(g1));
-            ElemArgs se{Iinter};
-            dispatch1(enc, g_p_silu, static_cast<uint>(Iinter), @[ bgate, bup ], &se, sizeof(se));
+            ActArgs aa{Iinter, act_a, act_b, static_cast<int>(act)};
+            if (g_p_act)
+                dispatch1(enc, g_p_act, static_cast<uint>(Iinter), @[ bgate, bup ], &aa, sizeof(aa));
+            else {
+                ElemArgs se{Iinter};
+                dispatch1(enc, g_p_silu, static_cast<uint>(Iinter), @[ bgate, bup ], &se, sizeof(se));
+            }
             GemmArgs g2{1, Iinter, D, 0};
             dispatch2(enc, g_p_gemm_f32, static_cast<uint>(D), 1u, @[ bgate, bshd, bsho ], &g2,
                       sizeof(g2));
         }
+        if (want_rt) {
+            GemmArgs gr{1, D, E, 0};
+            dispatch2(enc, g_p_gemm_f32, static_cast<uint>(E), 1u, @[ bn, brw, bsc ], &gr,
+                      sizeof(gr));
+        }
         if (!commit_wait(cb, enc)) {
-            cpu_layer_decode(x, attn, post_ln, shg, shu, shd, D, Iinter, eps, nrm_out, sh_out);
+            cpu_layer_decode_full(x, attn, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                                  act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out,
+                                  sh_out, idx_out, w_out);
             return true;
         }
         std::memcpy(x, [bx contents], db);
         std::memcpy(nrm_out, [bn contents], db);
         if (want_sh)
             std::memcpy(sh_out, [bsho contents], db);
+        if (want_rt) {
+            std::vector<float> scores(static_cast<size_t>(E));
+            std::memcpy(scores.data(), [bsc contents], sb);
+            std::vector<float> choice(static_cast<size_t>(E));
+            for (int i = 0; i < E; ++i) {
+                scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+                const float b = router_bias ? router_bias[i] : 0.f;
+                choice[static_cast<size_t>(i)] = scores[static_cast<size_t>(i)] + b;
+            }
+            moe_topk(choice.data(), E, K, idx_out, w_out, scores.data());
+            if (rscale != 1.f) {
+                const int kk = K > E ? E : K;
+                for (int i = 0; i < kk; ++i)
+                    w_out[i] *= rscale;
+            }
+        }
+    }
+    return true;
+}
+
+bool layer_decode_kda(const KdaToken &kda, float *x, const float *in_ln, const float *post_ln,
+                      const float *shg, const float *shu, const float *shd, int D, int Iinter,
+                      float eps, Act act, float act_a, float act_b, const float *router_w,
+                      const float *router_bias, int E, int K, float rscale, float *inrm_out,
+                      float *nrm_out, float *sh_out, int *idx_out, float *w_out) {
+    if (!kda_args_ok(kda.win_q, kda.qt, kda.win_k, kda.kt, kda.win_v, kda.tv, kda.taps_q, kda.taps_k,
+                     kda.taps_v, kda.S, kda.alpha, kda.beta, kda.oh, kda.P, kda.K, kda.H, kda.hd) ||
+        !x || !post_ln || !nrm_out || D < 1 || kda.P < D)
+        return false;
+    const bool want_sh = shg && shu && shd && Iinter > 0 && sh_out;
+    const bool want_rt = router_w && E > 0 && K > 0 && idx_out && w_out;
+    const bool need_act = want_sh && act != Act::Silu;
+    if (!g_use_metal || !g_p_kda || !g_p_add || !g_p_rms || (want_sh && !g_p_gemm_f32) ||
+        (need_act && !g_p_act) || (want_rt && !g_p_gemm_f32)) {
+        cpu_layer_decode_kda(kda, x, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                             act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out, sh_out,
+                             idx_out, w_out);
+        return true;
+    }
+    if (in_ln && inrm_out)
+        quant::rmsnorm(x, in_ln, inrm_out, D, eps);
+    @autoreleasepool {
+        const size_t pb = sizeof(float) * static_cast<size_t>(kda.P);
+        const size_t wb = sizeof(float) * static_cast<size_t>(kda.P) * kda.K;
+        const size_t sbk = sizeof(float) * static_cast<size_t>(kda.H) * kda.hd * kda.hd;
+        const size_t ab = sizeof(float) * static_cast<size_t>(kda.H) * kda.hd;
+        const size_t bb = sizeof(float) * static_cast<size_t>(kda.H);
+        const size_t db = sizeof(float) * static_cast<size_t>(D);
+        const size_t ib = want_sh ? sizeof(float) * static_cast<size_t>(Iinter) : 0;
+        const size_t shg_b = want_sh ? sizeof(float) * static_cast<size_t>(Iinter) * D : 0;
+        const size_t shd_b = want_sh ? sizeof(float) * static_cast<size_t>(D) * Iinter : 0;
+        const size_t rb = want_rt ? sizeof(float) * static_cast<size_t>(E) * D : 0;
+        const size_t sb = want_rt ? sizeof(float) * static_cast<size_t>(E) : 0;
+        id<MTLBuffer> b_win_q = buf_bytes(kda.win_q, wb);
+        id<MTLBuffer> b_qt = buf_bytes(kda.qt, pb);
+        id<MTLBuffer> b_win_k = buf_bytes(kda.win_k, wb);
+        id<MTLBuffer> b_kt = buf_bytes(kda.kt, pb);
+        id<MTLBuffer> b_win_v = buf_bytes(kda.win_v, wb);
+        id<MTLBuffer> b_tv = buf_bytes(kda.tv, pb);
+        id<MTLBuffer> b_tq = buf_bytes(kda.taps_q, wb);
+        id<MTLBuffer> b_tk = buf_bytes(kda.taps_k, wb);
+        id<MTLBuffer> b_tvt = buf_bytes(kda.taps_v, wb);
+        id<MTLBuffer> b_S = buf_bytes(kda.S, sbk);
+        id<MTLBuffer> b_al = buf_bytes(kda.alpha, ab);
+        id<MTLBuffer> b_be = buf_bytes(kda.beta, bb);
+        id<MTLBuffer> b_oh = buf_bytes(kda.oh, pb);
+        id<MTLBuffer> bx = buf_bytes(x, db);
+        id<MTLBuffer> bw = buf_bytes(post_ln, db);
+        id<MTLBuffer> bn = buf_empty(db);
+        id<MTLBuffer> bshg = want_sh ? buf_bytes(shg, shg_b) : nil;
+        id<MTLBuffer> bshu = want_sh ? buf_bytes(shu, shg_b) : nil;
+        id<MTLBuffer> bshd = want_sh ? buf_bytes(shd, shd_b) : nil;
+        id<MTLBuffer> bgate = want_sh ? buf_empty(ib) : nil;
+        id<MTLBuffer> bup = want_sh ? buf_empty(ib) : nil;
+        id<MTLBuffer> bsho = want_sh ? buf_empty(db) : nil;
+        id<MTLBuffer> brw = want_rt ? buf_bytes(router_w, rb) : nil;
+        id<MTLBuffer> bsc = want_rt ? buf_empty(sb) : nil;
+        if (!b_win_q || !b_qt || !b_win_k || !b_kt || !b_win_v || !b_tv || !b_tq || !b_tk ||
+            !b_tvt || !b_S || !b_al || !b_be || !b_oh || !bx || !bw || !bn ||
+            (want_sh && (!bshg || !bshu || !bshd || !bgate || !bup || !bsho)) ||
+            (want_rt && (!brw || !bsc))) {
+            cpu_layer_decode_kda(kda, x, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                                 act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out,
+                                 sh_out, idx_out, w_out);
+            return true;
+        }
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+        if (!cb || !enc) {
+            cpu_layer_decode_kda(kda, x, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                                 act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out,
+                                 sh_out, idx_out, w_out);
+            return true;
+        }
+        KdaArgs kargs{kda.P, kda.K, kda.H, kda.hd};
+        NSArray *kbufs = @[
+            b_win_q, b_qt, b_win_k, b_kt, b_win_v, b_tv, b_tq, b_tk, b_tvt, b_S, b_al, b_be, b_oh
+        ];
+        dispatch1(enc, g_p_kda, static_cast<uint>(kda.H), kbufs, &kargs, sizeof(kargs));
+        ElemArgs ea{D};
+        dispatch1(enc, g_p_add, static_cast<uint>(D), @[ bx, b_oh ], &ea, sizeof(ea));
+        RmsArgs ra{1, D, eps, 1};
+        dispatch1(enc, g_p_rms, 1u, @[ bx, bw, bn ], &ra, sizeof(ra));
+        if (want_sh) {
+            GemmArgs g1{1, D, Iinter, 0};
+            dispatch2(enc, g_p_gemm_f32, static_cast<uint>(Iinter), 1u, @[ bn, bshg, bgate ], &g1,
+                      sizeof(g1));
+            dispatch2(enc, g_p_gemm_f32, static_cast<uint>(Iinter), 1u, @[ bn, bshu, bup ], &g1,
+                      sizeof(g1));
+            ActArgs aa{Iinter, act_a, act_b, static_cast<int>(act)};
+            if (g_p_act)
+                dispatch1(enc, g_p_act, static_cast<uint>(Iinter), @[ bgate, bup ], &aa, sizeof(aa));
+            else {
+                ElemArgs se{Iinter};
+                dispatch1(enc, g_p_silu, static_cast<uint>(Iinter), @[ bgate, bup ], &se, sizeof(se));
+            }
+            GemmArgs g2{1, Iinter, D, 0};
+            dispatch2(enc, g_p_gemm_f32, static_cast<uint>(D), 1u, @[ bgate, bshd, bsho ], &g2,
+                      sizeof(g2));
+        }
+        if (want_rt) {
+            GemmArgs gr{1, D, E, 0};
+            dispatch2(enc, g_p_gemm_f32, static_cast<uint>(E), 1u, @[ bn, brw, bsc ], &gr,
+                      sizeof(gr));
+        }
+        if (!commit_wait(cb, enc)) {
+            cpu_layer_decode_kda(kda, x, in_ln, post_ln, shg, shu, shd, D, Iinter, eps, act, act_a,
+                                 act_b, router_w, router_bias, E, K, rscale, inrm_out, nrm_out,
+                                 sh_out, idx_out, w_out);
+            return true;
+        }
+        std::memcpy(kda.win_q, [b_win_q contents], wb);
+        std::memcpy(kda.qt, [b_qt contents], pb);
+        std::memcpy(kda.win_k, [b_win_k contents], wb);
+        std::memcpy(kda.kt, [b_kt contents], pb);
+        std::memcpy(kda.win_v, [b_win_v contents], wb);
+        std::memcpy(kda.tv, [b_tv contents], pb);
+        std::memcpy(kda.S, [b_S contents], sbk);
+        std::memcpy(kda.oh, [b_oh contents], pb);
+        std::memcpy(x, [bx contents], db);
+        std::memcpy(nrm_out, [bn contents], db);
+        if (want_sh)
+            std::memcpy(sh_out, [bsho contents], db);
+        if (want_rt) {
+            std::vector<float> scores(static_cast<size_t>(E));
+            std::memcpy(scores.data(), [bsc contents], sb);
+            std::vector<float> choice(static_cast<size_t>(E));
+            for (int i = 0; i < E; ++i) {
+                scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+                const float b = router_bias ? router_bias[i] : 0.f;
+                choice[static_cast<size_t>(i)] = scores[static_cast<size_t>(i)] + b;
+            }
+            moe_topk(choice.data(), E, K, idx_out, w_out, scores.data());
+            if (rscale != 1.f) {
+                const int kk = K > E ? E : K;
+                for (int i = 0; i < kk; ++i)
+                    w_out[i] *= rscale;
+            }
+        }
     }
     return true;
 }
@@ -745,16 +1054,19 @@ bool layer_decode(float *x, const float *attn, const float *post_ln, const float
 bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g,
                const void *const *u, const void *const *d, const float *const *gs,
                const float *const *us, const float *const *ds, const float *xg, const int *xoff,
-               const int *nr, const int *rows, const float *rw, float *out, int S) {
+               const int *nr, const int *rows, const float *rw, float *out, int S, Act act,
+               float act_a, float act_b) {
     if (nb < 1 || D < 1 || !out || !xg || (fmt != 0 && fmt != 4))
         return false;
     if (!xoff || !nr)
         return false;
     const bool use_i4 = fmt == 4;
-    const bool metal_ok =
-        g_use_metal && g_p_silu && ((use_i4 && g_p_gemm_i4) || (!use_i4 && g_p_gemm_f32));
+    const bool need_act = act != Act::Silu;
+    const bool metal_ok = g_use_metal && (need_act ? g_p_act : g_p_silu) &&
+                          ((use_i4 && g_p_gemm_i4) || (!use_i4 && g_p_gemm_f32));
     if (!metal_ok || Iinter < 1) {
-        cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, S);
+        cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out, S,
+                      act, act_a, act_b);
         return true;
     }
     @autoreleasepool {
@@ -780,7 +1092,7 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
         id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
         if (!cb || !enc) {
             cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out,
-                          S);
+                          S, act, act_a, act_b);
             return true;
         }
 
@@ -855,9 +1167,15 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
                 dispatch2(enc, g_p_gemm_f32, static_cast<uint>(Iinter), static_cast<uint>(nre),
                           @[ bxe, bu, bup ], &ag, sizeof(ag));
             }
-            ElemArgs se{nre * Iinter};
-            dispatch1(enc, g_p_silu, static_cast<uint>(nre * Iinter), @[ bgate, bup ], &se,
-                      sizeof(se));
+            if (g_p_act) {
+                ActArgs aa{nre * Iinter, act_a, act_b, static_cast<int>(act)};
+                dispatch1(enc, g_p_act, static_cast<uint>(nre * Iinter), @[ bgate, bup ], &aa,
+                          sizeof(aa));
+            } else {
+                ElemArgs se{nre * Iinter};
+                dispatch1(enc, g_p_silu, static_cast<uint>(nre * Iinter), @[ bgate, bup ], &se,
+                          sizeof(se));
+            }
             if (use_i4) {
                 dispatch2(enc, g_p_gemm_i4, static_cast<uint>(D), static_cast<uint>(nre),
                           @[ bgate, bd, bds, bhh ], &ad, sizeof(ad));
@@ -870,7 +1188,7 @@ bool moe_block(int nb, int D, int Iinter, int fmt, int qgs, const void *const *g
         }
         if (!ok || !commit_wait(cb, enc)) {
             cpu_moe_block(nb, D, Iinter, fmt, qgs, g, u, d, gs, us, ds, xg, xoff, nr, rows, rw, out,
-                          S);
+                          S, act, act_a, act_b);
             return true;
         }
         if (!rows || !rw)
