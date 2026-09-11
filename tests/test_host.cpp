@@ -3597,12 +3597,14 @@ static void test_wave1_new_families() {
         write_file(qdir + "/config.json",
                    R"({"model_type":"qwen3_5_moe","hidden_size":64,"num_hidden_layers":4,)"
                    R"("vocab_size":128,"num_attention_heads":4,"num_key_value_heads":2,)"
-                   R"("head_dim":16,"layer_types":["linear","linear","linear","full_attention"]})");
+                   R"("head_dim":16,"layer_types":["linear","linear","linear","full_attention"],)"
+                   R"("n_routed_experts":4,"num_experts_per_tok":2})");
         auto e = make_engine(Family::Qwen36);
         RuntimeConfig rt;
         std::string err;
         CHECK(e->load(qdir, rt, err) == Status::Ok);
         CHECK(e->describe().find("gdn=delta") != std::string::npos);
+        CHECK(e->describe().find("routed=experts") != std::string::npos);
         GenParams gp;
         gp.max_new_tokens = 2;
         gp.apply_template = false;
