@@ -78,6 +78,7 @@ public:
         std::vector<int> history;
         std::vector<float> h;
         std::vector<std::vector<float>> k_cache, v_cache;
+        std::vector<std::vector<float>> gdn_s, gdn_hq, gdn_hk, gdn_hv;
         int pos = 0;
         int t_max = 0;
         bool have = false;
@@ -137,6 +138,20 @@ public:
             Tmax = 1;
         std::vector<float> h(H), nrm(H), q(std::max(H, qd)), k(kvd), v(kvd), ctx(qd), g(I), u(I),
             d(H);
+        const int L = std::max(cfg_.n_layers, 0);
+        std::vector<std::vector<float>> gdn_s(static_cast<size_t>(L)),
+            gdn_hq(static_cast<size_t>(L)), gdn_hk(static_cast<size_t>(L)),
+            gdn_hv(static_cast<size_t>(L));
+        for (int l = 0; l < L; ++l) {
+            if (!layer_gdn(l))
+                continue;
+            gdn_s[static_cast<size_t>(l)].assign(static_cast<size_t>(nq) * hd * hd, 0.f);
+            gdn_hq[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * qd, 0.f);
+            gdn_hk[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+            gdn_hv[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+        }
+        std::vector<float> vis_mean;
+        encode_vision(gp.image_rgb, gp.image_w, gp.image_h, vis_mean);
         std::vector<std::vector<float>> k_cache, v_cache;
         const bool any_gqa = has_gqa();
         if (any_gqa) {
@@ -155,6 +170,11 @@ public:
             if (tid < 0 || tid >= cfg_.vocab)
                 tid = 0;
             std::memcpy(h.data(), embed_.data() + static_cast<size_t>(tid) * H, H * sizeof(float));
+            if (!vis_mean.empty() &&
+                (pos == 0 || (gp.image_token >= 0 && tid == gp.image_token))) {
+                for (int i = 0; i < H && i < static_cast<int>(vis_mean.size()); ++i)
+                    h[static_cast<size_t>(i)] += vis_mean[static_cast<size_t>(i)];
+            }
         };
         auto step = [&](int token) {
             embed(token);
@@ -164,7 +184,30 @@ public:
                                cfg_.rms_eps);
                 {
                     AccTimer t(t_attn_);
-                    if (layer_gqa(l) && tpos < Tmax) {
+                    if (layer_gdn(l) && layer_gqa(l)) {
+                        quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(),
+                                          1, H, qd);
+                        quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(),
+                                          1, H, kvd);
+                        quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(),
+                                          1, H, kvd);
+                        if (l < static_cast<int>(conv_q_.size()) &&
+                            !conv_q_[static_cast<size_t>(l)].empty()) {
+                            gdn_conv4(q.data(), gdn_hq[static_cast<size_t>(l)].data(),
+                                      conv_q_[static_cast<size_t>(l)].data(), qd);
+                            gdn_conv4(k.data(), gdn_hk[static_cast<size_t>(l)].data(),
+                                      conv_k_[static_cast<size_t>(l)].data(), kvd);
+                            gdn_conv4(v.data(), gdn_hv[static_cast<size_t>(l)].data(),
+                                      conv_v_[static_cast<size_t>(l)].data(), kvd);
+                        }
+                        const int ss = nq * hd * hd;
+                        if (static_cast<int>(gdn_s[static_cast<size_t>(l)].size()) < ss)
+                            gdn_s[static_cast<size_t>(l)].assign(static_cast<size_t>(ss), 0.f);
+                        gdn_delta(gdn_s[static_cast<size_t>(l)].data(), ctx.data(), q.data(),
+                                  k.data(), v.data(), nq, nkv, hd, group);
+                        quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(),
+                                          1, qd, H);
+                    } else if (layer_gqa(l) && tpos < Tmax) {
                         quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(),
                                           1, H, qd);
                         quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(),
@@ -296,8 +339,9 @@ public:
         std::ostringstream os;
         os << "qwen38 hidden=" << cfg_.hidden << " layers=" << cfg_.n_layers
            << " q_heads=" << cfg_.n_q_heads << " kv_heads=" << cfg_.n_kv_heads
-           << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
-           << (has_gqa() ? "GQA" : "stand-in") << "; vision=off)";
+           << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " gdn="
+           << (has_gdn() ? "delta" : "off") << " (CPU " << (has_gqa() ? "GQA" : "stand-in")
+           << "; vision=" << (vis_in_.empty() ? "off" : "vit2") << ")";
         return os.str();
     }
 
@@ -653,14 +697,20 @@ private:
 
     void slot_alloc(Qwen38Slot &s, int t_max) {
         const int H = std::max(cfg_.hidden, 1);
+        const int nq = std::max(cfg_.n_q_heads, 1);
         const int nkv = std::max(cfg_.n_kv_heads, 1);
         const int hd = std::max(cfg_.head_dim, 1);
+        const int qd = nq * hd;
         const int kvd = nkv * hd;
         const int Tmax = std::max(t_max, 1);
         const int L = std::max(cfg_.n_layers, 0);
         s.h.assign(static_cast<size_t>(H), 0.f);
         s.k_cache.assign(static_cast<size_t>(L), {});
         s.v_cache.assign(static_cast<size_t>(L), {});
+        s.gdn_s.assign(static_cast<size_t>(L), {});
+        s.gdn_hq.assign(static_cast<size_t>(L), {});
+        s.gdn_hk.assign(static_cast<size_t>(L), {});
+        s.gdn_hv.assign(static_cast<size_t>(L), {});
         if (has_gqa()) {
             for (int l = 0; l < L; ++l) {
                 if (layer_gqa(l)) {
@@ -668,6 +718,14 @@ private:
                     s.v_cache[static_cast<size_t>(l)].assign(static_cast<size_t>(Tmax) * kvd, 0.f);
                 }
             }
+        }
+        for (int l = 0; l < L; ++l) {
+            if (!layer_gdn(l))
+                continue;
+            s.gdn_s[static_cast<size_t>(l)].assign(static_cast<size_t>(nq) * hd * hd, 0.f);
+            s.gdn_hq[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * qd, 0.f);
+            s.gdn_hk[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+            s.gdn_hv[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
         }
         s.t_max = Tmax;
         s.pos = 0;
@@ -738,7 +796,42 @@ private:
                            cfg_.rms_eps);
             {
                 AccTimer t(t_attn_);
-                if (layer_gqa(l) && tpos < Tmax &&
+                if (layer_gdn(l) && layer_gqa(l)) {
+                    quant::matmul_f32(q.data(), nrm.data(), wq_[static_cast<size_t>(l)].data(), 1, H,
+                                      qd);
+                    quant::matmul_f32(k.data(), nrm.data(), wk_[static_cast<size_t>(l)].data(), 1, H,
+                                      kvd);
+                    quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(), 1, H,
+                                      kvd);
+                    if (l >= static_cast<int>(s.gdn_s.size())) {
+                        s.gdn_s.resize(static_cast<size_t>(l) + 1);
+                        s.gdn_hq.resize(static_cast<size_t>(l) + 1);
+                        s.gdn_hk.resize(static_cast<size_t>(l) + 1);
+                        s.gdn_hv.resize(static_cast<size_t>(l) + 1);
+                    }
+                    if (s.gdn_hq[static_cast<size_t>(l)].size() < static_cast<size_t>(4) * qd)
+                        s.gdn_hq[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * qd, 0.f);
+                    if (s.gdn_hk[static_cast<size_t>(l)].size() < static_cast<size_t>(4) * kvd)
+                        s.gdn_hk[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+                    if (s.gdn_hv[static_cast<size_t>(l)].size() < static_cast<size_t>(4) * kvd)
+                        s.gdn_hv[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+                    if (l < static_cast<int>(conv_q_.size()) &&
+                        !conv_q_[static_cast<size_t>(l)].empty()) {
+                        gdn_conv4(q.data(), s.gdn_hq[static_cast<size_t>(l)].data(),
+                                  conv_q_[static_cast<size_t>(l)].data(), qd);
+                        gdn_conv4(k.data(), s.gdn_hk[static_cast<size_t>(l)].data(),
+                                  conv_k_[static_cast<size_t>(l)].data(), kvd);
+                        gdn_conv4(v.data(), s.gdn_hv[static_cast<size_t>(l)].data(),
+                                  conv_v_[static_cast<size_t>(l)].data(), kvd);
+                    }
+                    const int ss = nq * hd * hd;
+                    if (static_cast<int>(s.gdn_s[static_cast<size_t>(l)].size()) < ss)
+                        s.gdn_s[static_cast<size_t>(l)].assign(static_cast<size_t>(ss), 0.f);
+                    gdn_delta(s.gdn_s[static_cast<size_t>(l)].data(), ctx.data(), q.data(), k.data(),
+                              v.data(), nq, nkv, hd, group);
+                    quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(), 1,
+                                      qd, H);
+                } else if (layer_gqa(l) && tpos < Tmax &&
                     l < static_cast<int>(s.k_cache.size()) &&
                     l < static_cast<int>(s.v_cache.size()) &&
                     !s.k_cache[static_cast<size_t>(l)].empty() &&
@@ -838,6 +931,101 @@ private:
                                &s.token_lps, &s.top_lps);
     }
 
+    static void gdn_conv4(float *x, float *hist, const float *w, int D) {
+        if (!x || !hist || D < 1)
+            return;
+        std::memmove(hist + D, hist, static_cast<size_t>(3) * D * sizeof(float));
+        std::memcpy(hist, x, static_cast<size_t>(D) * sizeof(float));
+        if (!w)
+            return;
+        for (int d = 0; d < D; ++d) {
+            float acc = 0.f;
+            for (int t = 0; t < 4; ++t)
+                acc += w[static_cast<size_t>(t) * D + d] * hist[static_cast<size_t>(t) * D + d];
+            x[d] = acc;
+        }
+    }
+
+    static void gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v,
+                          int nq, int nkv, int hd, int group) {
+        if (!S || !ctx || !q || !k || !v || nq < 1 || nkv < 1 || hd < 1)
+            return;
+        for (int hh = 0; hh < nq; ++hh) {
+            const int kh = std::min(hh / std::max(group, 1), nkv - 1);
+            const float *kk = k + kh * hd;
+            const float *vv = v + kh * hd;
+            const float *qq = q + hh * hd;
+            float *Sh = S + static_cast<size_t>(hh) * hd * hd;
+            const float beta = 1.f / (1.f + std::exp(-kk[0]));
+            std::vector<float> attn(static_cast<size_t>(hd), 0.f);
+            for (int j = 0; j < hd; ++j) {
+                float a = 0.f;
+                for (int i = 0; i < hd; ++i)
+                    a += Sh[static_cast<size_t>(i) * hd + j] * kk[i];
+                attn[static_cast<size_t>(j)] = a;
+            }
+            for (int i = 0; i < hd; ++i)
+                for (int j = 0; j < hd; ++j)
+                    Sh[static_cast<size_t>(i) * hd + j] +=
+                        beta * (kk[i] * vv[j] - kk[i] * attn[static_cast<size_t>(j)]);
+            for (int j = 0; j < hd; ++j) {
+                float o = 0.f;
+                for (int i = 0; i < hd; ++i)
+                    o += qq[i] * Sh[static_cast<size_t>(i) * hd + j];
+                ctx[hh * hd + j] = o;
+            }
+        }
+    }
+
+    bool layer_gdn(int l) const {
+        return l >= 0 && l < static_cast<int>(cfg_.is_kda.size()) && cfg_.is_kda[l];
+    }
+    bool has_gdn() const {
+        for (int l = 0; l < cfg_.n_layers; ++l)
+            if (layer_gdn(l))
+                return true;
+        return false;
+    }
+
+    void encode_vision(const float *rgb, int w, int h, std::vector<float> &mean) const {
+        mean.clear();
+        const int H = std::max(cfg_.hidden, 1);
+        const int pin = 8 * 8 * 3;
+        if (!rgb || w < 8 || h < 8 || vis_in_.size() < static_cast<size_t>(H) * pin)
+            return;
+        const int gh = h / 8, gw = w / 8;
+        mean.assign(static_cast<size_t>(H), 0.f);
+        std::vector<float> patch(static_cast<size_t>(pin)), hid(static_cast<size_t>(H)),
+            n1(static_cast<size_t>(H)), mid(static_cast<size_t>(H));
+        int n = 0;
+        for (int py = 0; py < gh; ++py) {
+            for (int px = 0; px < gw; ++px) {
+                for (int dy = 0; dy < 8; ++dy)
+                    for (int dx = 0; dx < 8; ++dx)
+                        for (int c = 0; c < 3; ++c) {
+                            const int yy = py * 8 + dy, xx = px * 8 + dx;
+                            patch[static_cast<size_t>((dy * 8 + dx) * 3 + c)] =
+                                rgb[(static_cast<size_t>(yy) * w + xx) * 3 + c];
+                        }
+                quant::matmul_f32(hid.data(), patch.data(), vis_in_.data(), 1, pin, H);
+                quant::rmsnorm(hid.data(), vis_n1_.empty() ? nullptr : vis_n1_.data(), n1.data(), H,
+                               cfg_.rms_eps);
+                quant::matmul_f32(mid.data(), n1.data(), vis_l1_.data(), 1, H, H);
+                for (int i = 0; i < H; ++i)
+                    mid[static_cast<size_t>(i)] =
+                        mid[static_cast<size_t>(i)] *
+                        (1.f / (1.f + std::exp(-mid[static_cast<size_t>(i)])));
+                quant::matmul_f32(hid.data(), mid.data(), vis_l2_.data(), 1, H, H);
+                for (int i = 0; i < H; ++i)
+                    mean[static_cast<size_t>(i)] += hid[static_cast<size_t>(i)];
+                ++n;
+            }
+        }
+        if (n > 0)
+            for (int i = 0; i < H; ++i)
+                mean[static_cast<size_t>(i)] /= static_cast<float>(n);
+    }
+
     bool layer_gqa(int l) const {
         return l >= 0 && l < static_cast<int>(wk_.size()) && l < static_cast<int>(wv_.size()) &&
                !wk_[static_cast<size_t>(l)].empty() && !wv_[static_cast<size_t>(l)].empty();
@@ -882,6 +1070,9 @@ private:
         gate_.assign(static_cast<size_t>(L), {});
         up_.assign(static_cast<size_t>(L), {});
         down_.assign(static_cast<size_t>(L), {});
+        conv_q_.assign(static_cast<size_t>(L), {});
+        conv_k_.assign(static_cast<size_t>(L), {});
+        conv_v_.assign(static_cast<size_t>(L), {});
         for (int l = 0; l < L; ++l) {
             ones(in_n_[static_cast<size_t>(l)], H);
             ones(out_n_[static_cast<size_t>(l)], H);
@@ -894,7 +1085,21 @@ private:
             xavier(gate_[static_cast<size_t>(l)], I, H, 420 + l);
             xavier(up_[static_cast<size_t>(l)], I, H, 430 + l);
             xavier(down_[static_cast<size_t>(l)], H, I, 440 + l);
+            conv_q_[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * qd, 0.f);
+            conv_k_[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+            conv_v_[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+            for (int d = 0; d < qd; ++d)
+                conv_q_[static_cast<size_t>(l)][static_cast<size_t>(d)] = 1.f;
+            for (int d = 0; d < kvd; ++d) {
+                conv_k_[static_cast<size_t>(l)][static_cast<size_t>(d)] = 1.f;
+                conv_v_[static_cast<size_t>(l)][static_cast<size_t>(d)] = 1.f;
+            }
         }
+        const int pin = 8 * 8 * 3;
+        xavier(vis_in_, H, pin, 700);
+        ones(vis_n1_, H);
+        xavier(vis_l1_, H, H, 701);
+        xavier(vis_l2_, H, H, 702);
     }
 
     void alloc_synthetic() { alloc_weights(true); }
@@ -1053,6 +1258,8 @@ private:
     bool from_checkpoint_ = false;
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
+    std::vector<std::vector<float>> conv_q_, conv_k_, conv_v_;
+    std::vector<float> vis_in_, vis_n1_, vis_l1_, vis_l2_;
     Qwen38Slot slots_[kMaxKvSlots];
     double t_attn_ = 0, t_head_ = 0;
 };

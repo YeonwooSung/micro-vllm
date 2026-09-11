@@ -3565,6 +3565,29 @@ static void test_wave1_new_families() {
         CHECK(sniff_family("/tmp/llama.cpp/models/qwen3.6-colibri") == Family::Qwen36);
     }
     {
+        std::string q38d = tmpdir();
+        write_file(q38d + "/config.json",
+                   R"({"model_type":"qwen4_exp","hidden_size":64,"num_hidden_layers":4,)"
+                   R"("vocab_size":128,"num_attention_heads":4,"num_key_value_heads":2,)"
+                   R"("head_dim":16,"layer_types":["linear","linear","linear","full_attention"]})");
+        auto e = make_engine(Family::Qwen38);
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(e->load(q38d, rt, err) == Status::Ok);
+        CHECK(e->describe().find("gdn=delta") != std::string::npos);
+        CHECK(e->describe().find("vision=vit2") != std::string::npos);
+        std::vector<float> img(16 * 16 * 3, 0.5f);
+        GenParams gp;
+        gp.max_new_tokens = 2;
+        gp.apply_template = false;
+        gp.image_rgb = img.data();
+        gp.image_w = 16;
+        gp.image_h = 16;
+        GenResult out;
+        CHECK(e->generate({1, 2}, gp, out, err) == Status::Ok);
+        CHECK(static_cast<int>(out.tokens.size()) == 2);
+    }
+    {
         std::string qdir = tmpdir();
         write_file(qdir + "/config.json",
                    R"({"model_type":"qwen3_5_moe","hidden_size":64,"num_hidden_layers":4,)"

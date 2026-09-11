@@ -244,8 +244,8 @@ void apply_family_defaults(ModelConfig &cfg) {
             cfg.moe.n_experts = 128;
         if (!cfg.moe.topk)
             cfg.moe.topk = 8;
-        if (cfg.family == Family::Qwen36 && cfg.n_layers > 0 &&
-            static_cast<int>(cfg.is_kda.size()) == cfg.n_layers) {
+        if ((cfg.family == Family::Qwen36 || cfg.family == Family::Qwen38) &&
+            cfg.n_layers > 0 && static_cast<int>(cfg.is_kda.size()) == cfg.n_layers) {
             bool any = false;
             for (int8_t v : cfg.is_kda)
                 if (v)
