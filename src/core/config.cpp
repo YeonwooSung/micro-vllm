@@ -338,6 +338,25 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
     if (has(mt, "kimi") || has(arch, "Kimi") || has(mt, "kimi_linear") ||
         has(arch, "KimiLinear"))
         return Family::KimiK3;
+
+    std::string mt_l = mt, arch_l = arch;
+    for (char &c : mt_l)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    for (char &c : arch_l)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    // Official colibri types (qwen3_5_moe / qwen4_exp) ship text_config +
+    // layer_types. Match them before the GLM catch-all.
+    if (has(mt_l, "qwen4_exp") || has(arch_l, "qwen4exp") || has(mt_l, "qwen3.8") ||
+        has(mt_l, "qwen38") || has(mt_l, "qwen3_8") || has(arch_l, "qwen3.8") ||
+        has(arch_l, "qwen38"))
+        return Family::Qwen38;
+    if (has(mt_l, "qwen3_5_moe") || has(arch_l, "qwen3_5moe") || has(mt_l, "qwen3.6") ||
+        has(mt_l, "qwen36") || has(mt_l, "qwen3_6") || has(arch_l, "qwen3.6") ||
+        has(arch_l, "qwen36"))
+        return Family::Qwen36;
+
     if (has(mt, "glm") || has(arch, "Glm") || has(arch, "GLM") ||
         root.contains("text_config")) {
         // GLM-5.3 is the K3-shaped hybrid; GLM-5.2 is also glm* but we treat
@@ -353,21 +372,6 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
         return Family::Olmoe;
     if (has(mt, "inkling") || has(arch, "Inkling"))
         return Family::Inkling;
-    {
-        std::string mt_l = mt, arch_l = arch;
-        for (char &c : mt_l)
-            if (c >= 'A' && c <= 'Z')
-                c = static_cast<char>(c - 'A' + 'a');
-        for (char &c : arch_l)
-            if (c >= 'A' && c <= 'Z')
-                c = static_cast<char>(c - 'A' + 'a');
-        if (has(mt_l, "qwen3.8") || has(mt_l, "qwen38") || has(mt_l, "qwen3_8") ||
-            has(arch_l, "qwen3.8") || has(arch_l, "qwen38"))
-            return Family::Qwen38;
-        if (has(mt_l, "qwen3.6") || has(mt_l, "qwen36") || has(mt_l, "qwen3_6") ||
-            has(arch_l, "qwen3.6") || has(arch_l, "qwen36"))
-            return Family::Qwen36;
-    }
     if (has(mt, "llama") || has(arch, "Llama"))
         return Family::Llama;
     if (has(mt, "minimax") || has(arch, "MiniMax") || has(mt, "h3") || lower_has("dit") ||
@@ -398,21 +402,21 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
         return Family::Glm53;
     if (dir.find("minimax") != std::string::npos || dir.find("h3") != std::string::npos)
         return Family::H3;
-    if (dir.find("llama") != std::string::npos)
-        return Family::Llama;
-    if (dir.find("dsv4") != std::string::npos || dir.find("deepseek-v4") != std::string::npos ||
-        dir.find("deepseek_v4") != std::string::npos || dir.find("deepseekv4") != std::string::npos)
-        return Family::Dsv4;
-    if (dir.find("qwen38") != std::string::npos || dir.find("qwen3.8") != std::string::npos ||
-        dir.find("qwen3-8") != std::string::npos)
+    if (dir.find("qwen4_exp") != std::string::npos || dir.find("qwen38") != std::string::npos ||
+        dir.find("qwen3.8") != std::string::npos)
         return Family::Qwen38;
-    if (dir.find("qwen36") != std::string::npos || dir.find("qwen3.6") != std::string::npos ||
-        dir.find("qwen3-6") != std::string::npos)
+    if (dir.find("qwen3_5_moe") != std::string::npos || dir.find("qwen36") != std::string::npos ||
+        dir.find("qwen3.6") != std::string::npos || dir.find("qwen3.5") != std::string::npos)
         return Family::Qwen36;
     if (dir.find("olmoe") != std::string::npos)
         return Family::Olmoe;
     if (dir.find("inkling") != std::string::npos)
         return Family::Inkling;
+    if (dir.find("llama") != std::string::npos)
+        return Family::Llama;
+    if (dir.find("dsv4") != std::string::npos || dir.find("deepseek-v4") != std::string::npos ||
+        dir.find("deepseek_v4") != std::string::npos || dir.find("deepseekv4") != std::string::npos)
+        return Family::Dsv4;
     return Family::Unknown;
 }
 

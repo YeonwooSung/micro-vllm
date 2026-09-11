@@ -3544,6 +3544,25 @@ static void test_wave1_new_families() {
         CHECK(e->generate({1, 2}, gp, out, err) == Status::Ok);
         CHECK(static_cast<int>(out.tokens.size()) == 2);
     }
+    {
+        std::string q36 = tmpdir();
+        write_file(q36 + "/config.json",
+                   R"({"model_type":"qwen3_5_moe","architectures":["Qwen3_5MoeForCausalLM"],)"
+                   R"("text_config":{"layer_types":["full_attention","linear"]}})");
+        CHECK(sniff_family(q36) == Family::Qwen36);
+        std::string q38 = tmpdir();
+        write_file(q38 + "/config.json",
+                   R"({"model_type":"qwen4_exp","architectures":["Qwen4ExpForCausalLM"],)"
+                   R"("text_config":{"layer_types":["full_attention"]}})");
+        CHECK(sniff_family(q38) == Family::Qwen38);
+        std::string glm = tmpdir();
+        write_file(glm + "/config.json",
+                   R"({"model_type":"glm","architectures":["Glm5ForConditionalGeneration"],)"
+                   R"("text_config":{"layer_types":["linear","full_attention"]}})");
+        CHECK(sniff_family(glm) == Family::Glm53);
+        CHECK(sniff_family("/tmp/Qwen3-8B-Instruct") != Family::Qwen38);
+        CHECK(sniff_family("/tmp/llama.cpp/models/qwen3.6-colibri") == Family::Qwen36);
+    }
 }
 
 static void test_live_dump_env() {
