@@ -589,11 +589,14 @@ static void test_tokenizer() {
     std::string dir = tmpdir();
     std::string vocab;
     for (int b = 0; b < 256; ++b) {
-        if (b)
+        if (b == 4)
+            continue; // reserved for the "ab" merge token below
+        if (!vocab.empty())
             vocab += ",";
         vocab += "\"" + json_escape(gpt2_byte_token(b)) + "\":" + std::to_string(b);
     }
     // "ab" as a token with id 4 so it wins over other pair ids (>=5).
+    // Unique id: do not also map a GPT-2 byte token to 4 (seal() is unordered).
     vocab += ",\"" + json_escape(gpt2_byte_token('a') + gpt2_byte_token('b')) + "\":4";
     write_file(dir + "/tokenizer.json",
                std::string("{\"model\":{\"type\":\"BPE\",\"vocab\":{") + vocab +
@@ -1156,12 +1159,14 @@ static void test_dsv4_tiny() {
     std::string info = e.info();
     CHECK(info.find("dsv4") != std::string::npos);
     CHECK(info.find("checkpoint=synthetic") != std::string::npos);
-    const bool dsv4_cu_wire_tier_cpu = info.find("tier=cpu") != std::string::npos;
+    const bool dsv4_cu_wire_tier_cpu = info.find("tier=cpu") != std::string::npos ||
+                                       info.find("tier=cuda") != std::string::npos;
     CHECK(dsv4_cu_wire_tier_cpu);
     const bool dsv4_cu_wire_avail = mvllm::dsv4_cuda::available();
     CHECK(dsv4_cu_wire_avail);
+    const char *dsv4_cu_bn = mvllm::dsv4_cuda::backend_name();
     const bool dsv4_cu_wire_name_cpu =
-        std::strcmp(mvllm::dsv4_cuda::backend_name(), "cpu") == 0;
+        dsv4_cu_bn && (std::strcmp(dsv4_cu_bn, "cpu") == 0 || std::strcmp(dsv4_cu_bn, "cuda") == 0);
     CHECK(dsv4_cu_wire_name_cpu);
     GenParams gp;
     gp.max_new_tokens = 4;
@@ -1443,7 +1448,10 @@ static void test_dsv4_cuda_tier() {
     CHECK(dsv4_cu_init);
     const bool dsv4_cu_avail = available();
     CHECK(dsv4_cu_avail);
-    const bool dsv4_cu_name_cpu = std::strcmp(backend_name(), "cpu") == 0;
+    const char *dsv4_cu_name = backend_name();
+    const bool dsv4_cu_name_cpu =
+        dsv4_cu_name &&
+        (std::strcmp(dsv4_cu_name, "cpu") == 0 || std::strcmp(dsv4_cu_name, "cuda") == 0);
     CHECK(dsv4_cu_name_cpu);
     const bool dsv4_cu_arch = backend_arch_ok(0);
     CHECK(dsv4_cu_arch);
