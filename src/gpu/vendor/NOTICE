@@ -9,5 +9,19 @@ h3_shaders.metal
   Copyright (c) 2026 Salvatore Sanfilippo.
   See /h3.c-main/LICENSE.
 
+coli/backend_metal.h, coli/backend_metal.mm
+  Copied from colibri c/ (Apache License 2.0).
+
+h3/h3_gpu.h, h3/h3_gpu.m
+  Copied from h3.c (MIT License).
+  Copyright (c) 2026 Salvatore Sanfilippo.
+
+These files are vendored for reference and optional hosts.
+Default host binary does not compile the ObjC TUs.
+`-DMVLLM_OFFICIAL_METAL_HOST=ON` builds them.
+h3_gpu.m has small SDK-14 guards (MTLMathModeSafe / MPSGraph SDPA
+need macOS 15); those paths return nil on older SDKs.
+`-DMVLLM_VENDOR_METAL=ON` compile-tests the .metal files at init.
+
 These files are vendored for reference and future device ports.
 They are not compiled into the default host binary.

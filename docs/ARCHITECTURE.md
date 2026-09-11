@@ -213,6 +213,8 @@ Vendored official Metal kernels (`src/gpu/vendor/`):
 - `h3_shaders.metal` copied from h3.c (MIT). See `NOTICE`. Not linked into
   the default host binary. `-DMVLLM_VENDOR_METAL=ON` compile-tests both
   files at Metal `init()` (`vendor_loaded()` / `vendor_status()`).
+  `-DMVLLM_OFFICIAL_METAL_HOST=ON` compiles vendored `backend_metal.mm`
+  and `h3_gpu.m` (`official_metal::status()`).
 
 Metal ops (`mvllm::metal_ops`):
 

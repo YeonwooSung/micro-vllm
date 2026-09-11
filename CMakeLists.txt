@@ -11,6 +11,7 @@ endif()
 option(MVLLM_GPU_CUDA "CUDA expert GEMM and H3 DiT in the host engine (not the Llama demo)" OFF)
 option(MVLLM_GPU_VULKAN "Probe a Vulkan instance in vk_ops (ops stay CPU until kernels land)" OFF)
 option(MVLLM_VENDOR_METAL "Compile-test vendored official MSL at Metal init (not the default link)" OFF)
+option(MVLLM_OFFICIAL_METAL_HOST "Build vendored colibri backend_metal.mm and h3_gpu.m" OFF)
 # DSV4 CUDA tier: src/gpu/dsv4_cuda.cpp is always-on (CPU API); .cu is optional.
 
 if(NOT USE_HIP AND MVLLM_CUDA AND NOT MVLLM_HOST_ONLY)
@@ -121,6 +122,7 @@ set(MVLLM_HOST_SOURCES
     src/gpu/metal_ops.cpp
     src/gpu/metal_h3.cpp
     src/gpu/vk_ops.cpp
+    src/gpu/official_metal.cpp
 )
 
 if(APPLE AND MVLLM_METAL)
@@ -166,6 +168,28 @@ if(APPLE AND MVLLM_METAL)
     if(MVLLM_VENDOR_METAL)
         target_compile_definitions(mvllm_host PUBLIC MVLLM_VENDOR_METAL=1
             MVLLM_VENDOR_METAL_DIR="${CMAKE_SOURCE_DIR}/src/gpu/vendor")
+    endif()
+    if(MVLLM_OFFICIAL_METAL_HOST)
+        enable_language(OBJC)
+        set_source_files_properties(src/gpu/vendor/coli/backend_metal.mm PROPERTIES
+            COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
+        set_source_files_properties(src/gpu/vendor/h3/h3_gpu.m PROPERTIES
+            LANGUAGE OBJC
+            COMPILE_FLAGS "-fobjc-arc")
+        target_sources(mvllm_host PRIVATE
+            src/gpu/vendor/coli/backend_metal.mm
+            src/gpu/vendor/h3/h3_gpu.m)
+        target_include_directories(mvllm_host PRIVATE
+            ${CMAKE_SOURCE_DIR}/src/gpu/vendor/coli
+            ${CMAKE_SOURCE_DIR}/src/gpu/vendor/h3)
+        target_compile_definitions(mvllm_host PUBLIC MVLLM_OFFICIAL_METAL_HOST=1)
+        if(NOT MVLLM_VENDOR_METAL)
+            target_compile_definitions(mvllm_host PUBLIC
+                MVLLM_VENDOR_METAL_DIR="${CMAKE_SOURCE_DIR}/src/gpu/vendor")
+        endif()
+        target_link_libraries(mvllm_host PUBLIC
+            "-framework MetalPerformanceShaders"
+            "-framework MetalPerformanceShadersGraph")
     endif()
 endif()
 if(MVLLM_GPU_CUDA)

@@ -5,6 +5,7 @@
 #include "gpu/dsv4_cuda.hpp"
 #include "gpu/metal_ops.hpp"
 #include "gpu/metal_h3.hpp"
+#include "gpu/official_metal.hpp"
 #include "gpu/vk_ops.hpp"
 #include "legacy/llama_dims.hpp"
 #include "io/dump_env.hpp"
@@ -2319,6 +2320,17 @@ static void test_metal_ops_tier() {
 #else
     CHECK(!vendor_loaded());
 #endif
+    {
+        CHECK(mvllm::official_metal::init());
+        CHECK(mvllm::official_metal::status() != nullptr);
+#if defined(MVLLM_OFFICIAL_METAL_HOST)
+        CHECK(mvllm::official_metal::coli_available() || mvllm::official_metal::h3_available() ||
+              std::strncmp(mvllm::official_metal::status(), "err:", 4) == 0);
+#else
+        CHECK(std::strcmp(mvllm::official_metal::status(), "off") == 0);
+#endif
+        mvllm::official_metal::shutdown();
+    }
 
     {
         const float metal_ops_ones[4] = {1.f, 1.f, 1.f, 1.f};
