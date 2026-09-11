@@ -22,6 +22,10 @@ bool available() { return true; }
 
 const char *backend_name() { return "cpu"; }
 
+bool vendor_loaded() { return false; }
+
+const char *vendor_status() { return "off"; }
+
 bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -30,6 +31,9 @@ id<MTLComputePipelineState> g_p_gdn = nil;
 id<MTLComputePipelineState> g_p_gemm_f32 = nil;
 id<MTLComputePipelineState> g_p_gemm_i4 = nil;
 id<MTLComputePipelineState> g_p_gemm_mx = nil;
+id<MTLLibrary> g_vendor_lib = nil;
+bool g_vendor = false;
+char g_vendor_st[256] = "off";
 
 static const char *kMetalSrc = R"MSL(
 #include <metal_stdlib>
@@ -801,6 +805,29 @@ bool init() {
             g_use_metal = true;
         else
             drop_metal();
+#if defined(MVLLM_VENDOR_METAL)
+        g_vendor = false;
+        std::snprintf(g_vendor_st, sizeof(g_vendor_st), "off");
+        if (g_dev) {
+            NSString *path = @MVLLM_VENDOR_METAL_DIR "/coli_metal_kernels.metal";
+            NSError *verr = nil;
+            NSString *vsrc = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding
+                                                          error:&verr];
+            if (!vsrc) {
+                std::snprintf(g_vendor_st, sizeof(g_vendor_st), "err: read");
+            } else {
+                MTLCompileOptions *opt = [MTLCompileOptions new];
+                id<MTLLibrary> vlib = [g_dev newLibraryWithSource:vsrc options:opt error:&verr];
+                if (!vlib) {
+                    std::snprintf(g_vendor_st, sizeof(g_vendor_st), "err: compile");
+                } else {
+                    g_vendor_lib = vlib;
+                    g_vendor = true;
+                    std::snprintf(g_vendor_st, sizeof(g_vendor_st), "coli");
+                }
+            }
+        }
+#endif
         return true;
     }
 }
@@ -808,6 +835,9 @@ bool init() {
 void shutdown() {
     @autoreleasepool {
         drop_metal();
+        g_vendor_lib = nil;
+        g_vendor = false;
+        std::snprintf(g_vendor_st, sizeof(g_vendor_st), "off");
         g_inited = false;
     }
 }
@@ -815,6 +845,10 @@ void shutdown() {
 bool available() { return g_inited; }
 
 const char *backend_name() { return g_use_metal ? "metal" : "cpu"; }
+
+bool vendor_loaded() { return g_vendor; }
+
+const char *vendor_status() { return g_vendor_st; }
 
 bool rmsnorm(float *y, const float *x, const float *w, int nrows, int D, float eps) {
     if (!y || !x || nrows < 1 || D < 1)

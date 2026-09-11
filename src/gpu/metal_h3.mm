@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -564,6 +565,9 @@ struct MetalH3 {
     id<MTLComputePipelineState> p_attn_c = nil;
     id<MTLComputePipelineState> p_pool = nil;
     bool ready = false;
+    bool vendor = false;
+    char vendor_st[256] = "off";
+    id<MTLLibrary> vendor_lib = nil;
 
     bool setup() {
         @autoreleasepool {
@@ -585,6 +589,29 @@ struct MetalH3 {
                 NSError *e = nil;
                 return [device newComputePipelineStateWithFunction:fn error:&e];
             };
+#if defined(MVLLM_VENDOR_METAL)
+            vendor = false;
+            std::snprintf(vendor_st, sizeof(vendor_st), "off");
+            {
+                NSString *path = @MVLLM_VENDOR_METAL_DIR "/h3_shaders.metal";
+                NSError *verr = nil;
+                NSString *vsrc = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding
+                                                              error:&verr];
+                if (!vsrc) {
+                    std::snprintf(vendor_st, sizeof(vendor_st), "err: read");
+                } else {
+                    MTLCompileOptions *opt = [MTLCompileOptions new];
+                    id<MTLLibrary> vlib = [device newLibraryWithSource:vsrc options:opt error:&verr];
+                    if (!vlib) {
+                        std::snprintf(vendor_st, sizeof(vendor_st), "err: compile");
+                    } else {
+                        vendor_lib = vlib;
+                        vendor = true;
+                        std::snprintf(vendor_st, sizeof(vendor_st), "h3");
+                    }
+                }
+            }
+#endif
             p_gemm = pso("gemm_f32");
             p_bf16 = pso("bf16_to_f32");
             p_adaln = pso("adaln");
@@ -616,6 +643,9 @@ struct MetalH3 {
                 p_attn_c = p_pool = nil;
         queue = nil;
         device = nil;
+        vendor_lib = nil;
+        vendor = false;
+        std::snprintf(vendor_st, sizeof(vendor_st), "off");
         ready = false;
     }
 };
@@ -1085,6 +1115,10 @@ void shutdown() { g.teardown(); }
 bool available() { return g.ready; }
 
 const char *backend_name() { return g.ready ? "metal" : "cpu"; }
+
+bool vendor_loaded() { return g.vendor; }
+
+const char *vendor_status() { return g.vendor_st; }
 
 bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
@@ -1758,6 +1792,8 @@ bool init() { return true; }
 void shutdown() {}
 bool available() { return true; }
 const char *backend_name() { return "cpu"; }
+bool vendor_loaded() { return false; }
+const char *vendor_status() { return "off"; }
 
 bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,

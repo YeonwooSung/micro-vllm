@@ -211,7 +211,8 @@ Vendored official Metal kernels (`src/gpu/vendor/`):
 
 - `coli_metal_kernels.metal` extracted from colibri `backend_metal.mm` (Apache-2.0).
 - `h3_shaders.metal` copied from h3.c (MIT). See `NOTICE`. Not linked into
-  the default host binary.
+  the default host binary. `-DMVLLM_VENDOR_METAL=ON` compile-tests both
+  files at Metal `init()` (`vendor_loaded()` / `vendor_status()`).
 
 Metal ops (`mvllm::metal_ops`):
 

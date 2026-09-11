@@ -9,12 +9,15 @@ namespace metal_h3 {
 // init (CPU always; Metal when compiled). dit_residual uses the same blob
 // layout as h3_dit_block_cpu. gemm_int8, nax_mlp, vae_transformer_block,
 // vision_block, and audio_pre_block are host ports of h3.c GPU ops.
-// Official h3_gpu.m / h3_shaders.metal are not vendored.
+// Official MSL is in src/gpu/vendor/h3_shaders.metal (compile-tested when
+// MVLLM_VENDOR_METAL=ON). h3_gpu.m host is not vendored.
 
 bool init();
 void shutdown();
 bool available();
 const char *backend_name(); // "metal" or "cpu"
+bool vendor_loaded();
+const char *vendor_status();
 
 // AdaLN / QK-norm / RoPE DiT residual. CPU fallback if Metal is missing or
 // the call fails. adaln_mod is [6, hidden] (scale0, shift0, scale1, shift1,

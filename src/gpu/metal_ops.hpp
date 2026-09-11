@@ -9,13 +9,15 @@ namespace metal_ops {
 // available() is true after a successful init (CPU always; Metal when compiled).
 // Returning false means the caller should use the existing host kernel.
 // Stage B full-layer (in_ln → MLA/KDA → residual → shared → router) is
-// layer_decode_full / layer_decode_kda / layer_decode_mla. Official Metal
-// shaders are not vendored.
+// layer_decode_full / layer_decode_kda / layer_decode_mla.
+// Official MSL in src/gpu/vendor/ is compile-tested when MVLLM_VENDOR_METAL=ON.
 
 bool init();
 void shutdown();
 bool available();
 const char *backend_name(); // "metal" or "cpu"
+bool vendor_loaded();        // official coli kernels compiled at init
+const char *vendor_status(); // "coli" | "off" | "err: ..."
 
 bool rmsnorm(float *y, const float *x, const float *w, int nrows, int D, float eps);
 bool add(float *y, const float *a, size_t n);

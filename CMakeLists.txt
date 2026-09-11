@@ -10,6 +10,7 @@ else()
 endif()
 option(MVLLM_GPU_CUDA "CUDA expert GEMM and H3 DiT in the host engine (not the Llama demo)" OFF)
 option(MVLLM_GPU_VULKAN "Probe a Vulkan instance in vk_ops (ops stay CPU until kernels land)" OFF)
+option(MVLLM_VENDOR_METAL "Compile-test vendored official MSL at Metal init (not the default link)" OFF)
 # DSV4 CUDA tier: src/gpu/dsv4_cuda.cpp is always-on (CPU API); .cu is optional.
 
 if(NOT USE_HIP AND MVLLM_CUDA AND NOT MVLLM_HOST_ONLY)
@@ -162,6 +163,10 @@ if(APPLE AND MVLLM_METAL)
         COMPILE_FLAGS "-x objective-c++ -fobjc-arc")
     target_compile_definitions(mvllm_host PUBLIC MVLLM_WITH_METAL=1)
     target_link_libraries(mvllm_host PUBLIC "-framework Metal" "-framework Foundation")
+    if(MVLLM_VENDOR_METAL)
+        target_compile_definitions(mvllm_host PUBLIC MVLLM_VENDOR_METAL=1
+            MVLLM_VENDOR_METAL_DIR="${CMAKE_SOURCE_DIR}/src/gpu/vendor")
+    endif()
 endif()
 if(MVLLM_GPU_CUDA)
     set_target_properties(mvllm_host PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

@@ -2312,6 +2312,13 @@ static void test_metal_ops_tier() {
     CHECK(metal_ops_init);
     const bool metal_ops_avail = available();
     CHECK(metal_ops_avail);
+    CHECK(vendor_status() != nullptr);
+#if defined(MVLLM_VENDOR_METAL)
+    CHECK(vendor_loaded());
+    CHECK(std::strcmp(vendor_status(), "coli") == 0);
+#else
+    CHECK(!vendor_loaded());
+#endif
 
     {
         const float metal_ops_ones[4] = {1.f, 1.f, 1.f, 1.f};
@@ -2633,6 +2640,13 @@ static void test_metal_h3_tier() {
 
     const bool metal_h3_init = init();
     CHECK(metal_h3_init);
+    CHECK(vendor_status() != nullptr);
+#if defined(MVLLM_VENDOR_METAL)
+    CHECK(vendor_loaded());
+    CHECK(std::strcmp(vendor_status(), "h3") == 0);
+#else
+    CHECK(!vendor_loaded());
+#endif
 
     const int metal_h3_hidden = 8, metal_h3_inner = 8, metal_h3_ffn = 8, metal_h3_hd = 4,
               metal_h3_tokens = 2;

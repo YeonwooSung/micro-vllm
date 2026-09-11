@@ -354,6 +354,10 @@ bool available() { return g_inited; }
 
 const char *backend_name() { return "cpu"; }
 
+bool vendor_loaded() { return false; }
+
+const char *vendor_status() { return "off"; }
+
 bool rmsnorm(float *y, const float *x, const float *w, int nrows, int D, float eps) {
     if (!y || !x || nrows < 1 || D < 1)
         return false;
