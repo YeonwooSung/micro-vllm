@@ -1,4 +1,6 @@
 #include "family.hpp"
+#include "../gpu/coli_cuda.hpp"
+#include "../gpu/vk_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../serve/session.hpp"
@@ -118,6 +120,8 @@ public:
             alloc_synthetic();
             from_checkpoint_ = false;
         }
+        coli_cuda::init(nullptr, 0);
+        vk_ops::init();
         loaded_ = true;
         return Status::Ok;
     }
@@ -341,6 +345,8 @@ public:
            << (has_gqa() ? "GQA" : "stand-in")
            << "; routed="
            << (have_expert_mats() ? "experts" : (cfg_.moe.n_experts > 0 ? "mix" : "no"))
+           << "; coli=" << (coli_cuda::available() ? "cpu" : "off")
+           << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off")
            << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
     }
