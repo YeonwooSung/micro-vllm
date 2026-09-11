@@ -39,7 +39,9 @@ bool has_tokenizer_json(const std::string &dir) {
 bool h3_tok_load(const std::string &model_dir, Tokenizer &tok, std::string &err) {
     g_backend = "off";
     const std::string dir = tokenizer_dir(model_dir);
-    const std::string cands[] = {dir, with_slash(dir) + "tokenizer"};
+    const std::string root = with_slash(dir);
+    const std::string cands[] = {dir, root + "tokenizer", root + "FL2VA/tokenizer",
+                                 root + "Ref2VA/tokenizer", root + "transformer/tokenizer"};
     for (const std::string &cand : cands) {
         if (!has_tokenizer_json(cand))
             continue;

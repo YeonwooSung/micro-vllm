@@ -244,6 +244,21 @@ void apply_family_defaults(ModelConfig &cfg) {
             cfg.moe.n_experts = 128;
         if (!cfg.moe.topk)
             cfg.moe.topk = 8;
+        if (cfg.family == Family::Qwen36 && cfg.n_layers > 0 &&
+            static_cast<int>(cfg.is_kda.size()) == cfg.n_layers) {
+            bool any = false;
+            for (int8_t v : cfg.is_kda)
+                if (v)
+                    any = true;
+            if (!any) {
+                cfg.is_kda.assign(cfg.n_layers, 1);
+                cfg.is_full.assign(cfg.n_layers, 0);
+                for (int i = 3; i < cfg.n_layers; i += 4) {
+                    cfg.is_kda[i] = 0;
+                    cfg.is_full[i] = 1;
+                }
+            }
+        }
         break;
     case Family::Olmoe:
         if (!cfg.hidden)

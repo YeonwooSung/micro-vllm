@@ -260,8 +260,9 @@ Status h3_read_mp4(const std::string &path, std::vector<float> &rgb, int &frames
     }
     const std::string rawp = path + ".tmp.rgb";
     std::ostringstream cmd;
-    cmd << shell_quote(ffmpeg_bin()) << " -y -nostdin -hide_banner -loglevel error -i "
-        << shell_quote(path) << " -an -f rawvideo -pix_fmt rgb24 " << shell_quote(rawp);
+    cmd << shell_quote(ffmpeg_bin()) << " -y -nostdin -hide_banner -loglevel error -noautorotate -i "
+        << shell_quote(path)
+        << " -map 0:v:0 -an -f rawvideo -pix_fmt rgb24 " << shell_quote(rawp);
     int rc = std::system(cmd.str().c_str());
     std::ifstream in(rawp, std::ios::binary);
     if (rc != 0 || !in) {

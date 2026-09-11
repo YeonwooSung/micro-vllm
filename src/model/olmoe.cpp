@@ -226,16 +226,7 @@ public:
                 }
                 for (int i = 0; i < H; ++i)
                     h[i] += d[i];
-                quant::rmsnorm(h.data(), out_n_[static_cast<size_t>(l)].data(), nrm.data(), H,
-                               cfg_.rms_eps);
-                // Stage A: dense SwiGLU even if n_experts > 0 (routed experts later).
-                quant::matmul_f32(g.data(), nrm.data(), gate_[static_cast<size_t>(l)].data(), 1, H,
-                                  I);
-                quant::matmul_f32(u.data(), nrm.data(), up_[static_cast<size_t>(l)].data(), 1, H, I);
-                quant::silu_mul(g.data(), u.data(), I);
-                quant::matmul_f32(d.data(), g.data(), down_[static_cast<size_t>(l)].data(), 1, I, H);
-                for (int i = 0; i < H; ++i)
-                    h[i] += d[i];
+                apply_ffn(l, h.data(), nrm.data(), g.data(), u.data(), d.data(), H, I);
             }
             ++pos;
         };
@@ -298,6 +289,8 @@ public:
         os << "olmoe  hidden=" << cfg_.hidden << " layers=" << cfg_.n_layers
            << " q_heads=" << cfg_.n_q_heads << " kv_heads=" << cfg_.n_kv_heads
            << " experts=" << cfg_.moe.n_experts
+           << " routed="
+           << (cfg_.moe.n_experts > 0 && cfg_.moe.topk > 0 ? "yes" : "no")
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
            << (has_gqa() ? "GQA" : "stand-in") << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
@@ -805,14 +798,7 @@ private:
             }
             for (int i = 0; i < H; ++i)
                 s.h[static_cast<size_t>(i)] += d[static_cast<size_t>(i)];
-            quant::rmsnorm(s.h.data(), out_n_[static_cast<size_t>(l)].data(), nrm.data(), H,
-                           cfg_.rms_eps);
-            quant::matmul_f32(g.data(), nrm.data(), gate_[static_cast<size_t>(l)].data(), 1, H, I);
-            quant::matmul_f32(u.data(), nrm.data(), up_[static_cast<size_t>(l)].data(), 1, H, I);
-            quant::silu_mul(g.data(), u.data(), I);
-            quant::matmul_f32(d.data(), g.data(), down_[static_cast<size_t>(l)].data(), 1, I, H);
-            for (int i = 0; i < H; ++i)
-                s.h[static_cast<size_t>(i)] += d[static_cast<size_t>(i)];
+            apply_ffn(l, s.h.data(), nrm.data(), g.data(), u.data(), d.data(), H, I);
         }
         ++s.pos;
     }
@@ -838,6 +824,40 @@ private:
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
+    }
+
+    void apply_ffn(int l, float *h, float *nrm, float *g, float *u, float *d, int H, int I) {
+        quant::rmsnorm(h, out_n_[static_cast<size_t>(l)].data(), nrm, H, cfg_.rms_eps);
+        quant::matmul_f32(g, nrm, gate_[static_cast<size_t>(l)].data(), 1, H, I);
+        quant::matmul_f32(u, nrm, up_[static_cast<size_t>(l)].data(), 1, H, I);
+        quant::silu_mul(g, u, I);
+        quant::matmul_f32(d, g, down_[static_cast<size_t>(l)].data(), 1, I, H);
+        const int E = cfg_.moe.n_experts;
+        const int topk = cfg_.moe.topk;
+        if (E > 0 && topk > 0 && l >= 0 && l < static_cast<int>(router_.size()) &&
+            router_[static_cast<size_t>(l)].size() >=
+                static_cast<size_t>(E) * static_cast<size_t>(H)) {
+            std::vector<float> scores(static_cast<size_t>(E));
+            quant::matmul_f32(scores.data(), nrm, router_[static_cast<size_t>(l)].data(), 1, H, E);
+            for (int i = 0; i < E; ++i)
+                scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+            int idx[16] = {};
+            float ww[16] = {};
+            int K = topk;
+            if (K > 16)
+                K = 16;
+            if (K > E)
+                K = E;
+            if (K > 0)
+                moe_topk(scores.data(), E, K, idx, ww, scores.data());
+            float mix = 0.f;
+            for (int i = 0; i < K; ++i)
+                mix += ww[i];
+            for (int i = 0; i < H; ++i)
+                d[i] *= mix;
+        }
+        for (int i = 0; i < H; ++i)
+            h[i] += d[i];
     }
 
     bool layer_gqa(int l) const {
@@ -884,6 +904,8 @@ private:
         gate_.assign(static_cast<size_t>(L), {});
         up_.assign(static_cast<size_t>(L), {});
         down_.assign(static_cast<size_t>(L), {});
+        router_.assign(static_cast<size_t>(L), {});
+        const int E = cfg_.moe.n_experts;
         for (int l = 0; l < L; ++l) {
             ones(in_n_[static_cast<size_t>(l)], H);
             ones(out_n_[static_cast<size_t>(l)], H);
@@ -896,10 +918,12 @@ private:
             xavier(gate_[static_cast<size_t>(l)], I, H, 420 + l);
             xavier(up_[static_cast<size_t>(l)], I, H, 430 + l);
             xavier(down_[static_cast<size_t>(l)], H, I, 440 + l);
+            if (E > 0 && E <= 64)
+                xavier(router_[static_cast<size_t>(l)], E, H, 470 + l);
         }
     }
 
-    // Stage A: synthetic GQA + RoPE; FFN is always dense SwiGLU (routed later).
+    // Stage A: synthetic GQA + RoPE; FFN is dense SwiGLU, scaled by router top-k mix.
     void alloc_synthetic() { alloc_weights(true); }
 
     Status overlay_f32(const std::vector<io::StFile> &files, const std::string &name,
@@ -1056,6 +1080,7 @@ private:
     bool from_checkpoint_ = false;
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
+    std::vector<std::vector<float>> router_; // [L][E*H]
     OlmoeSlot slots_[kMaxKvSlots];
     double t_attn_ = 0, t_head_ = 0;
 };

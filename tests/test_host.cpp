@@ -12,6 +12,7 @@
 #include "io/safetensors.hpp"
 #include "io/shard_probe.hpp"
 #include "model/family.hpp"
+#include "model/h3_tok.hpp"
 #include "model/h3_vae.hpp"
 #include "quant/quant.hpp"
 #include "quant/weight.hpp"
@@ -3562,6 +3563,65 @@ static void test_wave1_new_families() {
         CHECK(sniff_family(glm) == Family::Glm53);
         CHECK(sniff_family("/tmp/Qwen3-8B-Instruct") != Family::Qwen38);
         CHECK(sniff_family("/tmp/llama.cpp/models/qwen3.6-colibri") == Family::Qwen36);
+    }
+    {
+        std::string qdir = tmpdir();
+        write_file(qdir + "/config.json",
+                   R"({"model_type":"qwen3_5_moe","hidden_size":64,"num_hidden_layers":4,)"
+                   R"("vocab_size":128,"num_attention_heads":4,"num_key_value_heads":2,)"
+                   R"("head_dim":16,"layer_types":["linear","linear","linear","full_attention"]})");
+        auto e = make_engine(Family::Qwen36);
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(e->load(qdir, rt, err) == Status::Ok);
+        CHECK(e->describe().find("gdn=hybrid") != std::string::npos);
+        GenParams gp;
+        gp.max_new_tokens = 2;
+        gp.apply_template = false;
+        GenResult out;
+        CHECK(e->generate({1, 2}, gp, out, err) == Status::Ok);
+        CHECK(static_cast<int>(out.tokens.size()) == 2);
+    }
+    {
+        std::string odir = tmpdir();
+        write_file(odir + "/config.json",
+                   R"({"model_type":"olmoe","hidden_size":64,"num_hidden_layers":2,)"
+                   R"("vocab_size":128,"num_attention_heads":4,"num_key_value_heads":2,)"
+                   R"("head_dim":16,"n_routed_experts":4,"num_experts_per_tok":2})");
+        auto e = make_engine(Family::Olmoe);
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(e->load(odir, rt, err) == Status::Ok);
+        CHECK(e->describe().find("routed=yes") != std::string::npos);
+        GenParams gp;
+        gp.max_new_tokens = 2;
+        gp.apply_template = false;
+        GenResult out;
+        CHECK(e->generate({1, 2}, gp, out, err) == Status::Ok);
+        CHECK(static_cast<int>(out.tokens.size()) == 2);
+    }
+    {
+        std::string idir = tmpdir();
+        write_file(idir + "/config.json",
+                   R"({"model_type":"inkling","hidden_size":64,"num_hidden_layers":2,)"
+                   R"("vocab_size":128,"num_attention_heads":4,"num_key_value_heads":2,)"
+                   R"("head_dim":16,"n_routed_experts":4,"num_experts_per_tok":2})");
+        auto e = make_engine(Family::Inkling);
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(e->load(idir, rt, err) == Status::Ok);
+        CHECK(e->describe().find("routed=yes") != std::string::npos);
+    }
+    {
+        std::string hdir = tmpdir();
+        ::mkdir((hdir + "/FL2VA").c_str(), 0755);
+        ::mkdir((hdir + "/FL2VA/tokenizer").c_str(), 0755);
+        write_file(hdir + "/FL2VA/tokenizer/tokenizer.json",
+                   R"({"model":{"type":"BPE","vocab":{"a":0},"merges":[]}})");
+        Tokenizer htk;
+        std::string herr;
+        CHECK(h3_tok_load(hdir, htk, herr));
+        CHECK(std::string(h3_tok_backend()) == "json");
     }
 }
 
