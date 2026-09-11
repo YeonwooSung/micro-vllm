@@ -3574,7 +3574,7 @@ static void test_wave1_new_families() {
         RuntimeConfig rt;
         std::string err;
         CHECK(e->load(qdir, rt, err) == Status::Ok);
-        CHECK(e->describe().find("gdn=hybrid") != std::string::npos);
+        CHECK(e->describe().find("gdn=delta") != std::string::npos);
         GenParams gp;
         gp.max_new_tokens = 2;
         gp.apply_template = false;
@@ -3592,7 +3592,7 @@ static void test_wave1_new_families() {
         RuntimeConfig rt;
         std::string err;
         CHECK(e->load(odir, rt, err) == Status::Ok);
-        CHECK(e->describe().find("routed=yes") != std::string::npos);
+        CHECK(e->describe().find("routed=experts") != std::string::npos);
         GenParams gp;
         gp.max_new_tokens = 2;
         gp.apply_template = false;
@@ -3610,7 +3610,7 @@ static void test_wave1_new_families() {
         RuntimeConfig rt;
         std::string err;
         CHECK(e->load(idir, rt, err) == Status::Ok);
-        CHECK(e->describe().find("routed=yes") != std::string::npos);
+        CHECK(e->describe().find("routed=experts") != std::string::npos);
     }
     {
         std::string hdir = tmpdir();

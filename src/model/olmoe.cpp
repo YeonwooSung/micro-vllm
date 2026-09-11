@@ -24,6 +24,16 @@ void xavier(std::vector<float> &w, int rows, int cols, uint32_t seed) {
     for (float &v : w)
         v = dist(rng);
 }
+void xavier_tiles(std::vector<float> &w, int n_tiles, int rows, int cols, uint32_t seed) {
+    const size_t tile = static_cast<size_t>(std::max(rows, 0)) * static_cast<size_t>(std::max(cols, 0));
+    w.assign(static_cast<size_t>(std::max(n_tiles, 0)) * tile, 0.f);
+    for (int e = 0; e < n_tiles; ++e) {
+        std::vector<float> t;
+        xavier(t, rows, cols, seed + static_cast<uint32_t>(e));
+        if (!t.empty())
+            std::memcpy(w.data() + static_cast<size_t>(e) * tile, t.data(), t.size() * sizeof(float));
+    }
+}
 void ones(std::vector<float> &w, int n) { w.assign(n, 1.f); }
 
 int shape0(const io::StTensor *t) {
@@ -286,11 +296,14 @@ public:
 
     std::string describe() const override {
         std::ostringstream os;
+        const char *routed = "no";
+        if (have_expert_mats())
+            routed = "experts";
+        else if (cfg_.moe.n_experts > 0 && cfg_.moe.topk > 0)
+            routed = "yes";
         os << "olmoe  hidden=" << cfg_.hidden << " layers=" << cfg_.n_layers
            << " q_heads=" << cfg_.n_q_heads << " kv_heads=" << cfg_.n_kv_heads
-           << " experts=" << cfg_.moe.n_experts
-           << " routed="
-           << (cfg_.moe.n_experts > 0 && cfg_.moe.topk > 0 ? "yes" : "no")
+           << " experts=" << cfg_.moe.n_experts << " routed=" << routed
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
            << (has_gqa() ? "GQA" : "stand-in") << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
@@ -826,17 +839,80 @@ private:
                                &s.token_lps, &s.top_lps);
     }
 
+    bool layer_expert_mats(int l) const {
+        const int E = cfg_.moe.n_experts;
+        const int H = std::max(cfg_.hidden, 1);
+        const int I = std::max(cfg_.dense_intermediate, 1);
+        if (E <= 0 || l < 0)
+            return false;
+        const size_t gu = static_cast<size_t>(E) * static_cast<size_t>(I) * static_cast<size_t>(H);
+        const size_t dn = static_cast<size_t>(E) * static_cast<size_t>(H) * static_cast<size_t>(I);
+        return l < static_cast<int>(e_gate_.size()) && l < static_cast<int>(e_up_.size()) &&
+               l < static_cast<int>(e_down_.size()) &&
+               e_gate_[static_cast<size_t>(l)].size() >= gu &&
+               e_up_[static_cast<size_t>(l)].size() >= gu &&
+               e_down_[static_cast<size_t>(l)].size() >= dn;
+    }
+    bool have_expert_mats() const {
+        for (int l = 0; l < cfg_.n_layers; ++l)
+            if (layer_expert_mats(l))
+                return true;
+        return false;
+    }
+
     void apply_ffn(int l, float *h, float *nrm, float *g, float *u, float *d, int H, int I) {
         quant::rmsnorm(h, out_n_[static_cast<size_t>(l)].data(), nrm, H, cfg_.rms_eps);
+        const int E = cfg_.moe.n_experts;
+        const int topk = cfg_.moe.topk;
+        const bool router_ok =
+            E > 0 && topk > 0 && l >= 0 && l < static_cast<int>(router_.size()) &&
+            router_[static_cast<size_t>(l)].size() >=
+                static_cast<size_t>(E) * static_cast<size_t>(H);
+        if (router_ok && layer_expert_mats(l)) {
+            std::vector<float> scores(static_cast<size_t>(E));
+            quant::matmul_f32(scores.data(), nrm, router_[static_cast<size_t>(l)].data(), 1, H, E);
+            for (int i = 0; i < E; ++i)
+                scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+            int idx[16] = {};
+            float ww[16] = {};
+            int K = topk;
+            if (K > 16)
+                K = 16;
+            if (K > E)
+                K = E;
+            if (K > 0)
+                moe_topk(scores.data(), E, K, idx, ww, scores.data());
+            std::vector<float> tmp(static_cast<size_t>(H)), ge(static_cast<size_t>(I)),
+                ue(static_cast<size_t>(I));
+            std::fill(d, d + H, 0.f);
+            const size_t tile_gu = static_cast<size_t>(I) * static_cast<size_t>(H);
+            const size_t tile_dn = static_cast<size_t>(H) * static_cast<size_t>(I);
+            for (int k = 0; k < K; ++k) {
+                const int e = idx[k];
+                if (e < 0 || e >= E)
+                    continue;
+                const float *wg =
+                    e_gate_[static_cast<size_t>(l)].data() + static_cast<size_t>(e) * tile_gu;
+                const float *wu =
+                    e_up_[static_cast<size_t>(l)].data() + static_cast<size_t>(e) * tile_gu;
+                const float *wd =
+                    e_down_[static_cast<size_t>(l)].data() + static_cast<size_t>(e) * tile_dn;
+                quant::matmul_f32(ge.data(), nrm, wg, 1, H, I);
+                quant::matmul_f32(ue.data(), nrm, wu, 1, H, I);
+                quant::silu_mul(ge.data(), ue.data(), I);
+                quant::matmul_f32(tmp.data(), ge.data(), wd, 1, I, H);
+                for (int i = 0; i < H; ++i)
+                    d[i] += ww[k] * tmp[static_cast<size_t>(i)];
+            }
+            for (int i = 0; i < H; ++i)
+                h[i] += d[i];
+            return;
+        }
         quant::matmul_f32(g, nrm, gate_[static_cast<size_t>(l)].data(), 1, H, I);
         quant::matmul_f32(u, nrm, up_[static_cast<size_t>(l)].data(), 1, H, I);
         quant::silu_mul(g, u, I);
         quant::matmul_f32(d, g, down_[static_cast<size_t>(l)].data(), 1, I, H);
-        const int E = cfg_.moe.n_experts;
-        const int topk = cfg_.moe.topk;
-        if (E > 0 && topk > 0 && l >= 0 && l < static_cast<int>(router_.size()) &&
-            router_[static_cast<size_t>(l)].size() >=
-                static_cast<size_t>(E) * static_cast<size_t>(H)) {
+        if (router_ok) {
             std::vector<float> scores(static_cast<size_t>(E));
             quant::matmul_f32(scores.data(), nrm, router_[static_cast<size_t>(l)].data(), 1, H, E);
             for (int i = 0; i < E; ++i)
@@ -905,7 +981,13 @@ private:
         up_.assign(static_cast<size_t>(L), {});
         down_.assign(static_cast<size_t>(L), {});
         router_.assign(static_cast<size_t>(L), {});
+        e_gate_.assign(static_cast<size_t>(L), {});
+        e_up_.assign(static_cast<size_t>(L), {});
+        e_down_.assign(static_cast<size_t>(L), {});
         const int E = cfg_.moe.n_experts;
+        const bool mats =
+            E > 0 && E <= 16 &&
+            static_cast<int64_t>(E) * static_cast<int64_t>(I) * static_cast<int64_t>(H) <= 2000000;
         for (int l = 0; l < L; ++l) {
             ones(in_n_[static_cast<size_t>(l)], H);
             ones(out_n_[static_cast<size_t>(l)], H);
@@ -920,10 +1002,15 @@ private:
             xavier(down_[static_cast<size_t>(l)], H, I, 440 + l);
             if (E > 0 && E <= 64)
                 xavier(router_[static_cast<size_t>(l)], E, H, 470 + l);
+            if (mats) {
+                xavier_tiles(e_gate_[static_cast<size_t>(l)], E, I, H, 480 + l * 17);
+                xavier_tiles(e_up_[static_cast<size_t>(l)], E, I, H, 490 + l * 17);
+                xavier_tiles(e_down_[static_cast<size_t>(l)], E, H, I, 500 + l * 17);
+            }
         }
     }
 
-    // Stage A: synthetic GQA + RoPE; FFN is dense SwiGLU, scaled by router top-k mix.
+    // Stage A: synthetic GQA + RoPE; per-expert SwiGLU when mats fit, else dense mix.
     void alloc_synthetic() { alloc_weights(true); }
 
     Status overlay_f32(const std::vector<io::StFile> &files, const std::string &name,
@@ -1081,6 +1168,7 @@ private:
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
     std::vector<std::vector<float>> router_; // [L][E*H]
+    std::vector<std::vector<float>> e_gate_, e_up_, e_down_; // [L][E*I*H], [L][E*I*H], [L][E*H*I]
     OlmoeSlot slots_[kMaxKvSlots];
     double t_attn_ = 0, t_head_ = 0;
 };

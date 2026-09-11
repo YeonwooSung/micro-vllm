@@ -286,9 +286,7 @@ public:
         std::ostringstream os;
         os << "inkling  hidden=" << cfg_.hidden << " layers=" << cfg_.n_layers
            << " q_heads=" << cfg_.n_q_heads << " kv_heads=" << cfg_.n_kv_heads
-           << " rope=off window=" << cfg_.sliding_window
-           << " routed="
-           << (cfg_.moe.n_experts > 0 && cfg_.moe.topk > 0 ? "yes" : "no")
+           << " rope=off window=" << cfg_.sliding_window << " routed=" << routed_tag()
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
            << (has_gqa() ? "GQA" : "stand-in") << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
@@ -833,33 +831,107 @@ private:
         return false;
     }
 
+    static bool experts_budget(int E, int I, int H) {
+        if (E <= 0 || E > 16 || I <= 0 || H <= 0)
+            return false;
+        return static_cast<int64_t>(E) * static_cast<int64_t>(I) * static_cast<int64_t>(H) <=
+               2000000LL;
+    }
+
+    bool layer_experts(int l, int E, int I, int H) const {
+        if (!experts_budget(E, I, H) || l < 0)
+            return false;
+        const size_t li = static_cast<size_t>(l);
+        if (li >= egate_.size() || li >= eup_.size() || li >= edown_.size())
+            return false;
+        const size_t gih = static_cast<size_t>(E) * static_cast<size_t>(I) * static_cast<size_t>(H);
+        const size_t dhi = static_cast<size_t>(E) * static_cast<size_t>(H) * static_cast<size_t>(I);
+        return egate_[li].size() >= gih && eup_[li].size() >= gih && edown_[li].size() >= dhi;
+    }
+
+    bool have_resident_experts() const {
+        const int E = cfg_.moe.n_experts;
+        const int I = std::max(cfg_.dense_intermediate, 1);
+        const int H = std::max(cfg_.hidden, 1);
+        for (int l = 0; l < cfg_.n_layers; ++l)
+            if (layer_experts(l, E, I, H))
+                return true;
+        return false;
+    }
+
+    const char *routed_tag() const {
+        if (cfg_.moe.n_experts <= 0 || cfg_.moe.topk <= 0)
+            return "no";
+        return have_resident_experts() ? "experts" : "mix";
+    }
+
+    bool layer_router(int l, int E, int H) const {
+        return E > 0 && H > 0 && l >= 0 && l < static_cast<int>(router_.size()) &&
+               router_[static_cast<size_t>(l)].size() >=
+                   static_cast<size_t>(E) * static_cast<size_t>(H);
+    }
+
+    int route_topk(int l, const float *nrm, int H, int E, int topk, int *idx, float *ww) const {
+        if (!nrm || !idx || !ww || !layer_router(l, E, H) || topk <= 0)
+            return 0;
+        int K = topk;
+        if (K > E)
+            K = E;
+        if (K <= 0)
+            return 0;
+        std::vector<float> scores(static_cast<size_t>(E));
+        quant::matmul_f32(scores.data(), nrm, router_[static_cast<size_t>(l)].data(), 1, H, E);
+        for (int i = 0; i < E; ++i)
+            scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
+        return moe_topk(scores.data(), E, K, idx, ww, scores.data());
+    }
+
     void apply_ffn(int l, float *h, float *nrm, float *g, float *u, float *d, int H, int I) {
         quant::rmsnorm(h, out_n_[static_cast<size_t>(l)].data(), nrm, H, cfg_.rms_eps);
+        const int E = cfg_.moe.n_experts;
+        const int topk = cfg_.moe.topk;
+        if (layer_experts(l, E, I, H) && layer_router(l, E, H) && topk > 0) {
+            int idx[16] = {};
+            float ww[16] = {};
+            int K = topk;
+            if (K > 16)
+                K = 16;
+            K = route_topk(l, nrm, H, E, K, idx, ww);
+            std::fill(d, d + H, 0.f);
+            std::vector<float> acc(static_cast<size_t>(H), 0.f);
+            const size_t gih = static_cast<size_t>(I) * static_cast<size_t>(H);
+            const size_t dhi = static_cast<size_t>(H) * static_cast<size_t>(I);
+            for (int k = 0; k < K; ++k) {
+                const int e = idx[k];
+                if (e < 0 || e >= E)
+                    continue;
+                const float *Wg = egate_[static_cast<size_t>(l)].data() + static_cast<size_t>(e) * gih;
+                const float *Wu = eup_[static_cast<size_t>(l)].data() + static_cast<size_t>(e) * gih;
+                const float *Wd = edown_[static_cast<size_t>(l)].data() + static_cast<size_t>(e) * dhi;
+                quant::matmul_f32(g, nrm, Wg, 1, H, I);
+                quant::matmul_f32(u, nrm, Wu, 1, H, I);
+                quant::silu_mul(g, u, I);
+                quant::matmul_f32(acc.data(), g, Wd, 1, I, H);
+                const float w = ww[k];
+                for (int i = 0; i < H; ++i)
+                    d[i] += w * acc[static_cast<size_t>(i)];
+            }
+            for (int i = 0; i < H; ++i)
+                h[i] += d[i];
+            return;
+        }
         quant::matmul_f32(g, nrm, gate_[static_cast<size_t>(l)].data(), 1, H, I);
         quant::matmul_f32(u, nrm, up_[static_cast<size_t>(l)].data(), 1, H, I);
         quant::silu_mul(g, u, I);
         quant::matmul_f32(d, g, down_[static_cast<size_t>(l)].data(), 1, I, H);
-        const int E = cfg_.moe.n_experts;
-        const int topk = cfg_.moe.topk;
-        if (E > 0 && E <= 64 && topk > 0 && l >= 0 && l < static_cast<int>(router_.size()) &&
-            router_[static_cast<size_t>(l)].size() >=
-                static_cast<size_t>(E) * static_cast<size_t>(H)) {
-            std::vector<float> scores(static_cast<size_t>(E));
-            quant::matmul_f32(scores.data(), nrm, router_[static_cast<size_t>(l)].data(), 1, H, E);
-            for (int i = 0; i < E; ++i)
-                scores[static_cast<size_t>(i)] = quant::sigmoid(scores[static_cast<size_t>(i)]);
-            int idx[64] = {};
-            float ww[64] = {};
-            int K = topk;
-            if (K > 64)
-                K = 64;
-            if (K > E)
-                K = E;
-            if (K > 0)
-                moe_topk(scores.data(), E, K, idx, ww, scores.data());
+        if (E > 0 && topk > 0 && layer_router(l, E, H)) {
+            std::vector<int> idx(static_cast<size_t>(std::min(topk, E)));
+            std::vector<float> ww(idx.size());
+            const int K = route_topk(l, nrm, H, E, static_cast<int>(idx.size()), idx.data(),
+                                     ww.data());
             float mix = 0.f;
             for (int i = 0; i < K; ++i)
-                mix += ww[i];
+                mix += ww[static_cast<size_t>(i)];
             for (int i = 0; i < H; ++i)
                 d[i] *= mix;
         }
@@ -871,7 +943,9 @@ private:
         const int H = std::max(cfg_.hidden, 1);
         const int L = std::max(cfg_.n_layers, 0);
         const int V = std::max(cfg_.vocab, 1);
-        const int I = std::max(cfg_.dense_intermediate, 1);
+        int I = std::max(cfg_.dense_intermediate, 1);
+        if (cfg_.moe.intermediate > I)
+            I = cfg_.moe.intermediate;
         cfg_.hidden = H;
         cfg_.n_layers = L;
         cfg_.vocab = V;
@@ -901,7 +975,12 @@ private:
         up_.assign(static_cast<size_t>(L), {});
         down_.assign(static_cast<size_t>(L), {});
         router_.assign(static_cast<size_t>(L), {});
+        egate_.assign(static_cast<size_t>(L), {});
+        eup_.assign(static_cast<size_t>(L), {});
+        edown_.assign(static_cast<size_t>(L), {});
         const int E = cfg_.moe.n_experts;
+        // Resident per-expert SwiGLU only when E<=16 and E*I*H<=2e6.
+        const bool resident = experts_budget(E, I, H);
         for (int l = 0; l < L; ++l) {
             ones(in_n_[static_cast<size_t>(l)], H);
             ones(out_n_[static_cast<size_t>(l)], H);
@@ -914,12 +993,54 @@ private:
             xavier(gate_[static_cast<size_t>(l)], I, H, 420 + l);
             xavier(up_[static_cast<size_t>(l)], I, H, 430 + l);
             xavier(down_[static_cast<size_t>(l)], H, I, 440 + l);
-            if (E > 0 && E <= 64)
+            if (E > 0)
                 xavier(router_[static_cast<size_t>(l)], E, H, 470 + l);
+            if (resident) {
+                xavier(egate_[static_cast<size_t>(l)], E * I, H, 480 + l);
+                xavier(eup_[static_cast<size_t>(l)], E * I, H, 490 + l);
+                xavier(edown_[static_cast<size_t>(l)], E * H, I, 500 + l);
+            }
         }
     }
 
     void alloc_synthetic() { alloc_weights(false); }
+
+    void overlay_layer_experts(const std::vector<io::StFile> &files, const std::string &ly, int l,
+                               std::string &err) {
+        const int E = cfg_.moe.n_experts;
+        const int I = std::max(cfg_.dense_intermediate, 1);
+        const int H = std::max(cfg_.hidden, 1);
+        if (!layer_experts(l, E, I, H))
+            return;
+        const size_t li = static_cast<size_t>(l);
+        std::vector<float> pg, pu, pd;
+        if (overlay_f32(files, ly + ".mlp.experts.gate_proj.weight", pg, err) == Status::Ok &&
+            overlay_f32(files, ly + ".mlp.experts.up_proj.weight", pu, err) == Status::Ok &&
+            overlay_f32(files, ly + ".mlp.experts.down_proj.weight", pd, err) == Status::Ok) {
+            egate_[li].swap(pg);
+            eup_[li].swap(pu);
+            edown_[li].swap(pd);
+            return;
+        }
+        const size_t gih = static_cast<size_t>(I) * static_cast<size_t>(H);
+        const size_t dhi = static_cast<size_t>(H) * static_cast<size_t>(I);
+        for (int e = 0; e < E; ++e) {
+            const std::string ex = ly + ".mlp.experts." + std::to_string(e);
+            std::vector<float> tmp;
+            if (overlay_f32(files, ex + ".gate_proj.weight", tmp, err) == Status::Ok &&
+                tmp.size() >= gih)
+                std::memcpy(egate_[li].data() + static_cast<size_t>(e) * gih, tmp.data(),
+                            gih * sizeof(float));
+            if (overlay_f32(files, ex + ".up_proj.weight", tmp, err) == Status::Ok &&
+                tmp.size() >= gih)
+                std::memcpy(eup_[li].data() + static_cast<size_t>(e) * gih, tmp.data(),
+                            gih * sizeof(float));
+            if (overlay_f32(files, ex + ".down_proj.weight", tmp, err) == Status::Ok &&
+                tmp.size() >= dhi)
+                std::memcpy(edown_[li].data() + static_cast<size_t>(e) * dhi, tmp.data(),
+                            dhi * sizeof(float));
+        }
+    }
 
     Status overlay_f32(const std::vector<io::StFile> &files, const std::string &name,
                        std::vector<float> &dst, std::string &err) {
@@ -1030,6 +1151,29 @@ private:
         io::StHit g0 = io::st_find_dir(files, P + "layers.0.mlp.gate_proj.weight");
         if (g0.tensor && !g0.tensor->shape.empty() && g0.tensor->shape[0] > 0)
             cfg_.dense_intermediate = static_cast<int>(g0.tensor->shape[0]);
+        else {
+            io::StHit eg0 =
+                io::st_find_dir(files, P + "layers.0.mlp.experts.0.gate_proj.weight");
+            if (!eg0.tensor)
+                eg0 = io::st_find_dir(files, P + "layers.0.mlp.experts.gate_proj.weight");
+            if (eg0.tensor && eg0.tensor->shape.size() >= 2) {
+                const int last = static_cast<int>(eg0.tensor->shape.back());
+                const int rows = shape0(eg0.tensor);
+                if (eg0.tensor->shape.size() >= 3 && rows > 0) {
+                    if (cfg_.moe.n_experts <= 0)
+                        cfg_.moe.n_experts = rows;
+                    const int mid = static_cast<int>(eg0.tensor->shape[1]);
+                    if (mid > 0)
+                        cfg_.dense_intermediate = mid;
+                } else if (rows > 0) {
+                    cfg_.dense_intermediate = rows;
+                } else if (last > 0 && last != cfg_.hidden) {
+                    cfg_.dense_intermediate = last;
+                }
+            }
+        }
+        if (cfg_.moe.intermediate > cfg_.dense_intermediate)
+            cfg_.dense_intermediate = cfg_.moe.intermediate;
 
         // GQA only when K/V exist; otherwise keep the q→o stand-in (synth tests).
         const bool have_kv = k0.tensor != nullptr && v0.tensor != nullptr;
@@ -1062,6 +1206,10 @@ private:
             overlay_f32(files, ly + ".mlp.gate_proj.weight", gate_[static_cast<size_t>(i)], err);
             overlay_f32(files, ly + ".mlp.up_proj.weight", up_[static_cast<size_t>(i)], err);
             overlay_f32(files, ly + ".mlp.down_proj.weight", down_[static_cast<size_t>(i)], err);
+            if (overlay_f32(files, ly + ".mlp.gate.weight", router_[static_cast<size_t>(i)], err) !=
+                Status::Ok)
+                overlay_f32(files, ly + ".mlp.router.weight", router_[static_cast<size_t>(i)], err);
+            overlay_layer_experts(files, ly, i, err);
         }
         io::st_close_dir(files);
         err.clear();
@@ -1076,6 +1224,7 @@ private:
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
     std::vector<std::vector<float>> router_; // [L][E*H]
+    std::vector<std::vector<float>> egate_, eup_, edown_; // [L][E*I*H]
     InklingSlot slots_[kMaxKvSlots];
     double t_attn_ = 0, t_head_ = 0;
 };
