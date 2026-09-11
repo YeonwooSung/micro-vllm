@@ -93,6 +93,7 @@ public:
         int pos = 0;
         int ple_p1 = -1;
         int ple_p2 = -1;
+        std::vector<float> streams;
         int t_max = 0;
         bool have = false;
         bool live = false;
@@ -179,6 +180,8 @@ public:
             }
         }
         int pos = 0;
+        const int C = hc_count();
+        std::vector<float> streams(static_cast<size_t>(C) * H, 0.f);
         auto embed = [&](int id) {
             int tid = id;
             if (tid < 0 || tid >= cfg_.vocab)
@@ -189,6 +192,7 @@ public:
                 for (int i = 0; i < H && i < static_cast<int>(vis_mean.size()); ++i)
                     h[static_cast<size_t>(i)] += vis_mean[static_cast<size_t>(i)];
             }
+            hc_reset(streams.data(), h.data(), H);
         };
         auto step = [&](int token) {
             embed(token);
@@ -251,11 +255,21 @@ public:
                                           H, H);
                     }
                 }
-                for (int i = 0; i < H; ++i)
-                    h[i] += d[i];
-                if (l == ple_layer_)
+                hc_gated_add(streams.data(), d.data(),
+                             l < static_cast<int>(mix_a_.size()) ? mix_a_[static_cast<size_t>(l)].data()
+                                                                 : nullptr,
+                             nrm.data(), H);
+                hc_collapse(h.data(), streams.data(), H);
+                if (l == ple_layer_) {
                     inject_ple(h.data(), H, token, ple_p1, ple_p2);
+                    hc_reset(streams.data(), h.data(), H);
+                }
                 apply_ffn(l, h.data(), nrm.data(), g.data(), u.data(), d.data(), H, I);
+                hc_gated_add(streams.data(), d.data(),
+                             l < static_cast<int>(mix_f_.size()) ? mix_f_[static_cast<size_t>(l)].data()
+                                                                 : nullptr,
+                             nrm.data(), H);
+                hc_collapse(h.data(), streams.data(), H);
             }
             ple_p2 = ple_p1;
             ple_p1 = token;
@@ -325,7 +339,8 @@ public:
            << "; routed="
            << (have_expert_mats() ? "experts" : (cfg_.moe.n_experts > 0 ? "mix" : "no"))
            << "; qsa=topk" << qsa_budget()
-           << "; ple=" << (ple_table_.empty() ? "off" : std::to_string(ple_layer_)) << ")";
+           << "; ple=" << (ple_table_.empty() ? "off" : std::to_string(ple_layer_))
+           << "; residual=gated" << hc_count() << ")";
         return os.str();
     }
 
@@ -773,6 +788,10 @@ private:
             tid = 0;
         std::memcpy(s.h.data(), embed_.data() + static_cast<size_t>(tid) * H,
                     static_cast<size_t>(H) * sizeof(float));
+        const int C = hc_count();
+        if (static_cast<int>(s.streams.size()) != C * H)
+            s.streams.assign(static_cast<size_t>(C) * H, 0.f);
+        hc_reset(s.streams.data(), s.h.data(), H);
         std::vector<float> nrm(static_cast<size_t>(H)), q(static_cast<size_t>(std::max(H, qd))),
             k(static_cast<size_t>(kvd)), v(static_cast<size_t>(kvd)), ctx(static_cast<size_t>(qd)),
             g(static_cast<size_t>(I)), u(static_cast<size_t>(I)), d(static_cast<size_t>(H));
@@ -851,11 +870,21 @@ private:
                                       H);
                 }
             }
-            for (int i = 0; i < H; ++i)
-                s.h[static_cast<size_t>(i)] += d[static_cast<size_t>(i)];
-            if (l == ple_layer_)
+            hc_gated_add(s.streams.data(), d.data(),
+                         l < static_cast<int>(mix_a_.size()) ? mix_a_[static_cast<size_t>(l)].data()
+                                                             : nullptr,
+                         nrm.data(), H);
+            hc_collapse(s.h.data(), s.streams.data(), H);
+            if (l == ple_layer_) {
                 inject_ple(s.h.data(), H, token, s.ple_p1, s.ple_p2);
+                hc_reset(s.streams.data(), s.h.data(), H);
+            }
             apply_ffn(l, s.h.data(), nrm.data(), g.data(), u.data(), d.data(), H, I);
+            hc_gated_add(s.streams.data(), d.data(),
+                         l < static_cast<int>(mix_f_.size()) ? mix_f_[static_cast<size_t>(l)].data()
+                                                             : nullptr,
+                         nrm.data(), H);
+            hc_collapse(s.h.data(), s.streams.data(), H);
         }
         s.ple_p2 = s.ple_p1;
         s.ple_p1 = token;
@@ -883,6 +912,46 @@ private:
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
+    }
+
+    static int hc_count() { return 4; }
+
+    static void hc_reset(float *st, const float *h, int H) {
+        const int C = hc_count();
+        if (!st || !h || H < 1)
+            return;
+        std::memset(st, 0, static_cast<size_t>(C) * H * sizeof(float));
+        std::memcpy(st, h, static_cast<size_t>(H) * sizeof(float));
+    }
+
+    static void hc_collapse(float *h, const float *st, int H) {
+        const int C = hc_count();
+        if (!h || !st || H < 1)
+            return;
+        for (int i = 0; i < H; ++i) {
+            float a = 0.f;
+            for (int s = 0; s < C; ++s)
+                a += st[static_cast<size_t>(s) * H + i];
+            h[i] = a / static_cast<float>(C);
+        }
+    }
+
+    static void hc_gated_add(float *st, const float *d, const float *mix, const float *nrm, int H) {
+        const int C = hc_count();
+        if (!st || !d || H < 1)
+            return;
+        for (int s = 0; s < C; ++s) {
+            float g = 1.f;
+            if (mix && nrm) {
+                float acc = 0.f;
+                for (int i = 0; i < H; ++i)
+                    acc += mix[static_cast<size_t>(s) * H + i] * nrm[i];
+                g = 1.f / (1.f + std::exp(-acc));
+            }
+            float *row = st + static_cast<size_t>(s) * H;
+            for (int i = 0; i < H; ++i)
+                row[i] += g * d[i];
+        }
     }
 
     static int qsa_budget() { return 16; }
@@ -1149,8 +1218,6 @@ private:
             for (int i = 0; i < H; ++i)
                 d[i] *= mix;
         }
-        for (int i = 0; i < H; ++i)
-            h[i] += d[i];
     }
 
     bool layer_gqa(int l) const {
@@ -1200,6 +1267,8 @@ private:
         conv_q_.assign(static_cast<size_t>(L), {});
         conv_k_.assign(static_cast<size_t>(L), {});
         conv_v_.assign(static_cast<size_t>(L), {});
+        mix_a_.assign(static_cast<size_t>(L), {});
+        mix_f_.assign(static_cast<size_t>(L), {});
         router_.assign(static_cast<size_t>(L), {});
         e_gate_.assign(static_cast<size_t>(L), {});
         e_up_.assign(static_cast<size_t>(L), {});
@@ -1220,6 +1289,8 @@ private:
             xavier(gate_[static_cast<size_t>(l)], I, H, 420 + l);
             xavier(up_[static_cast<size_t>(l)], I, H, 430 + l);
             xavier(down_[static_cast<size_t>(l)], H, I, 440 + l);
+            xavier(mix_a_[static_cast<size_t>(l)], hc_count(), H, 520 + l);
+            xavier(mix_f_[static_cast<size_t>(l)], hc_count(), H, 530 + l);
             if (E > 0 && E <= 64)
                 xavier(router_[static_cast<size_t>(l)], E, H, 470 + l);
             if (mats) {
@@ -1404,6 +1475,7 @@ private:
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
     std::vector<std::vector<float>> conv_q_, conv_k_, conv_v_;
     std::vector<std::vector<float>> router_, e_gate_, e_up_, e_down_;
+    std::vector<std::vector<float>> mix_a_, mix_f_;
     std::vector<float> vis_in_, vis_n1_, vis_l1_, vis_l2_;
     std::vector<float> ple_table_;
     int ple_layer_ = 2;
