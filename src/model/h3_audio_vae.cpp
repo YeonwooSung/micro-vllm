@@ -779,6 +779,8 @@ Status H3AudioVae::load(const std::string &model_dir, std::string &err) {
     return Status::Ok;
 }
 
+const char *H3AudioVae::graph() const { return from_checkpoint ? "real" : "synth"; }
+
 void H3AudioVae::encode(const float *pcm, int samples, std::vector<float> &z, int &audio_t) const {
     ensure_metal_h3();
     const AudioW *wp = awc(this);

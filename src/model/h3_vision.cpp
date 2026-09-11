@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <sstream>
 #include <unordered_map>
 #include <utility>
 
@@ -846,6 +847,14 @@ void H3VisionEncoder::encode(const float *rgb_hwc, int frames, int height, int w
         const int merge_dim = hidden * merge * merge;
         pool_to_out(normed.data(), tokens, merge_dim, out_w, out.merged.data());
     }
+}
+
+std::string H3VisionEncoder::describe() const {
+    std::ostringstream os;
+    os << "vision=" << (from_checkpoint_ ? "qwen" : "off") << " layers=" << cfg_.layers
+       << " hidden=" << cfg_.hidden << " ready=" << (ready_ ? "yes" : "no")
+       << " checkpoint=" << (from_checkpoint_ ? "yes" : "no");
+    return os.str();
 }
 
 } // namespace mvllm

@@ -7,6 +7,7 @@
 #include "json.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1812,6 +1813,14 @@ Status H3Vae::load(const ::std::string &model_dir, const H3Config &h3, ::std::st
     return Status::Ok;
 }
 
+const char *H3Vae::graph() const {
+    if (official_decode || official_encode)
+        return "official";
+    if (from_checkpoint)
+        return "real";
+    return "synth";
+}
+
 void H3Vae::encode(const float *rgb, const H3VaeGeom &g, float *z) const {
     if (!rgb || !z)
         return;
@@ -1943,7 +1952,7 @@ Status h3_write_ppm(const std::string &path, const float *rgb, int frames, int h
         return Status::IoError;
     }
     out << "P6\n" << width << " " << height << "\n255\n";
-    const int n = height * width * 3;
+    const int n = frames * height * width * 3;
     std::vector<unsigned char> buf(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
         float v = rgb[i];
@@ -1964,6 +1973,99 @@ Status h3_write_ppm(const std::string &path, const float *rgb, int frames, int h
         std::ofstream t(side);
         t << "frames=" << frames << "\nwidth=" << width << "\nheight=" << height << "\n";
     }
+    err.clear();
+    return Status::Ok;
+}
+
+Status h3_read_ppm(const std::string &path, std::vector<float> &rgb, int &frames, int &height,
+                   int &width, std::string &err) {
+    rgb.clear();
+    frames = 0;
+    height = 0;
+    width = 0;
+    if (path.empty()) {
+        err = "h3_read_ppm: bad args";
+        return Status::InvalidArgument;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        err = "h3_read_ppm: open failed: " + path;
+        return Status::IoError;
+    }
+    std::vector<unsigned char> data((std::istreambuf_iterator<char>(in)),
+                                    std::istreambuf_iterator<char>());
+    if (data.size() < 2 || data[0] != 'P' || data[1] != '6') {
+        err = "h3_read_ppm: bad magic";
+        return Status::InvalidArgument;
+    }
+    size_t i = 2;
+    auto skip = [&]() {
+        for (;;) {
+            while (i < data.size() && std::isspace(data[i]))
+                ++i;
+            if (i < data.size() && data[i] == '#') {
+                while (i < data.size() && data[i] != '\n')
+                    ++i;
+                continue;
+            }
+            break;
+        }
+    };
+    auto num = [&](int &v) -> bool {
+        skip();
+        if (i >= data.size() || !std::isdigit(data[i]))
+            return false;
+        int acc = 0;
+        while (i < data.size() && std::isdigit(data[i])) {
+            acc = acc * 10 + (data[i++] - '0');
+            if (acc > 1 << 24)
+                return false;
+        }
+        if (acc <= 0)
+            return false;
+        v = acc;
+        return true;
+    };
+    int maxv = 0;
+    if (!num(width) || !num(height) || !num(maxv) || maxv > 255) {
+        err = "h3_read_ppm: truncated";
+        return Status::InvalidArgument;
+    }
+    if (i >= data.size() || !std::isspace(data[i])) {
+        err = "h3_read_ppm: truncated";
+        return Status::InvalidArgument;
+    }
+    ++i;
+    const size_t plane = static_cast<size_t>(width) * static_cast<size_t>(height) * 3u;
+    if (plane == 0 || i + plane > data.size()) {
+        err = "h3_read_ppm: truncated";
+        return Status::InvalidArgument;
+    }
+    int side_frames = 0;
+    {
+        std::ifstream t(path + ".txt");
+        if (t) {
+            std::string line;
+            while (std::getline(t, line)) {
+                if (line.compare(0, 7, "frames=") == 0)
+                    side_frames = std::atoi(line.c_str() + 7);
+            }
+        }
+    }
+    const size_t avail = (data.size() - i) / plane;
+    frames = 1;
+    if (side_frames > 1)
+        frames = side_frames;
+    else if (avail > 1)
+        frames = static_cast<int>(avail);
+    if (avail < static_cast<size_t>(frames) || i + plane * static_cast<size_t>(frames) > data.size()) {
+        err = "h3_read_ppm: truncated";
+        return Status::InvalidArgument;
+    }
+    rgb.resize(plane * static_cast<size_t>(frames));
+    const float s = maxv > 0 ? 1.f / static_cast<float>(maxv) : 1.f / 255.f;
+    for (size_t p = 0; p < rgb.size(); ++p)
+        rgb[p] = data[i + p] * s;
     err.clear();
     return Status::Ok;
 }

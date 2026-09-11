@@ -34,15 +34,15 @@ Shared plumbing (parent): `Family` enum, sniff, `make_engine`, CMake,
 | 4 | H3 `dit` Metal shaders (AdaLN + SDPA + SwiGLU) | `metal_h3` |
 | 5 | H3 int8 GEMM + NAX kernels | `metal_h3` |
 
-### Wave 3 — H3 full graphs + I/O
+### Wave 3 — H3 full graphs + I/O (landed)
 
 | # | Deliverable |
 |---|-------------|
-| 1 | Video VAE encode/decode graph | `h3_vae.cpp` |
-| 2 | Audio VAE graph | `h3_audio_vae.cpp` |
-| 3 | Vision encoder graph | `h3_vision.cpp` |
-| 4 | ffmpeg pipe (frames in/out) | `src/io/av_mux.cpp` / new |
-| 5 | H3 terminal/progress UI | `src/serve` or `h3` describe |
+| 1 | `H3Vae::graph()` + `h3_read_ppm` | `h3_vae.cpp` |
+| 2 | `H3AudioVae::graph()` | `h3_audio_vae.cpp` |
+| 3 | `H3VisionEncoder::describe()` | `h3_vision.cpp` |
+| 4 | `h3_read_mp4` ffmpeg pipe | `av_mux.cpp` |
+| 5 | `H3GenParams::on_progress` + `ffmpeg=` | `h3.cpp` |
 
 Stage-A engines may run **synthetic** weights (same as Llama/K3 fixtures)
 until a dump tree exists.

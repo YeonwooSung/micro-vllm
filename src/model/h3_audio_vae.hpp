@@ -38,6 +38,8 @@ struct H3AudioVae {
     std::vector<float> latents_std;
 
     Status load(const std::string &model_dir, std::string &err);
+    // "real" if checkpoint weights were overlaid, else "synth".
+    const char *graph() const;
     // PCM [2, samples] → normalized latent [32, 2, T]. Pads to hop 800.
     void encode(const float *pcm, int samples, std::vector<float> &z, int &audio_t) const;
     // Normalized latent [32, 2, T] → PCM [2, T*800] clipped to [-1,1].

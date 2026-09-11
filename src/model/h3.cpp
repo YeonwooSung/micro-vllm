@@ -616,6 +616,8 @@ public:
         for (unsigned char c : hp.prompt)
             ph = ph * 131u + c;
         for (int s = 0; s < evals; ++s) {
+            if (hp.on_progress)
+                hp.on_progress(s, evals, "denoise");
             h3_time_features(1.f - sigmas[static_cast<size_t>(s)], tfeat.data(), tdim);
             tfeat[0] += 0.01f * static_cast<float>(ph % 100u);
             std::vector<float> prev = latent;
@@ -746,6 +748,8 @@ public:
 
         std::vector<float> rgb(static_cast<size_t>(vg.frames) * vg.height * vg.width * 3, 0.f);
         vae_.decode(z.data(), vg, rgb.data());
+        if (hp.on_progress)
+            hp.on_progress(evals, evals, "vae");
         vae_.geom = vg;
         std::vector<float> pcm;
         avae_.decode(az.data(), audio_t, pcm);
@@ -903,7 +907,8 @@ public:
            << " h3gpu=" << metal_h3::backend_name()
            << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
-           << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off");
+           << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off")
+           << " ffmpeg=" << (h3_ffmpeg_available() ? "yes" : "no");
         return os.str();
     }
 

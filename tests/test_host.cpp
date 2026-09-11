@@ -946,6 +946,20 @@ static void test_config_and_families() {
     hp.output_path = hdir + "/out.txt";
     H3GenResult hr;
     CHECK(eh.generate_video(hp, hr, err) == Status::Ok);
+    CHECK(eh.info().find("ffmpeg=") != std::string::npos);
+    {
+        int h3_prog = 0;
+        const char *h3_phase = "";
+        hp.on_progress = [&](int, int, const char *ph) {
+            ++h3_prog;
+            if (ph)
+                h3_phase = ph;
+        };
+        H3GenResult hr2;
+        CHECK(eh.generate_video(hp, hr2, err) == Status::Ok);
+        CHECK(h3_prog > 0);
+        CHECK(h3_phase[0] != 0);
+    }
     {
         TurnPerf hpf;
         eh.turn_perf(hpf, false);
@@ -4095,6 +4109,14 @@ static void test_h3_vae() {
     std::string magic;
     in >> magic;
     CHECK(magic == "P6");
+    {
+        int rf = 0, rh = 0, rw = 0;
+        std::vector<float> rrgb;
+        CHECK(h3_read_ppm(dir + "/f.ppm", rrgb, rf, rh, rw, err) == Status::Ok);
+        CHECK(rf == F && rh == Ht && rw == Wt);
+        CHECK(static_cast<int>(rrgb.size()) == F * Ht * Wt * 3);
+    }
+    CHECK(std::string(vae.graph()) == "synth");
 
     CHECK(h3_vae_decoded_t(0, 5) == 3);
     CHECK(h3_vae_decoded_t(1, 5) == 4);

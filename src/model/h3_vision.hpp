@@ -54,6 +54,7 @@ public:
     // pixels: frame-major RGB HWC [T,H,W,3] in [0,1]. T is 1 or 2.
     // H and W must be multiples of 32 (patch*merge).
     void encode(const float *rgb_hwc, int frames, int height, int width, H3VisionOut &out) const;
+    std::string describe() const;
     const H3VisionConfig &config() const { return cfg_; }
     bool from_checkpoint() const { return from_checkpoint_; }
     bool ready() const { return ready_; }

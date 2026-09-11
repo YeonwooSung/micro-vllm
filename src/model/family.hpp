@@ -105,6 +105,8 @@ struct H3GenParams {
     const float *ref_rgb = nullptr;
     int ref_w = 0;
     int ref_h = 0;
+    // Optional denoise/VAE progress: step in [0, steps), phase e.g. "denoise" / "vae".
+    std::function<void(int step, int steps, const char *phase)> on_progress;
 };
 
 struct H3GenResult {

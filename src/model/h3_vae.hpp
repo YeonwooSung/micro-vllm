@@ -62,6 +62,8 @@ struct H3Vae {
     bool official_decode = false; // register_tokens present
     bool official_encode = false; // encoder.conv_in present
     Status load(const std::string &model_dir, const H3Config &h3, std::string &err);
+    // "official" if official_{decode,encode}, else "real" if checkpoint, else "synth".
+    const char *graph() const;
     // Pixels [F,H,W,3] -> normalized latent [24,T,lh,lw]. Always a real transform.
     void encode(const float *rgb, const H3VaeGeom &g, float *z) const;
     // Normalized latent -> RGB [F,H,W,3] in [0,1]. Always a real transform.
@@ -71,5 +73,8 @@ struct H3Vae {
 // PPM (P6) writer for generate_video output.
 Status h3_write_ppm(const std::string &path, const float *rgb, int frames, int height, int width,
                     std::string &err);
+// Inverse of h3_write_ppm (P6). RGB [0,1] frame-major HWC.
+Status h3_read_ppm(const std::string &path, std::vector<float> &rgb, int &frames, int &height,
+                   int &width, std::string &err);
 
 } // namespace mvllm
