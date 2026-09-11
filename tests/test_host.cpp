@@ -3578,6 +3578,8 @@ static void test_wave1_new_families() {
         CHECK(e->describe().find("gdn=delta") != std::string::npos);
         CHECK(e->describe().find("vision=vit2") != std::string::npos);
         CHECK(e->describe().find("routed=experts") != std::string::npos);
+        CHECK(e->describe().find("qsa=topk16") != std::string::npos);
+        CHECK(e->describe().find("ple=2") != std::string::npos);
         std::vector<float> img(16 * 16 * 3, 0.5f);
         GenParams gp;
         gp.max_new_tokens = 2;

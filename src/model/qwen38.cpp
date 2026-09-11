@@ -91,6 +91,8 @@ public:
         std::vector<std::vector<float>> k_cache, v_cache;
         std::vector<std::vector<float>> gdn_s, gdn_hq, gdn_hk, gdn_hv;
         int pos = 0;
+        int ple_p1 = -1;
+        int ple_p2 = -1;
         int t_max = 0;
         bool have = false;
         bool live = false;
@@ -163,6 +165,7 @@ public:
         }
         std::vector<float> vis_mean;
         encode_vision(gp.image_rgb, gp.image_w, gp.image_h, vis_mean);
+        int ple_p1 = -1, ple_p2 = -1;
         std::vector<std::vector<float>> k_cache, v_cache;
         const bool any_gqa = has_gqa();
         if (any_gqa) {
@@ -236,39 +239,9 @@ public:
                                         static_cast<size_t>(tpos) * kvd,
                                     v.data(), static_cast<size_t>(kvd) * sizeof(float));
                         std::fill(ctx.begin(), ctx.end(), 0.f);
-                        const int past = tpos + 1;
-                        std::vector<float> sc(static_cast<size_t>(past));
-                        for (int hh = 0; hh < nq; ++hh) {
-                            const int kh = std::min(hh / group, nkv - 1);
-                            const float *qh = q.data() + hh * hd;
-                            float mx = -1e30f;
-                            for (int s = 0; s < past; ++s) {
-                                const float *kk = k_cache[static_cast<size_t>(l)].data() +
-                                                  static_cast<size_t>(s) * kvd + kh * hd;
-                                float acc = 0.f;
-                                for (int d0 = 0; d0 < hd; ++d0)
-                                    acc += qh[d0] * kk[d0];
-                                sc[static_cast<size_t>(s)] = acc * scale;
-                                if (sc[static_cast<size_t>(s)] > mx)
-                                    mx = sc[static_cast<size_t>(s)];
-                            }
-                            float z = 0.f;
-                            for (int s = 0; s < past; ++s) {
-                                sc[static_cast<size_t>(s)] =
-                                    std::exp(sc[static_cast<size_t>(s)] - mx);
-                                z += sc[static_cast<size_t>(s)];
-                            }
-                            if (z <= 0.f)
-                                z = 1.f;
-                            float *oh = ctx.data() + hh * hd;
-                            for (int s = 0; s < past; ++s) {
-                                const float *vv = v_cache[static_cast<size_t>(l)].data() +
-                                                  static_cast<size_t>(s) * kvd + kh * hd;
-                                const float a = sc[static_cast<size_t>(s)] / z;
-                                for (int d0 = 0; d0 < hd; ++d0)
-                                    oh[d0] += a * vv[d0];
-                            }
-                        }
+                        qsa_attend(ctx.data(), q.data(), k_cache[static_cast<size_t>(l)].data(),
+                                   v_cache[static_cast<size_t>(l)].data(), nq, nkv, hd, group, kvd,
+                                   tpos + 1, scale);
                         quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(),
                                           1, qd, H);
                     } else {
@@ -280,8 +253,12 @@ public:
                 }
                 for (int i = 0; i < H; ++i)
                     h[i] += d[i];
+                if (l == ple_layer_)
+                    inject_ple(h.data(), H, token, ple_p1, ple_p2);
                 apply_ffn(l, h.data(), nrm.data(), g.data(), u.data(), d.data(), H, I);
             }
+            ple_p2 = ple_p1;
+            ple_p1 = token;
             ++pos;
         };
         for (int t : prompt)
@@ -346,7 +323,9 @@ public:
            << (has_gdn() ? "delta" : "off") << " (CPU " << (has_gqa() ? "GQA" : "stand-in")
            << "; vision=" << (vis_in_.empty() ? "off" : "vit2")
            << "; routed="
-           << (have_expert_mats() ? "experts" : (cfg_.moe.n_experts > 0 ? "mix" : "no")) << ")";
+           << (have_expert_mats() ? "experts" : (cfg_.moe.n_experts > 0 ? "mix" : "no"))
+           << "; qsa=topk" << qsa_budget()
+           << "; ple=" << (ple_table_.empty() ? "off" : std::to_string(ple_layer_)) << ")";
         return os.str();
     }
 
@@ -734,6 +713,8 @@ private:
         }
         s.t_max = Tmax;
         s.pos = 0;
+        s.ple_p1 = -1;
+        s.ple_p2 = -1;
         s.have = false;
         s.live = false;
         s.history.clear();
@@ -858,38 +839,9 @@ private:
                                     static_cast<size_t>(tpos) * kvd,
                                 v.data(), static_cast<size_t>(kvd) * sizeof(float));
                     std::fill(ctx.begin(), ctx.end(), 0.f);
-                    const int past = tpos + 1;
-                    std::vector<float> sc(static_cast<size_t>(past));
-                    for (int hh = 0; hh < nq; ++hh) {
-                        const int kh = std::min(hh / group, nkv - 1);
-                        const float *qh = q.data() + hh * hd;
-                        float mx = -1e30f;
-                        for (int t = 0; t < past; ++t) {
-                            const float *kk = s.k_cache[static_cast<size_t>(l)].data() +
-                                              static_cast<size_t>(t) * kvd + kh * hd;
-                            float acc = 0.f;
-                            for (int d0 = 0; d0 < hd; ++d0)
-                                acc += qh[d0] * kk[d0];
-                            sc[static_cast<size_t>(t)] = acc * scale;
-                            if (sc[static_cast<size_t>(t)] > mx)
-                                mx = sc[static_cast<size_t>(t)];
-                        }
-                        float z = 0.f;
-                        for (int t = 0; t < past; ++t) {
-                            sc[static_cast<size_t>(t)] = std::exp(sc[static_cast<size_t>(t)] - mx);
-                            z += sc[static_cast<size_t>(t)];
-                        }
-                        if (z <= 0.f)
-                            z = 1.f;
-                        float *oh = ctx.data() + hh * hd;
-                        for (int t = 0; t < past; ++t) {
-                            const float *vv = s.v_cache[static_cast<size_t>(l)].data() +
-                                              static_cast<size_t>(t) * kvd + kh * hd;
-                            const float a = sc[static_cast<size_t>(t)] / z;
-                            for (int d0 = 0; d0 < hd; ++d0)
-                                oh[d0] += a * vv[d0];
-                        }
-                    }
+                    qsa_attend(ctx.data(), q.data(), s.k_cache[static_cast<size_t>(l)].data(),
+                               s.v_cache[static_cast<size_t>(l)].data(), nq, nkv, hd, group, kvd,
+                               tpos + 1, scale);
                     quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(), 1,
                                       qd, H);
                 } else {
@@ -901,8 +853,12 @@ private:
             }
             for (int i = 0; i < H; ++i)
                 s.h[static_cast<size_t>(i)] += d[static_cast<size_t>(i)];
+            if (l == ple_layer_)
+                inject_ple(s.h.data(), H, token, s.ple_p1, s.ple_p2);
             apply_ffn(l, s.h.data(), nrm.data(), g.data(), u.data(), d.data(), H, I);
         }
+        s.ple_p2 = s.ple_p1;
+        s.ple_p1 = token;
         ++s.pos;
     }
 
@@ -927,6 +883,89 @@ private:
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
+    }
+
+    static int qsa_budget() { return 16; }
+
+    static void qsa_attend(float *ctx, const float *q, const float *k_cache, const float *v_cache,
+                           int nq, int nkv, int hd, int group, int kvd, int past, float scale) {
+        if (!ctx || !q || !k_cache || !v_cache || past < 1 || nq < 1 || hd < 1)
+            return;
+        const int budget = past <= qsa_budget() ? past : qsa_budget();
+        std::vector<float> sc(static_cast<size_t>(past));
+        std::vector<uint8_t> keep(static_cast<size_t>(past), 0);
+        for (int hh = 0; hh < nq; ++hh) {
+            const int kh = std::min(hh / std::max(group, 1), nkv - 1);
+            const float *qh = q + hh * hd;
+            std::fill(keep.begin(), keep.end(), 0);
+            for (int s = 0; s < past; ++s) {
+                const float *kk = k_cache + static_cast<size_t>(s) * kvd + kh * hd;
+                float acc = 0.f;
+                for (int d0 = 0; d0 < hd; ++d0)
+                    acc += qh[d0] * kk[d0];
+                sc[static_cast<size_t>(s)] = acc * scale;
+            }
+            const int local = past < 4 ? past : 4;
+            for (int s = past - local; s < past; ++s)
+                keep[static_cast<size_t>(s)] = 1;
+            int selected = local;
+            while (selected < budget) {
+                int best = -1;
+                float bests = -1e30f;
+                for (int s = 0; s < past; ++s) {
+                    if (keep[static_cast<size_t>(s)])
+                        continue;
+                    if (sc[static_cast<size_t>(s)] > bests) {
+                        bests = sc[static_cast<size_t>(s)];
+                        best = s;
+                    }
+                }
+                if (best < 0)
+                    break;
+                keep[static_cast<size_t>(best)] = 1;
+                ++selected;
+            }
+            float mx = -1e30f;
+            for (int s = 0; s < past; ++s)
+                if (keep[static_cast<size_t>(s)] && sc[static_cast<size_t>(s)] > mx)
+                    mx = sc[static_cast<size_t>(s)];
+            float z = 0.f;
+            for (int s = 0; s < past; ++s) {
+                if (!keep[static_cast<size_t>(s)]) {
+                    sc[static_cast<size_t>(s)] = 0.f;
+                    continue;
+                }
+                sc[static_cast<size_t>(s)] = std::exp(sc[static_cast<size_t>(s)] - mx);
+                z += sc[static_cast<size_t>(s)];
+            }
+            if (z <= 0.f)
+                z = 1.f;
+            float *oh = ctx + hh * hd;
+            std::fill(oh, oh + hd, 0.f);
+            for (int s = 0; s < past; ++s) {
+                if (!keep[static_cast<size_t>(s)])
+                    continue;
+                const float *vv = v_cache + static_cast<size_t>(s) * kvd + kh * hd;
+                const float a = sc[static_cast<size_t>(s)] / z;
+                for (int d0 = 0; d0 < hd; ++d0)
+                    oh[d0] += a * vv[d0];
+            }
+        }
+    }
+
+    void inject_ple(float *h, int H, int id, int p1, int p2) const {
+        if (!h || H < 1 || ple_table_.size() < static_cast<size_t>(H))
+            return;
+        const int rows = static_cast<int>(ple_table_.size() / static_cast<size_t>(H));
+        if (rows < 1)
+            return;
+        uint32_t x = static_cast<uint32_t>(id + 1) * 0x9e3779b9u;
+        x ^= static_cast<uint32_t>(p1 + 1) * 0x85ebca6bu;
+        x ^= static_cast<uint32_t>(p2 + 1) * 0xc2b2ae35u;
+        const int row = static_cast<int>(x % static_cast<uint32_t>(rows));
+        const float *src = ple_table_.data() + static_cast<size_t>(row) * H;
+        for (int i = 0; i < H; ++i)
+            h[i] += src[i];
     }
 
     static void gdn_conv4(float *x, float *hist, const float *w, int D) {
@@ -1203,6 +1242,8 @@ private:
         ones(vis_n1_, H);
         xavier(vis_l1_, H, H, 701);
         xavier(vis_l2_, H, H, 702);
+        xavier(ple_table_, 256, H, 710);
+        ple_layer_ = L >= 3 ? 2 : -1;
     }
 
     void alloc_synthetic() { alloc_weights(true); }
@@ -1364,6 +1405,8 @@ private:
     std::vector<std::vector<float>> conv_q_, conv_k_, conv_v_;
     std::vector<std::vector<float>> router_, e_gate_, e_up_, e_down_;
     std::vector<float> vis_in_, vis_n1_, vis_l1_, vis_l2_;
+    std::vector<float> ple_table_;
+    int ple_layer_ = 2;
     Qwen38Slot slots_[kMaxKvSlots];
     double t_attn_ = 0, t_head_ = 0;
 };
