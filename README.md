@@ -56,7 +56,8 @@ no `--family` flag.
 `--device cpu|metal|cuda` (or `MVLLM_DEVICE`) selects the compute backend.
 Default is `cpu` so tests stay deterministic.
 
-- K3 / GLM: Metal residual + post-LN (`layer_decode`). S=1 decode may fuse
+- K3 / GLM: Metal residual + post-LN (`layer_decode`) when the Metal
+  backend is live; otherwise `vk_ops::layer_residual`. S=1 decode may fuse
   KDA (`layer_decode_kda`) or absorbed MLA (`layer_decode_mla`) into that
   tail. GLM routed int4 uses `moe_block` with clamped-SwiGLU. K3 F32
   dense/shared uses SiTU; routed MXFP4 uses `moe_block` fmt 7 (SiTU)

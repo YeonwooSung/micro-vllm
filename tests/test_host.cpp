@@ -3140,6 +3140,9 @@ static void test_glm53_container() {
     CHECK(glm_metal_tier);
     const bool glm_vk_tier = info.find("vk=") != std::string::npos;
     CHECK(glm_vk_tier);
+    const bool glm_vk_cpu = info.find("vk=cpu") != std::string::npos ||
+                            info.find("vk=off") != std::string::npos;
+    CHECK(glm_vk_cpu);
     CHECK(eg.config().moe.n_experts == 2);
     GenParams gp;
     gp.max_new_tokens = 2;
@@ -3227,6 +3230,9 @@ static void test_k3_mxfp4_container() {
     CHECK(k3_metal_tier);
     const bool k3_vk_tier = info.find("vk=") != std::string::npos;
     CHECK(k3_vk_tier);
+    const bool k3_vk_cpu = info.find("vk=cpu") != std::string::npos ||
+                           info.find("vk=off") != std::string::npos;
+    CHECK(k3_vk_cpu);
     GenParams gp;
     gp.max_new_tokens = 2;
     gp.eos = 1;

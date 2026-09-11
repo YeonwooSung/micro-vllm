@@ -160,8 +160,11 @@ bool k3_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, i
 // x += attn; nrm = rmsnorm(x, post_ln). Shared expert stays on the host (SiTU).
 void k3_resid_post_ln(float *x, const float *attn, const float *post_ln, float *nrm, int H,
                       float eps) {
-    if (metal_ops::layer_decode(x, attn, post_ln, nullptr, nullptr, nullptr, H, 0, eps, nrm,
+    if (metal_ops::available() && std::strcmp(metal_ops::backend_name(), "metal") == 0 &&
+        metal_ops::layer_decode(x, attn, post_ln, nullptr, nullptr, nullptr, H, 0, eps, nrm,
                                 nullptr))
+        return;
+    if (vk_ops::layer_residual(x, attn, post_ln, nrm, H, eps))
         return;
     for (int i = 0; i < H; ++i)
         x[i] += attn[i];
