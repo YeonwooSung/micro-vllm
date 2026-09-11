@@ -3569,13 +3569,15 @@ static void test_wave1_new_families() {
         write_file(q38d + "/config.json",
                    R"({"model_type":"qwen4_exp","hidden_size":64,"num_hidden_layers":4,)"
                    R"("vocab_size":128,"num_attention_heads":4,"num_key_value_heads":2,)"
-                   R"("head_dim":16,"layer_types":["linear","linear","linear","full_attention"]})");
+                   R"("head_dim":16,"layer_types":["linear","linear","linear","full_attention"],)"
+                   R"("n_routed_experts":4,"num_experts_per_tok":2})");
         auto e = make_engine(Family::Qwen38);
         RuntimeConfig rt;
         std::string err;
         CHECK(e->load(q38d, rt, err) == Status::Ok);
         CHECK(e->describe().find("gdn=delta") != std::string::npos);
         CHECK(e->describe().find("vision=vit2") != std::string::npos);
+        CHECK(e->describe().find("routed=experts") != std::string::npos);
         std::vector<float> img(16 * 16 * 3, 0.5f);
         GenParams gp;
         gp.max_new_tokens = 2;
