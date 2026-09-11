@@ -66,8 +66,9 @@ Default is `cpu` so tests stay deterministic.
 - CUDA (`-DMVLLM_GPU_CUDA=ON`): K3/GLM expert GEMM via `coli_cuda`; DSV4
   route / mHC / sparse attn via `dsv4_cuda` when shapes match.
 
-`info` tags: `coli=cpu|cuda|off`, `metal=cpu|metal|off`, `tier=cpu|cuda|off`
-(DSV4), `h3gpu=…`, `mtp=off|loaded|markov|fwd`, `ckpt=N hits=M`.
+`info` tags: `coli=cpu|cuda|off`, `metal=cpu|metal|off`, `vk=cpu|off`,
+`tier=cpu|cuda|off` (DSV4), `h3gpu=…`, `mtp=off|loaded|markov|fwd`,
+`ckpt=N hits=M`.
 
 Also: `--expert-gb N`, `--kv-slots N` (serve/mux, 1–16).
 

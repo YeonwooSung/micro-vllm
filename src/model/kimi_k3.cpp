@@ -2,6 +2,7 @@
 #include "../gpu/backend.hpp"
 #include "../gpu/coli_cuda.hpp"
 #include "../gpu/metal_ops.hpp"
+#include "../gpu/vk_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 #include "../quant/weight.hpp"
@@ -318,6 +319,7 @@ public:
         loaded_ = true;
         coli_cuda::init(nullptr, 0);
         metal_ops::init();
+        vk_ops::init();
         return Status::Ok;
     }
 
@@ -734,7 +736,8 @@ public:
             os << "cpu";
         else
             os << "off";
-        os << " metal=" << (metal_ops::available() ? metal_ops::backend_name() : "off");
+        os << " metal=" << (metal_ops::available() ? metal_ops::backend_name() : "off")
+           << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off");
         return os.str();
     }
 

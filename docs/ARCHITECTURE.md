@@ -229,7 +229,8 @@ Vulkan ops (`mvllm::vk_ops`):
 
 - Host API: `src/gpu/vk_ops.hpp` + `vk_ops.cpp`. Always CPU (`backend_name`
   is `"cpu"`). No Vulkan SDK. Surface: `init` / `rmsnorm` / `add` /
-  `gemm_f32`. Device kernels can replace this TU later.
+  `silu_mul` / `gemm_f32` / `layer_residual`. K3 / GLM / H3 / DSV4
+  `describe()` show `vk=`. Device kernels can replace this TU later.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 

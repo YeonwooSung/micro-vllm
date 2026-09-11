@@ -37,10 +37,27 @@ bool add(float *y, const float *a, size_t n) {
     return true;
 }
 
+bool silu_mul(float *g, const float *u, size_t n) {
+    if (!g || !u)
+        return false;
+    quant::silu_mul(g, u, static_cast<int>(n));
+    return true;
+}
+
 bool gemm_f32(float *y, const float *x, const float *w, int S, int I, int O) {
     if (!y || !x || !w || S < 1 || I < 1 || O < 1)
         return false;
     quant::matmul_f32(y, x, w, S, I, O);
+    return true;
+}
+
+bool layer_residual(float *x, const float *attn, const float *post_ln, float *nrm, int D,
+                    float eps) {
+    if (!x || !attn || !post_ln || !nrm || D < 1)
+        return false;
+    for (int i = 0; i < D; ++i)
+        x[i] += attn[i];
+    quant::rmsnorm(x, post_ln, nrm, D, eps);
     return true;
 }
 

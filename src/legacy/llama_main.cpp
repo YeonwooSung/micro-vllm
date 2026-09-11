@@ -178,6 +178,25 @@ void releaseSlot(int slot, std::vector<bool> &is_slot_free, std::vector<int> &bl
     syncBlockTableSlot(slot, block_table, block_table_gpu);
 }
 
+void set_prompt_len(int slot, int n, std::vector<int> &current_prompt_len, std::vector<int> &prompt_lengths)
+{
+    current_prompt_len[slot] = n;
+    prompt_lengths[slot] = n;
+}
+
+int max_live_prompt_len(const std::vector<int> &current_prompt_len, const std::vector<bool> &is_slot_free)
+{
+    int packed = 0;
+    for (int slot = 0; slot < (int)current_prompt_len.size(); ++slot)
+    {
+        if (!is_slot_free[slot] && current_prompt_len[slot] > packed)
+        {
+            packed = current_prompt_len[slot];
+        }
+    }
+    return packed;
+}
+
 struct PrefillCtx
 {
     std::queue<std::vector<int>> &queue;
@@ -217,6 +236,8 @@ struct PrefillCtx
     std::vector<std::vector<int>> &generated_tokens;
     std::vector<int> &last_generated_tokens;
     std::vector<int> &current_prompt_len;
+    std::vector<int> &prompt_lengths;
+    int &input_tokens_size;
     __nv_bfloat16 *k_proj_temp_buf;
     __nv_bfloat16 *v_proj_temp_buf;
     std::vector<int> &block_table;
@@ -264,6 +285,8 @@ void prefill(PrefillCtx &ctx, int slot)
     std::vector<std::vector<int>> &generated_tokens = ctx.generated_tokens;
     std::vector<int> &last_generated_tokens = ctx.last_generated_tokens;
     std::vector<int> &current_prompt_len = ctx.current_prompt_len;
+    std::vector<int> &prompt_lengths = ctx.prompt_lengths;
+    int &input_tokens_size = ctx.input_tokens_size;
     __nv_bfloat16 *k_proj_temp_buf = ctx.k_proj_temp_buf;
     __nv_bfloat16 *v_proj_temp_buf = ctx.v_proj_temp_buf;
     std::vector<int> &block_table = ctx.block_table;
@@ -287,6 +310,8 @@ void prefill(PrefillCtx &ctx, int slot)
     }
 
     int prompt_len = (int)prompt.size();
+    // packed prefill width for this slot's single-prompt buffer
+    input_tokens_size = prompt_len;
     is_slot_free[slot] = false;
 
     cudaMemcpy(gpu_input_tokens, prompt.data(), prompt_len * sizeof(int), cudaMemcpyHostToDevice);
@@ -672,7 +697,12 @@ void prefill(PrefillCtx &ctx, int slot)
 
     generated_tokens[slot].push_back(max_token_idx);
     last_generated_tokens[slot] = max_token_idx;
-    current_prompt_len[slot] = prompt_len;
+    set_prompt_len(slot, prompt_len, current_prompt_len, prompt_lengths);
+    if (input_tokens_size > g_max_prompt)
+    {
+        input_tokens_size = g_max_prompt;
+    }
+    assert(input_tokens_size <= g_max_prompt);
 
     // synchronize state of block_table with block_table_gpu
     syncBlockTableSlot(slot, block_table, block_table_gpu);
@@ -882,6 +912,7 @@ int main(int argc, char *argv[]) {
     std::vector<std::vector<int>> generated_tokens(batch);
     std::vector<int> last_generated_tokens(batch);
     std::vector<int> current_prompt_len(batch, 0);
+    std::vector<int> prompt_lengths(batch, 0);
 
     // needed to provide contiguous data for decode
     std::vector<int> active_slots;
@@ -892,8 +923,8 @@ int main(int argc, char *argv[]) {
     int *gpu_seq_lens;
     cudaMalloc(&gpu_seq_lens, batch * sizeof(int));
 
-    // TODO: recalculate input_tokens_size and prompt_lengths always when there is a change to prompt_under_prefill
-    // TODO: right now I handle input manually, it's the least interesting part, will come back to it when continuous batching and pagedattn works
+    // input_tokens_size / prompt_lengths refresh when a slot takes a new prompt
+    int input_tokens_size = 0;
 
     int *gpu_input_tokens;
     cudaMalloc(&gpu_input_tokens, g_max_prompt * sizeof(int));
@@ -1007,6 +1038,8 @@ int main(int argc, char *argv[]) {
         generated_tokens,
         last_generated_tokens,
         current_prompt_len,
+        prompt_lengths,
+        input_tokens_size,
         k_proj_temp_buf,
         v_proj_temp_buf,
         block_table,
@@ -1071,6 +1104,7 @@ int main(int argc, char *argv[]) {
             active_tokens.push_back(last_generated_tokens[slot]);
         }
         int num_active_slots = active_slots.size();
+        input_tokens_size = max_live_prompt_len(current_prompt_len, is_slot_free);
         if (num_active_slots == 0)
         {
             if (queue.empty())
@@ -1352,7 +1386,7 @@ int main(int argc, char *argv[]) {
             {
                 last_generated_tokens[active_slot] = max_token_idx;
                 generated_tokens[active_slot].push_back(max_token_idx);
-                current_prompt_len[active_slot] = current_prompt_len[active_slot] + 1;
+                set_prompt_len(active_slot, current_prompt_len[active_slot] + 1, current_prompt_len, prompt_lengths);
                 if ((int)generated_tokens[active_slot].size() >= max_new_tokens)
                 {
                     releaseSlot(active_slot, is_slot_free, block_table, free_blocks, block_table_gpu);

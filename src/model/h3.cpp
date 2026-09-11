@@ -7,6 +7,7 @@
 #include "h3_vision.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/metal_h3.hpp"
+#include "../gpu/vk_ops.hpp"
 #include "../io/av_mux.hpp"
 #include "../io/image.hpp"
 #include "../io/safetensors.hpp"
@@ -185,6 +186,7 @@ public:
         }
         loaded_ = true;
         metal_h3::init();
+        vk_ops::init();
         return Status::Ok;
     }
 
@@ -894,7 +896,8 @@ public:
            << " vision=" << (vision_.from_checkpoint() ? "qwen" : "off")
            << " h3gpu=" << metal_h3::backend_name()
            << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
-           << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off");
+           << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
+           << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off");
         return os.str();
     }
 

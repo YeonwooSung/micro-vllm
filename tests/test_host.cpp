@@ -2242,6 +2242,21 @@ static void test_vk_ops_tier() {
     CHECK_NEAR(vk_ops_out[0], 0.5f, 1e-5);
     CHECK_NEAR(vk_ops_out[1], -0.25f, 1e-5);
 
+    float vk_ops_sg[2] = {0.5f, -1.f};
+    const float vk_ops_su[2] = {2.f, 0.5f};
+    const bool vk_ops_silu = silu_mul(vk_ops_sg, vk_ops_su, 2);
+    CHECK(vk_ops_silu);
+    CHECK(std::isfinite(vk_ops_sg[0]) && std::isfinite(vk_ops_sg[1]));
+
+    float vk_ops_lx[2] = {1.f, 0.f};
+    const float vk_ops_la[2] = {0.f, 1.f};
+    const float vk_ops_lp[2] = {1.f, 1.f};
+    float vk_ops_ln[2] = {};
+    const bool vk_ops_lr = layer_residual(vk_ops_lx, vk_ops_la, vk_ops_lp, vk_ops_ln, 2, 1e-6f);
+    CHECK(vk_ops_lr);
+    CHECK(vk_ops_lx[0] != 0.f && vk_ops_lx[1] != 0.f);
+    CHECK(std::isfinite(vk_ops_ln[0]) && std::isfinite(vk_ops_ln[1]));
+
     shutdown();
     const bool vk_ops_off = !available();
     CHECK(vk_ops_off);
@@ -3123,6 +3138,8 @@ static void test_glm53_container() {
     CHECK(glm_coli_avail);
     const bool glm_metal_tier = info.find("metal=") != std::string::npos;
     CHECK(glm_metal_tier);
+    const bool glm_vk_tier = info.find("vk=") != std::string::npos;
+    CHECK(glm_vk_tier);
     CHECK(eg.config().moe.n_experts == 2);
     GenParams gp;
     gp.max_new_tokens = 2;
@@ -3208,6 +3225,8 @@ static void test_k3_mxfp4_container() {
     CHECK(k3_coli_ndev);
     const bool k3_metal_tier = info.find("metal=") != std::string::npos;
     CHECK(k3_metal_tier);
+    const bool k3_vk_tier = info.find("vk=") != std::string::npos;
+    CHECK(k3_vk_tier);
     GenParams gp;
     gp.max_new_tokens = 2;
     gp.eos = 1;
