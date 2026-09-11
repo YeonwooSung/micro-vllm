@@ -8,6 +8,8 @@ namespace coli_cuda {
 
 // Generic K3/GLM CUDA-tier API. Names follow official backend_cuda.
 // Always compiled: ops run on CPU until a CUDA backend is linked.
+// Device GEMM lives in an optional .cu when MVLLM_GPU_CUDA and nvcc exist.
+// This header is the CPU-capable API.
 // Returns false on bad args; never throws.
 
 // weight_at decodes fmt 0–4 only. fmt 6/7/8 have their own matmul paths.

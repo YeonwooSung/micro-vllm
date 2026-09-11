@@ -2257,6 +2257,23 @@ static void test_vk_ops_tier() {
     CHECK(vk_ops_lx[0] != 0.f && vk_ops_lx[1] != 0.f);
     CHECK(std::isfinite(vk_ops_ln[0]) && std::isfinite(vk_ops_ln[1]));
 
+    const float vk_ops_moe_id[4] = {1.f, 0.f, 0.f, 1.f};
+    const float *vk_ops_moe_g[1] = {vk_ops_moe_id};
+    const float *vk_ops_moe_u[1] = {vk_ops_moe_id};
+    const float *vk_ops_moe_d[1] = {vk_ops_moe_id};
+    const float vk_ops_moe_x[2] = {0.5f, -0.25f};
+    const int vk_ops_moe_off[1] = {0};
+    const int vk_ops_moe_nr[1] = {1};
+    const int vk_ops_moe_rows[1] = {0};
+    const float vk_ops_moe_rw[1] = {1.f};
+    float vk_ops_moe_y[2] = {};
+    const bool vk_ops_moe =
+        moe_block_f32(1, 2, 2, vk_ops_moe_g, vk_ops_moe_u, vk_ops_moe_d, vk_ops_moe_x,
+                      vk_ops_moe_off, vk_ops_moe_nr, vk_ops_moe_rows, vk_ops_moe_rw, vk_ops_moe_y,
+                      1);
+    CHECK(vk_ops_moe);
+    CHECK(std::isfinite(vk_ops_moe_y[0]) && std::isfinite(vk_ops_moe_y[1]));
+
     shutdown();
     const bool vk_ops_off = !available();
     CHECK(vk_ops_off);

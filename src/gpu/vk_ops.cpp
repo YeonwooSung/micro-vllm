@@ -2,6 +2,8 @@
 
 #include "../quant/quant.hpp"
 
+#include <vector>
+
 #if defined(MVLLM_WITH_VULKAN)
 #include <vulkan/vulkan.h>
 #endif
@@ -88,6 +90,46 @@ bool layer_residual(float *x, const float *attn, const float *post_ln, float *nr
     for (int i = 0; i < D; ++i)
         x[i] += attn[i];
     quant::rmsnorm(x, post_ln, nrm, D, eps);
+    return true;
+}
+
+bool moe_block_f32(int nb, int D, int Iinter, const float *const *g, const float *const *u,
+                   const float *const *d, const float *xg, const int *xoff, const int *nr,
+                   const int *rows, const float *rw, float *out, int S) {
+    if (nb < 1 || D < 1 || !out || !xg || !xoff || !nr)
+        return false;
+    int base = 0;
+    std::vector<float> gate, up, hh;
+    for (int e = 0; e < nb; ++e) {
+        const int nre = nr[e];
+        if (nre <= 0)
+            continue;
+        if (Iinter < 1 || !g || !u || !d || !g[e] || !u[e] || !d[e]) {
+            base += nre;
+            continue;
+        }
+        const float *xe = xg + static_cast<size_t>(xoff[e]) * static_cast<size_t>(D);
+        gate.assign(static_cast<size_t>(nre) * static_cast<size_t>(Iinter), 0.f);
+        up.assign(static_cast<size_t>(nre) * static_cast<size_t>(Iinter), 0.f);
+        hh.assign(static_cast<size_t>(nre) * static_cast<size_t>(D), 0.f);
+        quant::matmul_f32(gate.data(), xe, g[e], nre, D, Iinter);
+        quant::matmul_f32(up.data(), xe, u[e], nre, D, Iinter);
+        quant::silu_mul(gate.data(), up.data(), nre * Iinter);
+        quant::matmul_f32(hh.data(), gate.data(), d[e], nre, Iinter, D);
+        if (rows && rw) {
+            for (int r = 0; r < nre; ++r) {
+                const int dest = rows[base + r];
+                if (dest < 0 || (S > 0 && dest >= S))
+                    continue;
+                const float w = rw[base + r];
+                const float *hr = hh.data() + static_cast<size_t>(r) * static_cast<size_t>(D);
+                float *orow = out + static_cast<size_t>(dest) * static_cast<size_t>(D);
+                for (int i = 0; i < D; ++i)
+                    orow[i] += w * hr[i];
+            }
+        }
+        base += nre;
+    }
     return true;
 }
 

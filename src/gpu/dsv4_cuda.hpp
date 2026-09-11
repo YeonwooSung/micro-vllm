@@ -6,9 +6,10 @@
 namespace mvllm {
 namespace dsv4_cuda {
 
-// Host-side DSV4 GPU-tier API. Names follow the official CUDA backend surface.
-// This translation unit always compiles: ops run on CPU until a CUDA .cu
-// backend is linked (MVLLM_GPU_CUDA). Returns false on bad args; never throws.
+// Host-side DSV4 GPU-tier API. Names follow official backend_cuda_dsv4.
+// CPU API is always on; src/gpu/dsv4_cuda.cu is optional nvcc
+// (MVLLM_GPU_CUDA). Official backend_cuda_dsv4.cu is not pasted.
+// Returns false on bad args; never throws.
 
 struct Tensor;
 struct Activation;

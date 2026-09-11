@@ -8,6 +8,9 @@ namespace metal_ops {
 // Standalone Metal (or CPU fallback) ops for K3/GLM decode.
 // available() is true after a successful init (CPU always; Metal when compiled).
 // Returning false means the caller should use the existing host kernel.
+// Stage B full-layer (in_ln → MLA/KDA → residual → shared → router) is
+// layer_decode_full / layer_decode_kda / layer_decode_mla. Official Metal
+// shaders are not vendored.
 
 bool init();
 void shutdown();
