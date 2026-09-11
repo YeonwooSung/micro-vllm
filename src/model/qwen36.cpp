@@ -1,5 +1,6 @@
 #include "family.hpp"
 #include "../gpu/coli_cuda.hpp"
+#include "../gpu/metal_ops.hpp"
 #include "../gpu/vk_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
@@ -121,6 +122,7 @@ public:
             from_checkpoint_ = false;
         }
         coli_cuda::init(nullptr, 0);
+        metal_ops::init();
         vk_ops::init();
         loaded_ = true;
         return Status::Ok;
@@ -212,8 +214,10 @@ public:
                         const int ss = nq * hd * hd;
                         if (static_cast<int>(gdn_s[static_cast<size_t>(l)].size()) < ss)
                             gdn_s[static_cast<size_t>(l)].assign(static_cast<size_t>(ss), 0.f);
-                        gdn_delta(gdn_s[static_cast<size_t>(l)].data(), ctx.data(), q.data(),
-                                  k.data(), v.data(), nq, nkv, hd, group);
+                        if (!metal_ops::gdn_delta(gdn_s[static_cast<size_t>(l)].data(), ctx.data(),
+                                                  q.data(), k.data(), v.data(), nq, nkv, hd, group))
+                            gdn_delta(gdn_s[static_cast<size_t>(l)].data(), ctx.data(), q.data(),
+                                      k.data(), v.data(), nq, nkv, hd, group);
                         quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(),
                                           1, qd, H);
                     } else if (layer_gqa(l) && tpos < Tmax) {
@@ -859,8 +863,10 @@ private:
                     const int ss = nq * hd * hd;
                     if (static_cast<int>(s.gdn_s[static_cast<size_t>(l)].size()) < ss)
                         s.gdn_s[static_cast<size_t>(l)].assign(static_cast<size_t>(ss), 0.f);
-                    gdn_delta(s.gdn_s[static_cast<size_t>(l)].data(), ctx.data(), q.data(), k.data(),
-                              v.data(), nq, nkv, hd, group);
+                    if (!metal_ops::gdn_delta(s.gdn_s[static_cast<size_t>(l)].data(), ctx.data(),
+                                              q.data(), k.data(), v.data(), nq, nkv, hd, group))
+                        gdn_delta(s.gdn_s[static_cast<size_t>(l)].data(), ctx.data(), q.data(),
+                                  k.data(), v.data(), nq, nkv, hd, group);
                     quant::matmul_f32(d.data(), ctx.data(), wo_[static_cast<size_t>(l)].data(), 1,
                                       qd, H);
                 } else if (layer_gqa(l) && tpos < Tmax &&

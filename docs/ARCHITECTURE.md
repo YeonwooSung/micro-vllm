@@ -207,10 +207,17 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
 - `backend_name()` is `"cpu"` on this Mac path. Multi-GPU TP2/EP2 return false.
 - Prefix checkpoints stay on the host (`V4_PREFIX_CKPT`).
 
+Vendored official Metal kernels (`src/gpu/vendor/`):
+
+- `coli_metal_kernels.metal` extracted from colibri `backend_metal.mm` (Apache-2.0).
+- `h3_shaders.metal` copied from h3.c (MIT). See `NOTICE`. Not linked into
+  the default host binary.
+
 Metal ops (`mvllm::metal_ops`):
 
 - Host API: `src/gpu/metal_ops.hpp`. CPU fallback TU (`metal_ops.cpp`) or
-  Metal `metal_ops.mm` when `APPLE AND MVLLM_METAL`.
+  Metal `metal_ops.mm` when `APPLE AND MVLLM_METAL`. Qwen36/38 GDN prefers
+  `metal_ops::gdn_delta`.
 - Surface: `rmsnorm` / `add` / `silu_mul` plus fused KDA token
   (`kda_fused_token`: depthwise conv+SiLU, L2-norm q/k, state recurrence).
   `layer_decode` is the post-attention tail (residual + rmsnorm + optional
@@ -224,6 +231,11 @@ Metal ops (`mvllm::metal_ops`):
   `moe_block` takes `Act::Silu|ClampSwiGLU|Situ`. GLM routed int4 uses
   ClampSwiGLU. K3 F32 dense/shared uses SiTU. K3 routed MXFP4 uses
   `moe_block` fmt 7 (`op_gemm_mxfp4` + SiTU) before `coli_cuda` / host.
+
+Vendored official Metal kernels (`src/gpu/vendor/`):
+
+- `coli_metal_kernels.metal` from colibri `backend_metal.mm` (Apache-2.0).
+- `h3_shaders.metal` from h3.c (MIT). See `NOTICE`. Not in the default host link.
 
 Vulkan ops (`mvllm::vk_ops`):
 

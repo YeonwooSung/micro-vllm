@@ -1,0 +1,13 @@
+Third-party Metal shader sources under src/gpu/vendor/
+
+coli_metal_kernels.metal
+  Extracted from colibri c/backend_metal.mm (Apache License 2.0).
+  Upstream: https://github.com (colibri). See /colibri-main/LICENSE.
+
+h3_shaders.metal
+  Copied from h3.c h3_shaders.metal (MIT License).
+  Copyright (c) 2026 Salvatore Sanfilippo.
+  See /h3.c-main/LICENSE.
+
+These files are vendored for reference and future device ports.
+They are not compiled into the default host binary.
