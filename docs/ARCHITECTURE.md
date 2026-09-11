@@ -232,7 +232,9 @@ Vulkan ops (`mvllm::vk_ops`):
   `silu_mul` / `gemm_f32` / `layer_residual`. K3 / GLM / H3 / DSV4
   `describe()` show `vk=`. K3/GLM residual uses Metal `layer_decode` only
   when `backend_name()` is `"metal"`; otherwise `vk_ops::layer_residual`.
-  Device kernels can replace this TU later.
+  `-DMVLLM_GPU_VULKAN=ON` plus `find_package(Vulkan)` creates an instance
+  and `backend_name()` becomes `"vulkan"`; GEMM/residual stay CPU until
+  kernels land. Without the SDK, CMake warns and the stub stays `"cpu"`.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 

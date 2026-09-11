@@ -2,24 +2,54 @@
 
 #include "../quant/quant.hpp"
 
+#if defined(MVLLM_WITH_VULKAN)
+#include <vulkan/vulkan.h>
+#endif
+
 namespace mvllm {
 namespace vk_ops {
 namespace {
 
 bool g_inited = false;
+bool g_vk = false;
+#if defined(MVLLM_WITH_VULKAN)
+VkInstance g_inst = VK_NULL_HANDLE;
+#endif
 
 } // namespace
 
 bool init() {
+#if defined(MVLLM_WITH_VULKAN)
+    if (!g_inst) {
+        VkApplicationInfo app{};
+        app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        app.pApplicationName = "micro-vllm";
+        app.apiVersion = VK_API_VERSION_1_0;
+        VkInstanceCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        ci.pApplicationInfo = &app;
+        if (vkCreateInstance(&ci, nullptr, &g_inst) == VK_SUCCESS)
+            g_vk = true;
+    }
+#endif
     g_inited = true;
     return true;
 }
 
-void shutdown() { g_inited = false; }
+void shutdown() {
+#if defined(MVLLM_WITH_VULKAN)
+    if (g_inst) {
+        vkDestroyInstance(g_inst, nullptr);
+        g_inst = VK_NULL_HANDLE;
+    }
+    g_vk = false;
+#endif
+    g_inited = false;
+}
 
 bool available() { return g_inited; }
 
-const char *backend_name() { return "cpu"; }
+const char *backend_name() { return g_vk ? "vulkan" : "cpu"; }
 
 bool rmsnorm(float *y, const float *x, const float *w, int nrows, int D, float eps) {
     if (!y || !x || nrows < 1 || D < 1)

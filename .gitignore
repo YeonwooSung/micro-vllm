@@ -77,6 +77,14 @@ Testing/
 
 # MacOS
 .DS_Store
+*.dSYM/
+a.out.dSYM/
+
+# runtime usage / prefix checkpoints next to a model tree
+.coli_usage
+**/.coli_usage
+.coli_ckpt/
+**/.coli_ckpt/
 
 # python
 __pycache__/

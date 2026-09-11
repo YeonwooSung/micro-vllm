@@ -11,7 +11,7 @@ namespace vk_ops {
 bool init();
 void shutdown();
 bool available();
-const char *backend_name(); // "cpu" until a Vulkan device path exists
+const char *backend_name(); // "vulkan" after a live instance, else "cpu"
 
 bool rmsnorm(float *y, const float *x, const float *w, int nrows, int D, float eps);
 bool add(float *y, const float *a, size_t n);

@@ -2218,7 +2218,7 @@ static void test_vk_ops_tier() {
     const bool vk_ops_avail = available();
     CHECK(vk_ops_avail);
     const char *vk_ops_bn = backend_name();
-    CHECK(vk_ops_bn && std::strcmp(vk_ops_bn, "cpu") == 0);
+    CHECK(vk_ops_bn && (std::strcmp(vk_ops_bn, "cpu") == 0 || std::strcmp(vk_ops_bn, "vulkan") == 0));
 
     const float vk_ops_x[4] = {1.f, 0.f, 0.f, 0.f};
     const float vk_ops_w[4] = {1.f, 1.f, 1.f, 1.f};
@@ -3141,6 +3141,7 @@ static void test_glm53_container() {
     const bool glm_vk_tier = info.find("vk=") != std::string::npos;
     CHECK(glm_vk_tier);
     const bool glm_vk_cpu = info.find("vk=cpu") != std::string::npos ||
+                            info.find("vk=vulkan") != std::string::npos ||
                             info.find("vk=off") != std::string::npos;
     CHECK(glm_vk_cpu);
     CHECK(eg.config().moe.n_experts == 2);
@@ -3231,6 +3232,7 @@ static void test_k3_mxfp4_container() {
     const bool k3_vk_tier = info.find("vk=") != std::string::npos;
     CHECK(k3_vk_tier);
     const bool k3_vk_cpu = info.find("vk=cpu") != std::string::npos ||
+                           info.find("vk=vulkan") != std::string::npos ||
                            info.find("vk=off") != std::string::npos;
     CHECK(k3_vk_cpu);
     GenParams gp;
