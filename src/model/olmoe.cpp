@@ -181,6 +181,7 @@ public:
                                           1, H, kvd);
                         quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(),
                                           1, H, kvd);
+                        qk_rmsnorm(q.data(), k.data(), l, nq, nkv, hd);
                         for (int hh = 0; hh < nq; ++hh)
                             apply_rope(q.data() + hh * hd, hd, tpos, theta);
                         for (int hh = 0; hh < nkv; ++hh)
@@ -304,6 +305,7 @@ public:
         os << "olmoe  hidden=" << cfg_.hidden << " layers=" << cfg_.n_layers
            << " q_heads=" << cfg_.n_q_heads << " kv_heads=" << cfg_.n_kv_heads
            << " experts=" << cfg_.moe.n_experts << " routed=" << routed
+           << " qk_norm=yes"
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
            << (has_gqa() ? "GQA" : "stand-in") << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
@@ -757,6 +759,7 @@ private:
                                       kvd);
                     quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(), 1, H,
                                       kvd);
+                    qk_rmsnorm(q.data(), k.data(), l, nq, nkv, hd);
                     for (int hh = 0; hh < nq; ++hh)
                         apply_rope(q.data() + hh * hd, hd, tpos, theta);
                     for (int hh = 0; hh < nkv; ++hh)
@@ -837,6 +840,26 @@ private:
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
+    }
+
+    void qk_rmsnorm(float *q, float *k, int l, int nq, int nkv, int hd) const {
+        if (!q || !k || hd < 1)
+            return;
+        const float *qw = (l >= 0 && l < static_cast<int>(qn_.size()) &&
+                           qn_[static_cast<size_t>(l)].size() >= static_cast<size_t>(hd))
+                              ? qn_[static_cast<size_t>(l)].data()
+                              : nullptr;
+        const float *kw = (l >= 0 && l < static_cast<int>(kn_.size()) &&
+                           kn_[static_cast<size_t>(l)].size() >= static_cast<size_t>(hd))
+                              ? kn_[static_cast<size_t>(l)].data()
+                              : nullptr;
+        std::vector<float> tmp(static_cast<size_t>(hd));
+        for (int hh = 0; hh < nq; ++hh)
+            quant::rmsnorm(q + hh * hd, qw, tmp.data(), hd, cfg_.rms_eps),
+                std::memcpy(q + hh * hd, tmp.data(), static_cast<size_t>(hd) * sizeof(float));
+        for (int hh = 0; hh < nkv; ++hh)
+            quant::rmsnorm(k + hh * hd, kw, tmp.data(), hd, cfg_.rms_eps),
+                std::memcpy(k + hh * hd, tmp.data(), static_cast<size_t>(hd) * sizeof(float));
     }
 
     bool layer_expert_mats(int l) const {
@@ -977,6 +1000,8 @@ private:
         wk_.assign(static_cast<size_t>(L), {});
         wv_.assign(static_cast<size_t>(L), {});
         wo_.assign(static_cast<size_t>(L), {});
+        qn_.assign(static_cast<size_t>(L), {});
+        kn_.assign(static_cast<size_t>(L), {});
         gate_.assign(static_cast<size_t>(L), {});
         up_.assign(static_cast<size_t>(L), {});
         down_.assign(static_cast<size_t>(L), {});
@@ -997,6 +1022,8 @@ private:
                 xavier(wk_[static_cast<size_t>(l)], kvd, H, 450 + l);
                 xavier(wv_[static_cast<size_t>(l)], kvd, H, 460 + l);
             }
+            ones(qn_[static_cast<size_t>(l)], std::max(cfg_.head_dim, 1));
+            ones(kn_[static_cast<size_t>(l)], std::max(cfg_.head_dim, 1));
             xavier(gate_[static_cast<size_t>(l)], I, H, 420 + l);
             xavier(up_[static_cast<size_t>(l)], I, H, 430 + l);
             xavier(down_[static_cast<size_t>(l)], H, I, 440 + l);
@@ -1012,6 +1039,43 @@ private:
 
     // Stage A: synthetic GQA + RoPE; per-expert SwiGLU when mats fit, else dense mix.
     void alloc_synthetic() { alloc_weights(true); }
+
+    void overlay_layer_experts(const std::vector<io::StFile> &files, const std::string &ly, int l,
+                               std::string &err) {
+        const int E = cfg_.moe.n_experts;
+        const int I = std::max(cfg_.dense_intermediate, 1);
+        const int H = std::max(cfg_.hidden, 1);
+        if (!layer_expert_mats(l))
+            return;
+        const size_t li = static_cast<size_t>(l);
+        std::vector<float> pg, pu, pd;
+        if (overlay_f32(files, ly + ".mlp.experts.gate_proj.weight", pg, err) == Status::Ok &&
+            overlay_f32(files, ly + ".mlp.experts.up_proj.weight", pu, err) == Status::Ok &&
+            overlay_f32(files, ly + ".mlp.experts.down_proj.weight", pd, err) == Status::Ok) {
+            e_gate_[li].swap(pg);
+            e_up_[li].swap(pu);
+            e_down_[li].swap(pd);
+            return;
+        }
+        const size_t gih = static_cast<size_t>(I) * static_cast<size_t>(H);
+        const size_t dhi = static_cast<size_t>(H) * static_cast<size_t>(I);
+        for (int e = 0; e < E; ++e) {
+            const std::string ex = ly + ".mlp.experts." + std::to_string(e);
+            std::vector<float> tmp;
+            if (overlay_f32(files, ex + ".gate_proj.weight", tmp, err) == Status::Ok &&
+                tmp.size() >= gih)
+                std::memcpy(e_gate_[li].data() + static_cast<size_t>(e) * gih, tmp.data(),
+                            gih * sizeof(float));
+            if (overlay_f32(files, ex + ".up_proj.weight", tmp, err) == Status::Ok &&
+                tmp.size() >= gih)
+                std::memcpy(e_up_[li].data() + static_cast<size_t>(e) * gih, tmp.data(),
+                            gih * sizeof(float));
+            if (overlay_f32(files, ex + ".down_proj.weight", tmp, err) == Status::Ok &&
+                tmp.size() >= dhi)
+                std::memcpy(e_down_[li].data() + static_cast<size_t>(e) * dhi, tmp.data(),
+                            dhi * sizeof(float));
+        }
+    }
 
     Status overlay_f32(const std::vector<io::StFile> &files, const std::string &name,
                        std::vector<float> &dst, std::string &err) {
@@ -1154,6 +1218,12 @@ private:
             overlay_f32(files, ly + ".mlp.gate_proj.weight", gate_[static_cast<size_t>(i)], err);
             overlay_f32(files, ly + ".mlp.up_proj.weight", up_[static_cast<size_t>(i)], err);
             overlay_f32(files, ly + ".mlp.down_proj.weight", down_[static_cast<size_t>(i)], err);
+            overlay_f32(files, ly + ".self_attn.q_norm.weight", qn_[static_cast<size_t>(i)], err);
+            overlay_f32(files, ly + ".self_attn.k_norm.weight", kn_[static_cast<size_t>(i)], err);
+            if (overlay_f32(files, ly + ".mlp.gate.weight", router_[static_cast<size_t>(i)], err) !=
+                Status::Ok)
+                overlay_f32(files, ly + ".mlp.router.weight", router_[static_cast<size_t>(i)], err);
+            overlay_layer_experts(files, ly, i, err);
         }
         io::st_close_dir(files);
         err.clear();
@@ -1167,6 +1237,7 @@ private:
     bool from_checkpoint_ = false;
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
+    std::vector<std::vector<float>> qn_, kn_;
     std::vector<std::vector<float>> router_; // [L][E*H]
     std::vector<std::vector<float>> e_gate_, e_up_, e_down_; // [L][E*I*H], [L][E*I*H], [L][E*H*I]
     OlmoeSlot slots_[kMaxKvSlots];

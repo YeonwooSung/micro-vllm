@@ -78,6 +78,7 @@ public:
         std::vector<int> history;
         std::vector<float> h;
         std::vector<std::vector<float>> k_cache, v_cache;
+        std::vector<std::vector<float>> ink_hk, ink_hv;
         int pos = 0;
         int t_max = 0;
         bool have = false;
@@ -137,6 +138,8 @@ public:
         std::vector<float> h(H), nrm(H), q(std::max(H, qd)), k(kvd), v(kvd), ctx(qd), g(I), u(I),
             d(H);
         std::vector<std::vector<float>> k_cache, v_cache;
+        std::vector<std::vector<float>> ink_hk(static_cast<size_t>(cfg_.n_layers)),
+            ink_hv(static_cast<size_t>(cfg_.n_layers));
         const bool any_gqa = has_gqa();
         if (any_gqa) {
             k_cache.resize(static_cast<size_t>(cfg_.n_layers));
@@ -170,16 +173,18 @@ public:
                                           1, H, kvd);
                         quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(),
                                           1, H, kvd);
+                        std::fill(ctx.begin(), ctx.end(), 0.f);
+                        const int past = tpos + 1;
+                        ink_conv_kv(l, k.data(), v.data(), kvd, ink_hk[static_cast<size_t>(l)],
+                                    ink_hv[static_cast<size_t>(l)]);
                         std::memcpy(k_cache[static_cast<size_t>(l)].data() +
                                         static_cast<size_t>(tpos) * kvd,
                                     k.data(), static_cast<size_t>(kvd) * sizeof(float));
                         std::memcpy(v_cache[static_cast<size_t>(l)].data() +
                                         static_cast<size_t>(tpos) * kvd,
                                     v.data(), static_cast<size_t>(kvd) * sizeof(float));
-                        std::fill(ctx.begin(), ctx.end(), 0.f);
-                        const int past = tpos + 1;
                         int s0 = 0;
-                        if (cfg_.sliding_window > 0)
+                        if (!layer_global(l) && cfg_.sliding_window > 0)
                             s0 = std::max(0, past - cfg_.sliding_window);
                         std::vector<float> sc(static_cast<size_t>(past));
                         for (int hh = 0; hh < nq; ++hh) {
@@ -192,7 +197,8 @@ public:
                                 float acc = 0.f;
                                 for (int d0 = 0; d0 < hd; ++d0)
                                     acc += qh[d0] * kk[d0];
-                                sc[static_cast<size_t>(s)] = acc * scale;
+                                sc[static_cast<size_t>(s)] =
+                                    acc * scale + rel_bias(l, tpos - s);
                                 if (sc[static_cast<size_t>(s)] > mx)
                                     mx = sc[static_cast<size_t>(s)];
                             }
@@ -287,6 +293,7 @@ public:
         os << "inkling  hidden=" << cfg_.hidden << " layers=" << cfg_.n_layers
            << " q_heads=" << cfg_.n_q_heads << " kv_heads=" << cfg_.n_kv_heads
            << " rope=off window=" << cfg_.sliding_window << " routed=" << routed_tag()
+           << " swa=5:1 rel=yes conv=k4"
            << " checkpoint=" << (from_checkpoint_ ? "yes" : "synthetic") << " (CPU "
            << (has_gqa() ? "GQA" : "stand-in") << "; CUDA demo is micro-vllm-cuda)";
         return os.str();
@@ -651,6 +658,8 @@ private:
         const int L = std::max(cfg_.n_layers, 0);
         s.h.assign(static_cast<size_t>(H), 0.f);
         s.k_cache.assign(static_cast<size_t>(L), {});
+        s.ink_hk.assign(static_cast<size_t>(L), {});
+        s.ink_hv.assign(static_cast<size_t>(L), {});
         s.v_cache.assign(static_cast<size_t>(L), {});
         if (has_gqa()) {
             for (int l = 0; l < L; ++l) {
@@ -739,16 +748,18 @@ private:
                                       kvd);
                     quant::matmul_f32(v.data(), nrm.data(), wv_[static_cast<size_t>(l)].data(), 1, H,
                                       kvd);
+                    std::fill(ctx.begin(), ctx.end(), 0.f);
+                    const int past = tpos + 1;
+                    ink_conv_kv(l, k.data(), v.data(), kvd, s.ink_hk[static_cast<size_t>(l)],
+                                s.ink_hv[static_cast<size_t>(l)]);
                     std::memcpy(s.k_cache[static_cast<size_t>(l)].data() +
                                     static_cast<size_t>(tpos) * kvd,
                                 k.data(), static_cast<size_t>(kvd) * sizeof(float));
                     std::memcpy(s.v_cache[static_cast<size_t>(l)].data() +
                                     static_cast<size_t>(tpos) * kvd,
                                 v.data(), static_cast<size_t>(kvd) * sizeof(float));
-                    std::fill(ctx.begin(), ctx.end(), 0.f);
-                    const int past = tpos + 1;
                     int s0 = 0;
-                    if (cfg_.sliding_window > 0)
+                    if (!layer_global(l) && cfg_.sliding_window > 0)
                         s0 = std::max(0, past - cfg_.sliding_window);
                     std::vector<float> sc(static_cast<size_t>(past));
                     for (int hh = 0; hh < nq; ++hh) {
@@ -761,7 +772,7 @@ private:
                             float acc = 0.f;
                             for (int d0 = 0; d0 < hd; ++d0)
                                 acc += qh[d0] * kk[d0];
-                            sc[static_cast<size_t>(t)] = acc * scale;
+                            sc[static_cast<size_t>(t)] = acc * scale + rel_bias(l, tpos - t);
                             if (sc[static_cast<size_t>(t)] > mx)
                                 mx = sc[static_cast<size_t>(t)];
                         }
@@ -818,6 +829,46 @@ private:
         return sample_penalized(logits.data(), cfg_.vocab, gp, s.history.data(),
                                static_cast<int>(s.history.size()), rng, allow, nullptr,
                                &s.token_lps, &s.top_lps);
+    }
+
+    static bool layer_global(int l) { return l >= 0 && (l + 1) % 6 == 0; }
+
+    float rel_bias(int l, int dist) const {
+        if (l < 0 || l >= static_cast<int>(rel_.size()) || rel_[static_cast<size_t>(l)].empty())
+            return 0.f;
+        const int n = static_cast<int>(rel_[static_cast<size_t>(l)].size());
+        if (n < 1)
+            return 0.f;
+        if (dist < 0)
+            dist = 0;
+        if (dist >= n)
+            dist = n - 1;
+        return rel_[static_cast<size_t>(l)][static_cast<size_t>(dist)];
+    }
+
+    void ink_conv_kv(int l, float *k, float *v, int kvd, std::vector<float> &hk,
+                     std::vector<float> &hv) const {
+        if (!k || !v || kvd < 1)
+            return;
+        if (l < 0 || l >= static_cast<int>(conv_k_.size()) ||
+            conv_k_[static_cast<size_t>(l)].size() < static_cast<size_t>(4) * kvd)
+            return;
+        if (hk.size() < static_cast<size_t>(4) * kvd)
+            hk.assign(static_cast<size_t>(4) * kvd, 0.f);
+        if (hv.size() < static_cast<size_t>(4) * kvd)
+            hv.assign(static_cast<size_t>(4) * kvd, 0.f);
+        auto conv = [](float *x, float *hist, const float *w, int D) {
+            std::memmove(hist + D, hist, static_cast<size_t>(3) * D * sizeof(float));
+            std::memcpy(hist, x, static_cast<size_t>(D) * sizeof(float));
+            for (int d = 0; d < D; ++d) {
+                float acc = 0.f;
+                for (int t = 0; t < 4; ++t)
+                    acc += w[static_cast<size_t>(t) * D + d] * hist[static_cast<size_t>(t) * D + d];
+                x[d] = acc;
+            }
+        };
+        conv(k, hk.data(), conv_k_[static_cast<size_t>(l)].data(), kvd);
+        conv(v, hv.data(), conv_v_[static_cast<size_t>(l)].data(), kvd);
     }
 
     bool layer_gqa(int l) const {
@@ -978,6 +1029,9 @@ private:
         egate_.assign(static_cast<size_t>(L), {});
         eup_.assign(static_cast<size_t>(L), {});
         edown_.assign(static_cast<size_t>(L), {});
+        conv_k_.assign(static_cast<size_t>(L), {});
+        conv_v_.assign(static_cast<size_t>(L), {});
+        rel_.assign(static_cast<size_t>(L), {});
         const int E = cfg_.moe.n_experts;
         // Resident per-expert SwiGLU only when E<=16 and E*I*H<=2e6.
         const bool resident = experts_budget(E, I, H);
@@ -1000,6 +1054,13 @@ private:
                 xavier(eup_[static_cast<size_t>(l)], E * I, H, 490 + l);
                 xavier(edown_[static_cast<size_t>(l)], E * H, I, 500 + l);
             }
+            conv_k_[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+            conv_v_[static_cast<size_t>(l)].assign(static_cast<size_t>(4) * kvd, 0.f);
+            for (int d = 0; d < kvd; ++d) {
+                conv_k_[static_cast<size_t>(l)][static_cast<size_t>(d)] = 1.f;
+                conv_v_[static_cast<size_t>(l)][static_cast<size_t>(d)] = 1.f;
+            }
+            rel_[static_cast<size_t>(l)].assign(64, 0.f);
         }
     }
 
@@ -1223,6 +1284,7 @@ private:
     bool from_checkpoint_ = false;
     std::vector<float> embed_, norm_, lm_head_;
     std::vector<std::vector<float>> in_n_, out_n_, wq_, wk_, wv_, wo_, gate_, up_, down_;
+    std::vector<std::vector<float>> conv_k_, conv_v_, rel_;
     std::vector<std::vector<float>> router_; // [L][E*H]
     std::vector<std::vector<float>> egate_, eup_, edown_; // [L][E*I*H]
     InklingSlot slots_[kMaxKvSlots];

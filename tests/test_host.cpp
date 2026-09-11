@@ -3623,6 +3623,7 @@ static void test_wave1_new_families() {
         std::string err;
         CHECK(e->load(odir, rt, err) == Status::Ok);
         CHECK(e->describe().find("routed=experts") != std::string::npos);
+        CHECK(e->describe().find("qk_norm=yes") != std::string::npos);
         GenParams gp;
         gp.max_new_tokens = 2;
         gp.apply_template = false;
@@ -3641,6 +3642,9 @@ static void test_wave1_new_families() {
         std::string err;
         CHECK(e->load(idir, rt, err) == Status::Ok);
         CHECK(e->describe().find("routed=experts") != std::string::npos);
+        CHECK(e->describe().find("swa=5:1") != std::string::npos);
+        CHECK(e->describe().find("rel=yes") != std::string::npos);
+        CHECK(e->describe().find("conv=k4") != std::string::npos);
     }
     {
         std::string hdir = tmpdir();
