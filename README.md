@@ -50,7 +50,8 @@ HIP: `-DUSE_HIP=ON -DMVLLM_HOST_ONLY=OFF`.
 
 The family is sniffed from `config.json` (`model_type` / `architectures`)
 and then the directory name (`kimi`/`k3`, `glm`, `deepseek-v4`/`dsv4`,
-`minimax`/`h3`, `llama`). GLM-5.2-style names load as **glm53**. There is
+`minimax`/`h3`, `llama`, `qwen36`/`qwen3.6`, `qwen38`/`qwen3.8`, `olmoe`,
+`inkling`). GLM-5.2-style names load as **glm53**. There is
 no `--family` flag.
 
 `--device cpu|metal|cuda` (or `MVLLM_DEVICE`) selects the compute backend.

@@ -28,7 +28,7 @@ void usage() {
         << "                      [--width W] [--height H] [--frames N] [--seed S] [--audio PATH]\n"
         << "                      [--ref-image PATH]... [--first-frame PATH] [--last-frame PATH]\n"
         << "\n"
-        << "Families: llama | kimi_k3 | glm53 | dsv4 | h3\n"
+        << "Families: llama | kimi_k3 | glm53 | dsv4 | h3 | qwen36 | qwen38 | olmoe | inkling\n"
         << "  --device cpu|metal|cuda   expert GEMM / residual / H3 DiT (default cpu)\n"
         << "  --expert-gb N             expert LRU budget\n"
         << "\n"

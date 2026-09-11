@@ -40,6 +40,10 @@ enum class Family : int {
     Glm53 = 3,
     H3 = 4,
     Dsv4 = 5,
+    Qwen36 = 6,
+    Qwen38 = 7,
+    Olmoe = 8,
+    Inkling = 9,
 };
 
 inline const char *device_name(Device d) {
@@ -77,6 +81,14 @@ inline const char *family_name(Family f) {
         return "h3";
     case Family::Dsv4:
         return "dsv4";
+    case Family::Qwen36:
+        return "qwen36";
+    case Family::Qwen38:
+        return "qwen38";
+    case Family::Olmoe:
+        return "olmoe";
+    case Family::Inkling:
+        return "inkling";
     default:
         return "unknown";
     }

@@ -224,6 +224,65 @@ void apply_family_defaults(ModelConfig &cfg) {
         if (cfg.first_dense >= cfg.n_layers && cfg.n_layers > 0)
             cfg.first_dense = 0;
         break;
+    case Family::Qwen36:
+    case Family::Qwen38:
+        if (!cfg.hidden)
+            cfg.hidden = full ? 2048 : 64;
+        if (!cfg.n_layers)
+            cfg.n_layers = full ? 40 : 2;
+        if (!cfg.vocab)
+            cfg.vocab = full ? 151936 : 128;
+        if (!cfg.n_q_heads)
+            cfg.n_q_heads = full ? 16 : 4;
+        if (!cfg.n_kv_heads)
+            cfg.n_kv_heads = full ? 4 : 2;
+        if (!cfg.head_dim)
+            cfg.head_dim = 64;
+        if (!cfg.dense_intermediate)
+            cfg.dense_intermediate = full ? 5632 : 128;
+        if (!cfg.moe.n_experts && full)
+            cfg.moe.n_experts = 128;
+        if (!cfg.moe.topk)
+            cfg.moe.topk = 8;
+        break;
+    case Family::Olmoe:
+        if (!cfg.hidden)
+            cfg.hidden = full ? 2048 : 64;
+        if (!cfg.n_layers)
+            cfg.n_layers = full ? 16 : 2;
+        if (!cfg.vocab)
+            cfg.vocab = full ? 50304 : 128;
+        if (!cfg.n_q_heads)
+            cfg.n_q_heads = full ? 16 : 4;
+        if (!cfg.n_kv_heads)
+            cfg.n_kv_heads = full ? 16 : 2;
+        if (!cfg.head_dim)
+            cfg.head_dim = 64;
+        if (!cfg.moe.n_experts && full)
+            cfg.moe.n_experts = 64;
+        if (!cfg.moe.topk)
+            cfg.moe.topk = 8;
+        break;
+    case Family::Inkling:
+        if (!cfg.hidden)
+            cfg.hidden = full ? 4096 : 64;
+        if (!cfg.n_layers)
+            cfg.n_layers = full ? 48 : 2;
+        if (!cfg.vocab)
+            cfg.vocab = full ? 128000 : 128;
+        if (!cfg.n_q_heads)
+            cfg.n_q_heads = full ? 32 : 4;
+        if (!cfg.n_kv_heads)
+            cfg.n_kv_heads = full ? 8 : 2;
+        if (!cfg.head_dim)
+            cfg.head_dim = 64;
+        if (!cfg.sliding_window)
+            cfg.sliding_window = 512;
+        if (!cfg.moe.n_experts && full)
+            cfg.moe.n_experts = 128;
+        if (!cfg.moe.topk)
+            cfg.moe.topk = 8;
+        break;
     default:
         break;
     }
@@ -290,6 +349,25 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
         if (has(mt, "glm") || has(arch, "Glm"))
             return Family::Glm53;
     }
+    if (has(mt, "olmoe") || has(arch, "Olmoe") || has(arch, "OLMoE"))
+        return Family::Olmoe;
+    if (has(mt, "inkling") || has(arch, "Inkling"))
+        return Family::Inkling;
+    {
+        std::string mt_l = mt, arch_l = arch;
+        for (char &c : mt_l)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        for (char &c : arch_l)
+            if (c >= 'A' && c <= 'Z')
+                c = static_cast<char>(c - 'A' + 'a');
+        if (has(mt_l, "qwen3.8") || has(mt_l, "qwen38") || has(mt_l, "qwen3_8") ||
+            has(arch_l, "qwen3.8") || has(arch_l, "qwen38"))
+            return Family::Qwen38;
+        if (has(mt_l, "qwen3.6") || has(mt_l, "qwen36") || has(mt_l, "qwen3_6") ||
+            has(arch_l, "qwen3.6") || has(arch_l, "qwen36"))
+            return Family::Qwen36;
+    }
     if (has(mt, "llama") || has(arch, "Llama"))
         return Family::Llama;
     if (has(mt, "minimax") || has(arch, "MiniMax") || has(mt, "h3") || lower_has("dit") ||
@@ -325,6 +403,16 @@ Family sniff_family(const std::string &model_dir, std::string *model_type) {
     if (dir.find("dsv4") != std::string::npos || dir.find("deepseek-v4") != std::string::npos ||
         dir.find("deepseek_v4") != std::string::npos || dir.find("deepseekv4") != std::string::npos)
         return Family::Dsv4;
+    if (dir.find("qwen38") != std::string::npos || dir.find("qwen3.8") != std::string::npos ||
+        dir.find("qwen3-8") != std::string::npos)
+        return Family::Qwen38;
+    if (dir.find("qwen36") != std::string::npos || dir.find("qwen3.6") != std::string::npos ||
+        dir.find("qwen3-6") != std::string::npos)
+        return Family::Qwen36;
+    if (dir.find("olmoe") != std::string::npos)
+        return Family::Olmoe;
+    if (dir.find("inkling") != std::string::npos)
+        return Family::Inkling;
     return Family::Unknown;
 }
 

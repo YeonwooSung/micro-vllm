@@ -105,6 +105,11 @@ set(MVLLM_HOST_SOURCES
     src/model/h3_token_reduce.cpp
     src/model/moe_pick.cpp
     src/model/llama.cpp
+    src/model/qwen36.cpp
+    src/model/qwen38.cpp
+    src/model/olmoe.cpp
+    src/model/inkling.cpp
+    src/model/h3_tok.cpp
     src/serve/http_server.cpp
     src/serve/session.cpp
     src/serve/scheduler.cpp

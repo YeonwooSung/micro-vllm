@@ -4,6 +4,7 @@
 #include "h3_mm.hpp"
 #include "h3_text.hpp"
 #include "h3_vae.hpp"
+#include "h3_tok.hpp"
 #include "h3_vision.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/metal_h3.hpp"
@@ -183,6 +184,10 @@ public:
         {
             std::string aerr;
             avae_.load(model_dir, aerr);
+        }
+        {
+            std::string terr;
+            h3_tok_load(model_dir, h3_tok_, terr);
         }
         loaded_ = true;
         metal_h3::init();
@@ -882,6 +887,7 @@ public:
            << " block_bytes=" << block_bytes_ << " checkpoint="
            << (from_checkpoint_ ? "yes" : "synthetic")
            << " transformer=" << (transformer_dir_.empty() ? "-" : transformer_dir_)
+           << " tok=" << h3_tok_backend()
            << " default=" << cfg_.h3.default_width << "x" << cfg_.h3.default_height << "@"
            << cfg_.h3.default_frames << " hits=" << blocks_.hits()
            << " misses=" << blocks_.misses()
@@ -1117,6 +1123,7 @@ private:
     std::vector<std::vector<float>> adaln_w_, adaln_b_, q_norm_, k_norm_;
     H3TextEncoder text_;
     H3VisionEncoder vision_;
+    Tokenizer h3_tok_;
     double t_attn_ = 0, t_emm_ = 0;
 };
 

@@ -3484,12 +3484,47 @@ static bool dump_env_readable_dir(const char *p) {
     return ::access(p, R_OK) == 0;
 }
 
+static void test_wave1_new_families() {
+    using namespace mvllm;
+    const char *wave1_cfgs[][2] = {
+        {"qwen3.6", "qwen36"},
+        {"qwen3.8", "qwen38"},
+        {"olmoe", "olmoe"},
+        {"inkling", "inkling"},
+    };
+    const Family wave1_fam[] = {Family::Qwen36, Family::Qwen38, Family::Olmoe, Family::Inkling};
+    for (int i = 0; i < 4; ++i) {
+        std::string dir = tmpdir();
+        write_file(dir + "/config.json",
+                   std::string("{\"model_type\":\"") + wave1_cfgs[i][0] +
+                       "\",\"hidden_size\":64,\"num_hidden_layers\":2,\"vocab_size\":128,"
+                       "\"num_attention_heads\":4,\"num_key_value_heads\":2,\"head_dim\":16}\n");
+        CHECK(sniff_family(dir) == wave1_fam[i]);
+        auto e = make_engine(wave1_fam[i]);
+        CHECK(e != nullptr);
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(e->load(dir, rt, err) == Status::Ok);
+        CHECK(e->describe().find(wave1_cfgs[i][1]) != std::string::npos);
+        GenParams gp;
+        gp.max_new_tokens = 2;
+        gp.apply_template = false;
+        GenResult out;
+        CHECK(e->generate({1, 2}, gp, out, err) == Status::Ok);
+        CHECK(static_cast<int>(out.tokens.size()) == 2);
+    }
+}
+
 static void test_live_dump_env() {
     using namespace mvllm;
     CHECK(dump_env_for(Family::KimiK3) == dump_env_k3());
     CHECK(dump_env_for(Family::Glm53) == dump_env_glm53());
     CHECK(dump_env_for(Family::H3) == dump_env_h3());
     CHECK(dump_env_for(Family::Dsv4) == dump_env_dsv4());
+    CHECK(dump_env_for(Family::Qwen36) == dump_env_qwen36());
+    CHECK(dump_env_for(Family::Qwen38) == dump_env_qwen38());
+    CHECK(dump_env_for(Family::Olmoe) == dump_env_olmoe());
+    CHECK(dump_env_for(Family::Inkling) == dump_env_inkling());
     CHECK(dump_env_for(Family::Llama) == nullptr);
     CHECK(dump_env_for(Family::Unknown) == nullptr);
     const char *dsv4 = dump_env_dsv4();
@@ -4565,6 +4600,7 @@ int main() {
     test_kda_short_conv();
     test_dsa();
     test_shard_probe();
+    test_wave1_new_families();
     test_live_dump_env();
     test_moe_union();
     test_dense_bits_generate();

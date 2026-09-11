@@ -44,6 +44,14 @@ const char *dump_env_h3() { return pair("MVLLM_DUMP_H3", "COLI_DUMP_H3", nullptr
 
 const char *dump_env_dsv4() { return pair("MVLLM_DUMP_DSV4", "COLI_DUMP_DSV4", nullptr); }
 
+const char *dump_env_qwen36() { return pair("MVLLM_DUMP_QWEN36", "COLI_DUMP_QWEN36", nullptr); }
+
+const char *dump_env_qwen38() { return pair("MVLLM_DUMP_QWEN38", "COLI_DUMP_QWEN38", nullptr); }
+
+const char *dump_env_olmoe() { return pair("MVLLM_DUMP_OLMOE", "COLI_DUMP_OLMOE", nullptr); }
+
+const char *dump_env_inkling() { return pair("MVLLM_DUMP_INKLING", "COLI_DUMP_INKLING", nullptr); }
+
 const char *dump_env_for(Family f) {
     switch (f) {
     case Family::KimiK3:
@@ -54,6 +62,14 @@ const char *dump_env_for(Family f) {
         return dump_env_h3();
     case Family::Dsv4:
         return dump_env_dsv4();
+    case Family::Qwen36:
+        return dump_env_qwen36();
+    case Family::Qwen38:
+        return dump_env_qwen38();
+    case Family::Olmoe:
+        return dump_env_olmoe();
+    case Family::Inkling:
+        return dump_env_inkling();
     default:
         return nullptr;
     }
@@ -80,6 +96,30 @@ const char *dump_env_first_dir(const char **which) {
         return p;
     }
     p = pair("MVLLM_DUMP_DSV4", "COLI_DUMP_DSV4", &name);
+    if (is_dir(p)) {
+        if (which)
+            *which = name;
+        return p;
+    }
+    p = pair("MVLLM_DUMP_QWEN36", "COLI_DUMP_QWEN36", &name);
+    if (is_dir(p)) {
+        if (which)
+            *which = name;
+        return p;
+    }
+    p = pair("MVLLM_DUMP_QWEN38", "COLI_DUMP_QWEN38", &name);
+    if (is_dir(p)) {
+        if (which)
+            *which = name;
+        return p;
+    }
+    p = pair("MVLLM_DUMP_OLMOE", "COLI_DUMP_OLMOE", &name);
+    if (is_dir(p)) {
+        if (which)
+            *which = name;
+        return p;
+    }
+    p = pair("MVLLM_DUMP_INKLING", "COLI_DUMP_INKLING", &name);
     if (is_dir(p)) {
         if (which)
             *which = name;
