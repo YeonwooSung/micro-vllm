@@ -781,6 +781,20 @@ RuntimeConfig runtime_from_env() {
         if (rt.kv_slots > 16)
             rt.kv_slots = 16;
     }
+    if (const char *v = get("MVLLM_TP") ? get("MVLLM_TP") : get("COLI_TP")) {
+        rt.tp_size = std::atoi(v);
+        if (rt.tp_size < 1)
+            rt.tp_size = 1;
+        if (rt.tp_size > 2)
+            rt.tp_size = 2;
+    }
+    if (const char *v = get("MVLLM_EP") ? get("MVLLM_EP") : get("COLI_EP")) {
+        rt.ep_size = std::atoi(v);
+        if (rt.ep_size < 1)
+            rt.ep_size = 1;
+        if (rt.ep_size > 2)
+            rt.ep_size = 2;
+    }
     if (const char *v = get("MVLLM_KV") ? get("MVLLM_KV")
                                         : (get("MVLLM_KV_PATH") ? get("MVLLM_KV_PATH")
                                                                 : get("COLI_KV")))

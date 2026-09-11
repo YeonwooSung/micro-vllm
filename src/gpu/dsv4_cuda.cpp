@@ -1150,40 +1150,70 @@ KvCache *kv_create(int device, int window, int head_dim, int max_tokens, int rop
 
 void kv_free(KvCache *cache) { delete cache; }
 
-bool attention_window(const Activation *input, Tensor *attn_norm, Tensor *q_a, Tensor *q_norm,
-                      Tensor *q_b, Tensor *wkv, Tensor *kv_norm, Tensor *sink, Tensor *wo_a,
-                      Tensor *wo_b, Tensor *, Tensor *, Tensor *, Tensor *, int, int heads,
-                      int head_dim, int qk_rope, int groups, int pos, float eps, KvCache *cache,
-                      Activation *output) {
-    if (!input || !cache || !output || heads <= 0 || head_dim <= 0)
+namespace {
+
+void allreduce_pair(Activation *a, Activation *b) {
+    if (!a || !b)
+        return;
+    const size_t n = std::min(a->v.size(), b->v.size());
+    for (size_t i = 0; i < n; ++i) {
+        const float s = a->v[i] + b->v[i];
+        a->v[i] = s;
+        b->v[i] = s;
+    }
+}
+
+bool attention_window_heads(const Activation *input, Tensor *attn_norm, Tensor *q_a, Tensor *q_norm,
+                            Tensor *q_b, Tensor *wkv, Tensor *kv_norm, Tensor *sink, Tensor *wo_a,
+                            Tensor *wo_b, int heads, int head_dim, int qk_rope, int groups, int pos,
+                            float eps, KvCache *cache, Activation *output, int head_begin,
+                            int n_heads) {
+    if (!input || !cache || !output || heads <= 0 || head_dim <= 0 || n_heads <= 0)
+        return false;
+    if (head_begin < 0 || head_begin + n_heads > heads)
         return false;
     const int H = static_cast<int>(input->v.size());
+    if (H <= 0)
+        return false;
     std::vector<float> n(static_cast<size_t>(H));
     if (!rmsnorm_tensor(n.data(), input->v.data(), attn_norm, H, eps))
         return false;
-    std::vector<float> q(static_cast<size_t>(heads * head_dim), 0.f);
+    const int qn = heads * head_dim;
+    const int q_rows = q_b ? std::max(q_b->O, qn) : qn;
+    std::vector<float> q(static_cast<size_t>(q_rows), 0.f);
     std::vector<float> k(static_cast<size_t>(head_dim), 0.f);
     if (!qkv(q_a, q_norm, q_b, wkv, eps, q.data(), k.data(), n.data()))
         return false;
     std::vector<float> kn(static_cast<size_t>(head_dim));
     if (!rmsnorm_tensor(kn.data(), k.data(), kv_norm, head_dim, eps))
         return false;
-    apply_rope_pairs(kn.data(), head_dim, qk_rope, pos, cache->rope_cos.empty() ? nullptr
-                                                                               : cache->rope_cos.data(),
-                     cache->rope_sin.empty() ? nullptr : cache->rope_sin.data(), cache->rope_pairs);
-    for (int h = 0; h < heads; ++h)
-        apply_rope_pairs(q.data() + static_cast<size_t>(h) * head_dim, head_dim, qk_rope, pos,
-                         cache->rope_cos.empty() ? nullptr : cache->rope_cos.data(),
-                         cache->rope_sin.empty() ? nullptr : cache->rope_sin.data(),
-                         cache->rope_pairs);
+    const float *rcos = cache->rope_cos.empty() ? nullptr : cache->rope_cos.data();
+    const float *rsin = cache->rope_sin.empty() ? nullptr : cache->rope_sin.data();
+    apply_rope_pairs(kn.data(), head_dim, qk_rope, pos, rcos, rsin, cache->rope_pairs);
+    const int q_avail = head_dim > 0 ? static_cast<int>(q.size() / static_cast<size_t>(head_dim)) : 0;
+    const bool q_sharded = q_avail < heads;
+    for (int hi = 0; hi < n_heads; ++hi) {
+        const int qh_i = q_sharded ? hi : head_begin + hi;
+        if (qh_i < 0 || qh_i >= q_avail)
+            continue;
+        apply_rope_pairs(q.data() + static_cast<size_t>(qh_i) * head_dim, head_dim, qk_rope, pos, rcos,
+                         rsin, cache->rope_pairs);
+    }
     cache->keys.insert(cache->keys.end(), kn.begin(), kn.end());
     cache->filled += 1;
     const int T = cache->filled;
     const float att_scale = 1.f / std::sqrt(static_cast<float>(head_dim));
     const float *sk = sink && vec_data(sink) ? vec_data(sink) : nullptr;
-    std::vector<float> ctx(static_cast<size_t>(heads * head_dim), 0.f);
-    for (int h = 0; h < heads; ++h) {
-        const float *qh = q.data() + static_cast<size_t>(h) * head_dim;
+    const int sink_n = sink ? vec_n(sink) : 0;
+    const int wo_I = wo_a ? wo_a->I : qn;
+    std::vector<float> ctx(static_cast<size_t>(std::max(wo_I, qn)), 0.f);
+    const bool wo_full = wo_I >= qn;
+    for (int hi = 0; hi < n_heads; ++hi) {
+        const int h = head_begin + hi;
+        const int qh_i = q_sharded ? hi : h;
+        if (qh_i < 0 || qh_i >= q_avail)
+            continue;
+        const float *qh = q.data() + static_cast<size_t>(qh_i) * head_dim;
         std::vector<float> scores(static_cast<size_t>(T) + 1, 0.f);
         for (int t = 0; t < T; ++t) {
             const float *kt = cache->keys.data() + static_cast<size_t>(t) * head_dim;
@@ -1192,7 +1222,8 @@ bool attention_window(const Activation *input, Tensor *attn_norm, Tensor *q_a, T
                 s += qh[d] * kt[d];
             scores[static_cast<size_t>(t)] = s * att_scale;
         }
-        scores[static_cast<size_t>(T)] = sk ? sk[h] : -1e9f;
+        const int si = sink_n >= heads ? h : hi;
+        scores[static_cast<size_t>(T)] = (sk && si >= 0 && si < sink_n) ? sk[si] : -1e9f;
         float mx = scores[0];
         for (float s : scores)
             if (s > mx)
@@ -1202,7 +1233,8 @@ bool attention_window(const Activation *input, Tensor *attn_norm, Tensor *q_a, T
             s = std::exp(s - mx);
             den += s;
         }
-        float *ch = ctx.data() + static_cast<size_t>(h) * head_dim;
+        const int ctx_i = wo_full ? h : hi;
+        float *ch = ctx.data() + static_cast<size_t>(ctx_i) * head_dim;
         for (int t = 0; t < T; ++t) {
             const float a = den > 0.f ? scores[static_cast<size_t>(t)] / den : 0.f;
             const float *kt = cache->keys.data() + static_cast<size_t>(t) * head_dim;
@@ -1211,6 +1243,71 @@ bool attention_window(const Activation *input, Tensor *attn_norm, Tensor *q_a, T
         }
     }
     return wo(wo_a, wo_b, groups, output->v.data(), ctx.data());
+}
+
+int map_ep_expert(const ExpertSet *set, int global_id, int parity) {
+    if (!set || global_id < 0)
+        return -1;
+    if (parity >= 0 && (global_id % 2) != parity)
+        return -1;
+    if (global_id < set->count && set->gate[static_cast<size_t>(global_id)])
+        return global_id;
+    if (parity >= 0) {
+        const int packed = global_id / 2;
+        if (packed >= 0 && packed < set->count && set->gate[static_cast<size_t>(packed)])
+            return packed;
+    }
+    return -1;
+}
+
+bool moe_routed_parity(const Activation *input, ExpertSet *set, const int *ids, const float *weights,
+                       int parity, float limit, Activation *output, bool with_shared) {
+    if (!input || !output || input->v.empty())
+        return false;
+    if (static_cast<int>(output->v.size()) < static_cast<int>(input->v.size()))
+        return false;
+    std::fill(output->v.begin(), output->v.begin() + static_cast<std::ptrdiff_t>(input->v.size()),
+              0.f);
+    Tensor *g[6] = {}, *u[6] = {}, *d[6] = {};
+    float ww[6] = {};
+    int n = 0;
+    if (set && ids && weights) {
+        for (int k = 0; k < 6; ++k) {
+            const int local = map_ep_expert(set, ids[k], parity);
+            if (local < 0 || !set->up[static_cast<size_t>(local)] ||
+                !set->down[static_cast<size_t>(local)])
+                continue;
+            g[n] = set->gate[static_cast<size_t>(local)];
+            u[n] = set->up[static_cast<size_t>(local)];
+            d[n] = set->down[static_cast<size_t>(local)];
+            ww[n] = weights[k];
+            ++n;
+        }
+    }
+    Tensor *sg = (with_shared && set) ? set->sg : nullptr;
+    Tensor *su = (with_shared && set) ? set->su : nullptr;
+    Tensor *sd = (with_shared && set) ? set->sd : nullptr;
+    if (n > 0)
+        return moe(g, u, d, ww, n, sg, su, sd, limit, output->v.data(), input->v.data());
+    if (sg && su && sd) {
+        std::vector<float> sh(input->v.size(), 0.f);
+        if (!expert_fp8(sg, su, sd, limit, sh.data(), input->v.data()))
+            return false;
+        std::memcpy(output->v.data(), sh.data(), input->v.size() * sizeof(float));
+    }
+    return true;
+}
+
+} // namespace
+
+bool attention_window(const Activation *input, Tensor *attn_norm, Tensor *q_a, Tensor *q_norm,
+                      Tensor *q_b, Tensor *wkv, Tensor *kv_norm, Tensor *sink, Tensor *wo_a,
+                      Tensor *wo_b, Tensor *, Tensor *, Tensor *, Tensor *, int, int heads,
+                      int head_dim, int qk_rope, int groups, int pos, float eps, KvCache *cache,
+                      Activation *output) {
+    return attention_window_heads(input, attn_norm, q_a, q_norm, q_b, wkv, kv_norm, sink, wo_a, wo_b,
+                                  heads, head_dim, qk_rope, groups, pos, eps, cache, output, 0,
+                                  heads);
 }
 
 bool attention_sparse_batch(const Activation *input, Tensor *attn_norm, Tensor *qkv_t, Tensor *,
@@ -1272,10 +1369,47 @@ bool attention_output_batch(const Activation *context, Tensor *wo_a, Tensor *wo_
     return true;
 }
 
-bool attention_window_tp2(const Activation *, Activation *, const AttentionWeights *,
-                          const AttentionWeights *, int, int, int, int, int, int, float, KvCache *,
-                          KvCache *, Activation *, Activation *) {
-    return false;
+bool attention_window_tp2(const Activation *input, Activation *peer_input,
+                          const AttentionWeights *primary, const AttentionWeights *peer,
+                          int compress_ratio, int heads, int head_dim, int qk_rope, int groups,
+                          int pos, float eps, KvCache *cache, KvCache *peer_cache,
+                          Activation *output, Activation *peer_output) {
+    if (!input || !peer_input || !primary || !peer || !cache || !peer_cache || !output ||
+        !peer_output || heads <= 0 || head_dim <= 0)
+        return false;
+    auto run_rank = [&](const Activation *in, const AttentionWeights *w, KvCache *kv,
+                        Activation *out, int rank) -> bool {
+        if (!w)
+            return false;
+        Tensor *q_proj = w->q_a ? w->q_a : w->qkv;
+        const int half = heads / 2;
+        const int q_rows = w->q_b ? w->q_b->O : (w->qkv ? w->qkv->O : 0);
+        const int wo_in = w->wo_a ? w->wo_a->I : 0;
+        const bool sharded =
+            half > 0 && (q_rows == half * head_dim || wo_in == half * head_dim);
+        if (half <= 0) {
+            return attention_window(in, w->attn_norm, q_proj, w->q_norm, w->q_b, w->wkv, w->kv_norm,
+                                    w->sink, w->wo_a, w->wo_b, w->compress_wkv, w->compress_wgate,
+                                    w->compress_ape, w->compress_norm, compress_ratio, heads,
+                                    head_dim, qk_rope, groups, pos, eps, kv, out);
+        }
+        const int n0 = half;
+        const int n1 = heads - half;
+        const int n_heads = rank == 0 ? n0 : n1;
+        const int head_begin = sharded ? 0 : (rank == 0 ? 0 : n0);
+        const int use_heads = sharded ? n_heads : heads;
+        const int g = groups >= 2 ? groups / 2 : groups;
+        return attention_window_heads(in, w->attn_norm, q_proj, w->q_norm, w->q_b, w->wkv,
+                                      w->kv_norm, w->sink, w->wo_a, w->wo_b, use_heads, head_dim,
+                                      qk_rope, g, pos, eps, kv, out, head_begin, n_heads);
+    };
+    if (!run_rank(input, primary, cache, output, 0))
+        return false;
+    if (!run_rank(peer_input, peer, peer_cache, peer_output, 1))
+        return false;
+    if (heads >= 2)
+        allreduce_pair(output, peer_output);
+    return true;
 }
 
 bool route(const Activation *input, Tensor *gate, Tensor *bias, const int *fixed_ids,
@@ -1420,9 +1554,50 @@ bool expert_bank_upload_aux(ExpertSet *set, int expert, const uint8_t *gw, const
     return expert_bank_upload(set, expert, gw, gs, uw, us, dw, ds, gate, up, down);
 }
 
-bool expert_bank_upload_tp2(ExpertSet *, int, int, const uint8_t *, const uint8_t *, const uint8_t *,
-                            const uint8_t *, const uint8_t *, const uint8_t *) {
-    return false;
+bool expert_bank_upload_tp2(ExpertSet *set, int expert, int rank, const uint8_t *gate_weight,
+                            const uint8_t *gate_scale, const uint8_t *up_weight,
+                            const uint8_t *up_scale, const uint8_t *down_weight,
+                            const uint8_t *down_scale) {
+    if (!set || expert < 0 || expert >= set->count || (rank != 0 && rank != 1) || !gate_weight ||
+        !up_weight || !down_weight)
+        return false;
+    const int H = set->hidden;
+    const int J = set->intermediate;
+    if (H <= 0 || J <= 0 || (J & 1))
+        return expert_bank_upload(set, expert, gate_weight, gate_scale, up_weight, up_scale,
+                                  down_weight, down_scale, nullptr, nullptr, nullptr);
+    const int packed_h = ceil_div(H, 2);
+    const int scale_h = std::max(ceil_div(H, 32), 1);
+    const uint8_t *gw = gate_weight + static_cast<size_t>(rank) * static_cast<size_t>(J) * packed_h;
+    const uint8_t *uw = up_weight + static_cast<size_t>(rank) * static_cast<size_t>(J) * packed_h;
+    const uint8_t *gs =
+        gate_scale ? gate_scale + static_cast<size_t>(rank) * static_cast<size_t>(J) * scale_h
+                   : nullptr;
+    const uint8_t *us =
+        up_scale ? up_scale + static_cast<size_t>(rank) * static_cast<size_t>(J) * scale_h : nullptr;
+    const int packed_full = ceil_div(2 * J, 2);
+    const int packed_half = ceil_div(J, 2);
+    const int scale_full = std::max(ceil_div(2 * J, 32), 1);
+    const int scale_half = std::max(ceil_div(J, 32), 1);
+    std::vector<uint8_t> dw(static_cast<size_t>(H) * packed_half);
+    std::vector<uint8_t> ds(static_cast<size_t>(H) * scale_half, 127);
+    for (int o = 0; o < H; ++o) {
+        std::memcpy(dw.data() + static_cast<size_t>(o) * packed_half,
+                    down_weight + static_cast<size_t>(o) * packed_full +
+                        static_cast<size_t>(rank) * packed_half,
+                    static_cast<size_t>(packed_half));
+        if (down_scale)
+            std::memcpy(ds.data() + static_cast<size_t>(o) * scale_half,
+                        down_scale + static_cast<size_t>(o) * scale_full +
+                            static_cast<size_t>(rank) * scale_half,
+                        static_cast<size_t>(scale_half));
+    }
+    if (!upload_fp4(&set->gate[static_cast<size_t>(expert)], gw, gs, J, H, set->device) ||
+        !upload_fp4(&set->up[static_cast<size_t>(expert)], uw, us, J, H, set->device) ||
+        !upload_fp4(&set->down[static_cast<size_t>(expert)], dw.data(), ds.data(), H, J,
+                    set->device))
+        return false;
+    return true;
 }
 
 void expert_set_free(ExpertSet *set) {
@@ -1532,9 +1707,48 @@ bool route_moe_batch(const Activation *input, Tensor *gate, Tensor *bias, const 
     return route_moe_ids_batch(input, ids.data(), w.data(), count, experts, limit, output);
 }
 
-bool route_moe_ep2(const Activation *, Tensor *, Tensor *, const Activation *, Tensor *, Tensor *,
-                   int, float, ExpertSet *, ExpertSet *, float, Activation *, Activation *) {
-    return false;
+bool route_moe_ep2(const Activation *input, Tensor *gate, Tensor *bias,
+                   const Activation *peer_input, Tensor *peer_gate, Tensor *peer_bias, int token,
+                   float routed_scale, ExpertSet *local, ExpertSet *peer, float limit,
+                   Activation *output, Activation *peer_output) {
+    if (!input || !output || !peer_output || (!local && !peer))
+        return false;
+    const Activation *pin = peer_input ? peer_input : input;
+    Tensor *pgate = peer_gate ? peer_gate : gate;
+    Tensor *pbias = peer_bias ? peer_bias : bias;
+    int ids[6] = {-1, -1, -1, -1, -1, -1};
+    float w[6] = {};
+    int ids_p[6] = {-1, -1, -1, -1, -1, -1};
+    float w_p[6] = {};
+    bool routed = false;
+    if (gate && route(input, gate, bias, nullptr, routed_scale, ids, w))
+        routed = true;
+    if (pgate && route(pin, pgate, pbias, nullptr, routed_scale, ids_p, w_p))
+        routed = true;
+    else {
+        std::memcpy(ids_p, ids, sizeof(ids));
+        std::memcpy(w_p, w, sizeof(w));
+    }
+    if (!routed) {
+        const bool a = local && route_moe(input, gate, bias, token, routed_scale, local, limit, output);
+        const bool b =
+            peer && route_moe(pin, pgate, pbias, token, routed_scale, peer, limit, peer_output);
+        if (!a && !b)
+            return false;
+        if (!a)
+            std::fill(output->v.begin(), output->v.end(), 0.f);
+        if (!b)
+            std::fill(peer_output->v.begin(), peer_output->v.end(), 0.f);
+        allreduce_pair(output, peer_output);
+        return true;
+    }
+    const bool have_local_shared = local && local->sg && local->su && local->sd;
+    if (!moe_routed_parity(input, local, ids, w, 0, limit, output, have_local_shared))
+        return false;
+    if (!moe_routed_parity(pin, peer, ids_p, w_p, 1, limit, peer_output, !have_local_shared))
+        return false;
+    allreduce_pair(output, peer_output);
+    return true;
 }
 
 } // namespace dsv4_cuda

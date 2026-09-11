@@ -105,6 +105,42 @@ bool kda_args_ok(const float *win_q, const float *qt, const float *win_k, const 
            beta && oh && P == H * hd && K >= 1 && H >= 1 && hd >= 1;
 }
 
+// Matches qwen36 gdn_delta: beta=σ(k[0]), attn=S^T k, S += β k (v-attn)^T, ctx=S^T q.
+void cpu_gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+                   int nkv, int hd, int group) {
+    const int g = std::max(group, 1);
+    std::vector<float> attn(static_cast<size_t>(hd), 0.f);
+    for (int hh = 0; hh < nq; ++hh) {
+        const int kh = std::min(hh / g, nkv - 1);
+        const float *kk = k + kh * hd;
+        const float *vv = v + kh * hd;
+        const float *qq = q + hh * hd;
+        float *Sh = S + static_cast<size_t>(hh) * hd * hd;
+        const float beta = 1.f / (1.f + std::exp(-kk[0]));
+        for (int j = 0; j < hd; ++j) {
+            float a = 0.f;
+            for (int i = 0; i < hd; ++i)
+                a += Sh[static_cast<size_t>(i) * hd + j] * kk[i];
+            attn[static_cast<size_t>(j)] = a;
+        }
+        for (int i = 0; i < hd; ++i)
+            for (int j = 0; j < hd; ++j)
+                Sh[static_cast<size_t>(i) * hd + j] +=
+                    beta * (kk[i] * vv[j] - kk[i] * attn[static_cast<size_t>(j)]);
+        for (int j = 0; j < hd; ++j) {
+            float o = 0.f;
+            for (int i = 0; i < hd; ++i)
+                o += qq[i] * Sh[static_cast<size_t>(i) * hd + j];
+            ctx[hh * hd + j] = o;
+        }
+    }
+}
+
+bool gdn_args_ok(const float *S, const float *ctx, const float *q, const float *k, const float *v,
+                 int nq, int nkv, int hd) {
+    return S && ctx && q && k && v && nq >= 1 && nkv >= 1 && hd >= 1;
+}
+
 bool mla_args_ok(const MlaAbsorb &m, const float *x, const float *post_ln, int D,
                  const float *nrm_out) {
     return m.q && m.cache && m.w_kt && m.w_v && m.oh && x && post_ln && nrm_out && m.H >= 1 &&
@@ -348,6 +384,14 @@ bool kda_fused_token(float *win_q, float *qt, float *win_k, float *kt, float *wi
         return false;
     cpu_kda_fused(win_q, qt, win_k, kt, win_v, tv, taps_q, taps_k, taps_v, S, alpha, beta, oh, P, K,
                   H, hd);
+    return true;
+}
+
+bool gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+               int nkv, int hd, int group) {
+    if (!gdn_args_ok(S, ctx, q, k, v, nq, nkv, hd))
+        return false;
+    cpu_gdn_delta(S, ctx, q, k, v, nq, nkv, hd, group);
     return true;
 }
 

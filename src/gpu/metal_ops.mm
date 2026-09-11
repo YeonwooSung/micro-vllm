@@ -26,6 +26,7 @@ id<MTLComputePipelineState> g_p_add = nil;
 id<MTLComputePipelineState> g_p_silu = nil;
 id<MTLComputePipelineState> g_p_act = nil;
 id<MTLComputePipelineState> g_p_kda = nil;
+id<MTLComputePipelineState> g_p_gdn = nil;
 id<MTLComputePipelineState> g_p_gemm_f32 = nil;
 id<MTLComputePipelineState> g_p_gemm_i4 = nil;
 id<MTLComputePipelineState> g_p_gemm_mx = nil;
@@ -38,6 +39,7 @@ struct RmsArgs { int nrows; int D; float eps; int has_w; };
 struct ElemArgs { int n; };
 struct ActArgs { int n; float a; float b; int kind; };
 struct KdaArgs { int P; int K; int H; int hd; };
+struct GdnArgs { int nq; int nkv; int hd; int group; };
 struct GemmArgs { int S; int I; int O; int qgs; };
 
 inline float silu_from(float x) {
@@ -221,6 +223,45 @@ kernel void op_kda_fused(device float *win_q [[buffer(0)]],
     }
 }
 
+kernel void op_gdn_delta(device float *S [[buffer(0)]],
+                         device float *ctx [[buffer(1)]],
+                         device const float *q [[buffer(2)]],
+                         device const float *k [[buffer(3)]],
+                         device const float *v [[buffer(4)]],
+                         constant GdnArgs &a [[buffer(5)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= (uint)a.nq) return;
+    const int D = a.hd;
+    const int g = a.group > 0 ? a.group : 1;
+    int kh = (int)gid / g;
+    if (kh > a.nkv - 1)
+        kh = a.nkv - 1;
+    const device float *kk = k + (ulong)kh * (uint)D;
+    const device float *vv = v + (ulong)kh * (uint)D;
+    const device float *qq = q + (ulong)gid * (uint)D;
+    device float *Sh = S + (ulong)gid * (uint)(D * D);
+    device float *ch = ctx + (ulong)gid * (uint)D;
+    const float beta = 1.0f / (1.0f + exp(-kk[0]));
+    // Stash S^T k in this head's ctx slice, then overwrite with S^T q.
+    for (int j = 0; j < D; ++j) {
+        float acc = 0.0f;
+        for (int i = 0; i < D; ++i)
+            acc += Sh[i * D + j] * kk[i];
+        ch[j] = acc;
+    }
+    for (int i = 0; i < D; ++i) {
+        const float ki = kk[i];
+        for (int j = 0; j < D; ++j)
+            Sh[i * D + j] += beta * (ki * vv[j] - ki * ch[j]);
+    }
+    for (int j = 0; j < D; ++j) {
+        float o = 0.0f;
+        for (int i = 0; i < D; ++i)
+            o += qq[i] * Sh[i * D + j];
+        ch[j] = o;
+    }
+}
+
 kernel void op_gemm_f32(device const float *x [[buffer(0)]],
                         device const float *w [[buffer(1)]],
                         device float *y [[buffer(2)]],
@@ -309,6 +350,9 @@ struct ActArgs {
 };
 struct KdaArgs {
     int P, K, H, hd;
+};
+struct GdnArgs {
+    int nq, nkv, hd, group;
 };
 struct GemmArgs {
     int S, I, O, qgs;
@@ -400,6 +444,41 @@ bool kda_args_ok(const float *win_q, const float *qt, const float *win_k, const 
                  const float *oh, int P, int K, int H, int hd) {
     return win_q && qt && win_k && kt && win_v && tv && taps_q && taps_k && taps_v && S && alpha &&
            beta && oh && P == H * hd && K >= 1 && H >= 1 && hd >= 1;
+}
+
+void cpu_gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+                   int nkv, int hd, int group) {
+    const int g = std::max(group, 1);
+    std::vector<float> attn(static_cast<size_t>(hd), 0.f);
+    for (int hh = 0; hh < nq; ++hh) {
+        const int kh = std::min(hh / g, nkv - 1);
+        const float *kk = k + kh * hd;
+        const float *vv = v + kh * hd;
+        const float *qq = q + hh * hd;
+        float *Sh = S + static_cast<size_t>(hh) * hd * hd;
+        const float beta = 1.f / (1.f + std::exp(-kk[0]));
+        for (int j = 0; j < hd; ++j) {
+            float a = 0.f;
+            for (int i = 0; i < hd; ++i)
+                a += Sh[static_cast<size_t>(i) * hd + j] * kk[i];
+            attn[static_cast<size_t>(j)] = a;
+        }
+        for (int i = 0; i < hd; ++i)
+            for (int j = 0; j < hd; ++j)
+                Sh[static_cast<size_t>(i) * hd + j] +=
+                    beta * (kk[i] * vv[j] - kk[i] * attn[static_cast<size_t>(j)]);
+        for (int j = 0; j < hd; ++j) {
+            float o = 0.f;
+            for (int i = 0; i < hd; ++i)
+                o += qq[i] * Sh[static_cast<size_t>(i) * hd + j];
+            ctx[hh * hd + j] = o;
+        }
+    }
+}
+
+bool gdn_args_ok(const float *S, const float *ctx, const float *q, const float *k, const float *v,
+                 int nq, int nkv, int hd) {
+    return S && ctx && q && k && v && nq >= 1 && nkv >= 1 && hd >= 1;
 }
 
 void apply_act(float *g, const float *u, int n, Act act, float a, float b) {
@@ -670,6 +749,7 @@ void drop_metal() {
     g_p_silu = nil;
     g_p_act = nil;
     g_p_kda = nil;
+    g_p_gdn = nil;
     g_p_gemm_f32 = nil;
     g_p_gemm_i4 = nil;
     g_p_gemm_mx = nil;
@@ -713,6 +793,7 @@ bool init() {
         g_p_silu = pso("op_silu_mul");
         g_p_act = pso("op_act_mul");
         g_p_kda = pso("op_kda_fused");
+        g_p_gdn = pso("op_gdn_delta");
         g_p_gemm_f32 = pso("op_gemm_f32");
         g_p_gemm_i4 = pso("op_gemm_int4_g64");
         g_p_gemm_mx = pso("op_gemm_mxfp4");
@@ -899,6 +980,46 @@ bool kda_fused_token(float *win_q, float *qt, float *win_k, float *kt, float *wi
         std::memcpy(tv, [b_tv contents], pb);
         std::memcpy(S, [b_S contents], sb);
         std::memcpy(oh, [b_oh contents], pb);
+    }
+    return true;
+}
+
+bool gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+               int nkv, int hd, int group) {
+    if (!gdn_args_ok(S, ctx, q, k, v, nq, nkv, hd))
+        return false;
+    if (!g_use_metal || !g_p_gdn) {
+        cpu_gdn_delta(S, ctx, q, k, v, nq, nkv, hd, group);
+        return true;
+    }
+    @autoreleasepool {
+        const size_t sb = sizeof(float) * static_cast<size_t>(nq) * hd * hd;
+        const size_t qb = sizeof(float) * static_cast<size_t>(nq) * hd;
+        const size_t kb = sizeof(float) * static_cast<size_t>(nkv) * hd;
+        id<MTLBuffer> b_S = buf_bytes(S, sb);
+        id<MTLBuffer> b_ctx = buf_bytes(ctx, qb);
+        id<MTLBuffer> b_q = buf_bytes(q, qb);
+        id<MTLBuffer> b_k = buf_bytes(k, kb);
+        id<MTLBuffer> b_v = buf_bytes(v, kb);
+        if (!b_S || !b_ctx || !b_q || !b_k || !b_v) {
+            cpu_gdn_delta(S, ctx, q, k, v, nq, nkv, hd, group);
+            return true;
+        }
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = cb ? [cb computeCommandEncoder] : nil;
+        if (!cb || !enc) {
+            cpu_gdn_delta(S, ctx, q, k, v, nq, nkv, hd, group);
+            return true;
+        }
+        GdnArgs args{nq, nkv, hd, group};
+        dispatch1(enc, g_p_gdn, static_cast<uint>(nq), @[ b_S, b_ctx, b_q, b_k, b_v ], &args,
+                  sizeof(args));
+        if (!commit_wait(cb, enc)) {
+            cpu_gdn_delta(S, ctx, q, k, v, nq, nkv, hd, group);
+            return true;
+        }
+        std::memcpy(S, [b_S contents], sb);
+        std::memcpy(ctx, [b_ctx contents], qb);
     }
     return true;
 }

@@ -30,6 +30,12 @@ bool kda_fused_token(float *win_q, float *qt, float *win_k, float *kt, float *wi
                      const float *alpha, const float *beta, float *oh, int P, int K, int H,
                      int hd);
 
+// Gated delta-net recurrence (qwen36 gdn_delta).
+// S [nq][hd][hd] row-major; q [nq*hd]; k/v [nkv*hd]; ctx [nq*hd] overwritten.
+// KV head = min(hh / max(group,1), nkv-1). False on bad args.
+bool gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+               int nkv, int hd, int group);
+
 // Family activation fused into shared-expert / moe_block.
 // Silu = silu(g)*u. ClampSwiGLU = silu(min(g,a))*clamp(u,-a,a).
 // Situ = a*tanh(g/a)*σ(g) * b*tanh(u/b) (K3 SiTU-GLU).

@@ -30,5 +30,11 @@ bool moe_block_f32(int nb, int D, int Iinter, const float *const *g, const float
                    const float *const *d, const float *xg, const int *xoff, const int *nr,
                    const int *rows, const float *rw, float *out, int S);
 
+// Gated delta-net recurrence (same math as qwen36 gdn_delta). CPU always.
+// S [nq,hd,hd] row-major [h][i][j]; ctx[h,j] = q_h · S_h after rank-1 update.
+// KV head = min(h / max(group,1), nkv-1). False on bad args.
+bool gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+               int nkv, int hd, int group);
+
 } // namespace vk_ops
 } // namespace mvllm

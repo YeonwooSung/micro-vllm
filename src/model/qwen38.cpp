@@ -11,9 +11,18 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <sstream>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace mvllm {
 namespace {
@@ -86,6 +95,7 @@ class Qwen38Engine final : public FamilyEngine {
 public:
     Family family() const override { return Family::Qwen38; }
     const ModelConfig &config() const override { return cfg_; }
+    ~Qwen38Engine() override { unmap_ple(); }
 
     struct Qwen38Slot {
         std::vector<int> history;
@@ -122,6 +132,7 @@ public:
             alloc_synthetic();
             from_checkpoint_ = false;
         }
+        try_map_ple(model_dir);
         coli_cuda::init(nullptr, 0);
         vk_ops::init();
         loaded_ = true;
@@ -343,7 +354,8 @@ public:
            << "; routed="
            << (have_expert_mats() ? "experts" : (cfg_.moe.n_experts > 0 ? "mix" : "no"))
            << "; qsa=topk" << qsa_budget()
-           << "; ple=" << (ple_table_.empty() ? "off" : std::to_string(ple_layer_))
+           << "; ple="
+           << (ple_disk_ ? "disk" : (ple_table_.empty() ? "off" : std::to_string(ple_layer_)))
            << "; residual=gated" << hc_count()
            << " coli=" << (coli_cuda::available() ? "cpu" : "off")
            << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off") << ")";
@@ -1029,16 +1041,24 @@ private:
     }
 
     void inject_ple(float *h, int H, int id, int p1, int p2) const {
-        if (!h || H < 1 || ple_table_.size() < static_cast<size_t>(H))
+        if (!h || H < 1)
             return;
-        const int rows = static_cast<int>(ple_table_.size() / static_cast<size_t>(H));
-        if (rows < 1)
+        const float *table = nullptr;
+        int rows = 0;
+        if (ple_map_ && ple_rows_ >= 1) {
+            table = static_cast<const float *>(ple_map_);
+            rows = ple_rows_;
+        } else if (ple_table_.size() >= static_cast<size_t>(H)) {
+            table = ple_table_.data();
+            rows = static_cast<int>(ple_table_.size() / static_cast<size_t>(H));
+        }
+        if (!table || rows < 1)
             return;
         uint32_t x = static_cast<uint32_t>(id + 1) * 0x9e3779b9u;
         x ^= static_cast<uint32_t>(p1 + 1) * 0x85ebca6bu;
         x ^= static_cast<uint32_t>(p2 + 1) * 0xc2b2ae35u;
         const int row = static_cast<int>(x % static_cast<uint32_t>(rows));
-        const float *src = ple_table_.data() + static_cast<size_t>(row) * H;
+        const float *src = table + static_cast<size_t>(row) * H;
         for (int i = 0; i < H; ++i)
             h[i] += src[i];
     }
@@ -1325,6 +1345,96 @@ private:
 
     void alloc_synthetic() { alloc_weights(true); }
 
+    void unmap_ple() {
+#if !defined(_WIN32)
+        if (ple_map_ && ple_map_ != MAP_FAILED && ple_map_bytes_ > 0)
+            ::munmap(ple_map_, ple_map_bytes_);
+#endif
+        ple_map_ = nullptr;
+        ple_map_bytes_ = 0;
+    }
+
+    bool read_ple_file(const std::string &path, int H) {
+        if (path.empty() || H < 1)
+            return false;
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        in.seekg(0, std::ios::end);
+        const std::streamoff sz = in.tellg();
+        if (sz < static_cast<std::streamoff>(sizeof(float)))
+            return false;
+        const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+        const int rows = static_cast<int>(static_cast<size_t>(sz) / row_bytes);
+        if (rows < 1)
+            return false;
+        in.seekg(0, std::ios::beg);
+        std::vector<float> buf(static_cast<size_t>(rows) * static_cast<size_t>(H));
+        in.read(reinterpret_cast<char *>(buf.data()),
+                static_cast<std::streamsize>(buf.size() * sizeof(float)));
+        if (!in)
+            return false;
+        unmap_ple();
+        ple_table_ = std::move(buf);
+        ple_rows_ = rows;
+        ple_disk_ = true;
+        return true;
+    }
+
+    bool load_ple_file(const std::string &path, int H) {
+        if (path.empty() || H < 1)
+            return false;
+#if !defined(_WIN32)
+        const size_t row_bytes = static_cast<size_t>(H) * sizeof(float);
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0)
+            return false;
+        struct stat st {};
+        if (::fstat(fd, &st) != 0 || st.st_size < static_cast<off_t>(row_bytes)) {
+            ::close(fd);
+            return false;
+        }
+        const size_t bytes = static_cast<size_t>(st.st_size);
+        const int rows = static_cast<int>(bytes / row_bytes);
+        if (rows < 1) {
+            ::close(fd);
+            return false;
+        }
+        void *p = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (p != MAP_FAILED) {
+            unmap_ple();
+            ple_map_ = p;
+            ple_map_bytes_ = bytes;
+            ple_rows_ = rows;
+            ple_disk_ = true;
+            ple_table_.clear();
+            return true;
+        }
+#endif
+        return read_ple_file(path, H);
+    }
+
+    void try_map_ple(const std::string &model_dir) {
+        unmap_ple();
+        ple_disk_ = false;
+        ple_rows_ = 0;
+        const int H = std::max(cfg_.hidden, 1);
+        if (const char *e = std::getenv("MVLLM_PLE"); e && e[0]) {
+            if (load_ple_file(e, H))
+                return;
+        }
+        if (const char *e = std::getenv("COLI_PLE"); e && e[0]) {
+            if (load_ple_file(e, H))
+                return;
+        }
+        if (model_dir.empty())
+            return;
+        if (load_ple_file(model_dir + "/ple.bin", H))
+            return;
+        load_ple_file(model_dir + "/ple.f32", H);
+    }
+
     Status overlay_f32(const std::vector<io::StFile> &files, const std::string &name,
                        std::vector<float> &dst, std::string &err) {
         io::StHit hit = io::st_find_dir(files, name);
@@ -1484,6 +1594,10 @@ private:
     std::vector<std::vector<float>> mix_a_, mix_f_;
     std::vector<float> vis_in_, vis_n1_, vis_l1_, vis_l2_;
     std::vector<float> ple_table_;
+    void *ple_map_ = nullptr;
+    size_t ple_map_bytes_ = 0;
+    int ple_rows_ = 0;
+    bool ple_disk_ = false;
     int ple_layer_ = 2;
     Qwen38Slot slots_[kMaxKvSlots];
     double t_attn_ = 0, t_head_ = 0;

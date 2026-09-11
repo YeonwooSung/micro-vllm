@@ -2270,6 +2270,16 @@ static void test_vk_ops_tier() {
     const bool vk_ops_lr = layer_residual(vk_ops_lx, vk_ops_la, vk_ops_lp, vk_ops_ln, 2, 1e-6f);
     CHECK(vk_ops_lr);
     CHECK(vk_ops_lx[0] != 0.f && vk_ops_lx[1] != 0.f);
+    {
+        const int nq = 2, nkv = 1, hd = 2;
+        std::vector<float> S(static_cast<size_t>(nq) * hd * hd, 0.f);
+        std::vector<float> ctx(static_cast<size_t>(nq) * hd, 0.f);
+        const float q[4] = {0.2f, -0.1f, 0.3f, 0.f};
+        const float k[2] = {0.1f, -0.2f};
+        const float v[2] = {0.4f, 0.5f};
+        CHECK(gdn_delta(S.data(), ctx.data(), q, k, v, nq, nkv, hd, 2));
+        CHECK(std::isfinite(ctx[0]) && std::isfinite(ctx[1]));
+    }
     CHECK(std::isfinite(vk_ops_ln[0]) && std::isfinite(vk_ops_ln[1]));
 
     const float vk_ops_moe_id[4] = {1.f, 0.f, 0.f, 1.f};
@@ -3580,6 +3590,24 @@ static void test_wave1_new_families() {
         CHECK(e->describe().find("routed=experts") != std::string::npos);
         CHECK(e->describe().find("qsa=topk16") != std::string::npos);
         CHECK(e->describe().find("ple=2") != std::string::npos);
+        {
+            std::string pdir = tmpdir();
+            write_file(pdir + "/config.json",
+                       R"({"model_type":"qwen4_exp","hidden_size":8,"num_hidden_layers":3,)"
+                       R"("vocab_size":32,"num_attention_heads":2,"num_key_value_heads":1,)"
+                       R"("head_dim":4})");
+            std::vector<float> tbl(8 * 8, 0.25f);
+            {
+                std::ofstream pf(pdir + "/ple.bin", std::ios::binary);
+                pf.write(reinterpret_cast<const char *>(tbl.data()),
+                         static_cast<std::streamsize>(tbl.size() * sizeof(float)));
+            }
+            auto pe = make_engine(Family::Qwen38);
+            RuntimeConfig prt;
+            std::string perr;
+            CHECK(pe->load(pdir, prt, perr) == Status::Ok);
+            CHECK(pe->describe().find("ple=disk") != std::string::npos);
+        }
         CHECK(e->describe().find("residual=gated4") != std::string::npos);
         CHECK(e->describe().find("vk=") != std::string::npos);
         CHECK(e->describe().find("coli=") != std::string::npos);
@@ -5303,6 +5331,21 @@ int main() {
         CHECK(sch.queue_depth() == 0);
         RuntimeConfig rt = runtime_from_env();
         CHECK(rt.kv_slots >= 1 && rt.kv_slots <= 16);
+        const char *tp_old = std::getenv("MVLLM_TP");
+        const char *ep_old = std::getenv("MVLLM_EP");
+        setenv("MVLLM_TP", "2", 1);
+        setenv("MVLLM_EP", "2", 1);
+        RuntimeConfig rtp = runtime_from_env();
+        CHECK(rtp.tp_size == 2);
+        CHECK(rtp.ep_size == 2);
+        if (tp_old)
+            setenv("MVLLM_TP", tp_old, 1);
+        else
+            unsetenv("MVLLM_TP");
+        if (ep_old)
+            setenv("MVLLM_EP", ep_old, 1);
+        else
+            unsetenv("MVLLM_EP");
     }
     {
         using namespace mvllm;

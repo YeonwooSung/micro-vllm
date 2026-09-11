@@ -2,6 +2,8 @@
 
 #include "../quant/quant.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 #if defined(MVLLM_WITH_VULKAN)
@@ -129,6 +131,38 @@ bool moe_block_f32(int nb, int D, int Iinter, const float *const *g, const float
             }
         }
         base += nre;
+    }
+    return true;
+}
+
+bool gdn_delta(float *S, float *ctx, const float *q, const float *k, const float *v, int nq,
+               int nkv, int hd, int group) {
+    if (!S || !ctx || !q || !k || !v || nq < 1 || nkv < 1 || hd < 1)
+        return false;
+    for (int hh = 0; hh < nq; ++hh) {
+        const int kh = std::min(hh / std::max(group, 1), nkv - 1);
+        const float *kk = k + kh * hd;
+        const float *vv = v + kh * hd;
+        const float *qq = q + hh * hd;
+        float *Sh = S + static_cast<size_t>(hh) * hd * hd;
+        const float beta = 1.f / (1.f + std::exp(-kk[0]));
+        std::vector<float> attn(static_cast<size_t>(hd), 0.f);
+        for (int j = 0; j < hd; ++j) {
+            float a = 0.f;
+            for (int i = 0; i < hd; ++i)
+                a += Sh[static_cast<size_t>(i) * hd + j] * kk[i];
+            attn[static_cast<size_t>(j)] = a;
+        }
+        for (int i = 0; i < hd; ++i)
+            for (int j = 0; j < hd; ++j)
+                Sh[static_cast<size_t>(i) * hd + j] +=
+                    beta * (kk[i] * vv[j] - kk[i] * attn[static_cast<size_t>(j)]);
+        for (int j = 0; j < hd; ++j) {
+            float o = 0.f;
+            for (int i = 0; i < hd; ++i)
+                o += qq[i] * Sh[static_cast<size_t>(i) * hd + j];
+            ctx[hh * hd + j] = o;
+        }
     }
     return true;
 }

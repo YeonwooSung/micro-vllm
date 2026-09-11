@@ -168,6 +168,8 @@ struct RuntimeConfig {
     int kv_persist_ver = 1; // 1 COLIKV1, 2 COLIKV2, 3 COLIKV3
     int kv_tq_codec = 0;    // COLIKV3: 0 PolarQuant, 1 rotated int4
     int kv_tq_bits = 4;
+    int tp_size = 1; // COLI_TP / MVLLM_TP (1 or 2)
+    int ep_size = 1; // COLI_EP / MVLLM_EP (1 or 2)
 };
 
 inline bool is_stop_token(int id, const ModelConfig &cfg, int extra_eos = -1) {
