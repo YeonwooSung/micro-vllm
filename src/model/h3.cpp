@@ -136,6 +136,38 @@ void expand_patch_rows(const float *rows, int tokens, int patch, int hidden, flo
                 rows[static_cast<size_t>(i) * patch + (d % patch)];
 }
 
+void linear_bias(float *y, const float *x, const float *w, const float *b, int rows, int in,
+                 int out) {
+    if (!y || !x || !w || rows < 1 || in < 1 || out < 1)
+        return;
+    quant::matmul_f32(y, x, w, rows, in, out);
+    if (!b)
+        return;
+    for (int r = 0; r < rows; ++r)
+        for (int d = 0; d < out; ++d)
+            y[static_cast<size_t>(r) * out + d] += b[static_cast<size_t>(d)];
+}
+
+void rms_adaln_final(float *y, const float *x, const float *wn, const float *scale,
+                     const float *shift, int tokens, int hidden, float eps) {
+    if (!y || !x || tokens < 1 || hidden < 1)
+        return;
+    for (int t = 0; t < tokens; ++t) {
+        const float *xs = x + static_cast<size_t>(t) * hidden;
+        float *ys = y + static_cast<size_t>(t) * hidden;
+        float ss = 0.f;
+        for (int i = 0; i < hidden; ++i)
+            ss += xs[i] * xs[i];
+        const float inv = 1.f / std::sqrt(ss / static_cast<float>(hidden) + eps);
+        for (int i = 0; i < hidden; ++i) {
+            const float n = wn ? wn[i] : 1.f;
+            const float sc = scale ? scale[i] : 0.f;
+            const float sh = shift ? shift[i] : 0.f;
+            ys[i] = xs[i] * inv * n * (1.f + sc) + sh;
+        }
+    }
+}
+
 struct AccTimer {
     double &acc;
     std::chrono::steady_clock::time_point t0;
@@ -645,6 +677,55 @@ public:
         h3_dit_rope_tables(layout, inv_freq, spatial_scale, rope_cos, rope_sin);
         const float *r_cos = rope_cos.empty() ? nullptr : rope_cos.data();
         const float *r_sin = rope_sin.empty() ? nullptr : rope_sin.data();
+        const bool vel_vid = hidden > 0 &&
+                             static_cast<int>(vid_in_w_.size()) >= hidden * patch &&
+                             static_cast<int>(vid_out_w_.size()) >= patch * hidden;
+        const bool vel_aud = hidden > 0 &&
+                             static_cast<int>(aud_in_w_.size()) >= hidden * AC &&
+                             static_cast<int>(aud_out_w_.size()) >= AC * hidden;
+        const bool vel_path = vel_vid;
+        auto take_pack_rows = [&](const float *full, float *keep) {
+            if (!full || !keep || tokens < 1)
+                return;
+            if (tokens_full == tokens) {
+                std::memcpy(keep, full, static_cast<size_t>(tokens) * patch * sizeof(float));
+                return;
+            }
+            const int nh = vg.latent_h / 2;
+            const int nw = vg.latent_w / 2;
+            const int nh2 = pack_lh / 2;
+            const int nw2 = pack_lw / 2;
+            int o = 0;
+            for (int ti = 0; ti < pack_lt; ++ti)
+                for (int y = 0; y < nh2; ++y)
+                    for (int x = 0; x < nw2; ++x) {
+                        const int src = (ti * nh + y) * nw + x;
+                        std::memcpy(keep + static_cast<size_t>(o) * patch,
+                                    full + static_cast<size_t>(src) * patch,
+                                    static_cast<size_t>(patch) * sizeof(float));
+                        ++o;
+                    }
+        };
+        auto pack_from_latents = [&]() {
+            if (!vel_path || tokens < 1)
+                return;
+            std::vector<float> full(static_cast<size_t>(std::max(tokens_full, tokens)) * patch, 0.f);
+            if (can_patch)
+                h3_dit_patchify(z.data(), C, vg.latent_t, vg.latent_h, vg.latent_w, full.data());
+            take_pack_rows(full.data(), rows.data());
+            float *vdst = latent.data() + static_cast<size_t>(video_off) * hidden;
+            linear_bias(vdst, rows.data(), vid_in_w_.data(),
+                        vid_in_b_.size() >= static_cast<size_t>(hidden) ? vid_in_b_.data() : nullptr,
+                        tokens, patch, hidden);
+            if (vel_aud && audio_rows > 0) {
+                h3_dit_pack_audio(az.data(), AC, audio_t, arows.data());
+                float *adst = latent.data() + static_cast<size_t>(audio_off) * hidden;
+                linear_bias(adst, arows.data(), aud_in_w_.data(),
+                            aud_in_b_.size() >= static_cast<size_t>(hidden) ? aud_in_b_.data()
+                                                                           : nullptr,
+                            audio_rows, AC, hidden);
+            }
+        };
         auto unpack_z = [&]() {
             const float *vid = latent.data() + static_cast<size_t>(video_off) * hidden;
             for (int i = 0; i < tokens; ++i)
@@ -741,6 +822,8 @@ public:
         for (int s = 0; s < evals; ++s) {
             if (hp.on_progress)
                 hp.on_progress(s, evals, "denoise");
+            if (vel_path)
+                pack_from_latents();
             int temb_rows = 1;
             if (have_sched) {
                 tfeat = dit.time_features();
@@ -870,16 +953,107 @@ public:
                 }
                 blocks_.release(b);
             }
-            if (computed) {
-                // Keep text/cond tokens as the encoded condition. Official RES
-                // treats DiT output as x0; do not Euler-step the prompt.
+            if (computed && vel_path) {
+                std::vector<float> vnorm(static_cast<size_t>(tokens) * hidden);
+                const float *vin = latent.data() + static_cast<size_t>(video_off) * hidden;
+                const float *fn = fin_norm_.size() >= static_cast<size_t>(hidden) ? fin_norm_.data()
+                                                                                 : nullptr;
+                const float *sc = nullptr;
+                const float *sh = nullptr;
+                std::vector<float> fmod;
+                if (!temb.empty() && td > 0 &&
+                    static_cast<int>(fin_adaln_w_.size()) >= 2 * hidden * td) {
+                    fmod.assign(static_cast<size_t>(2) * hidden, 0.f);
+                    const uint32_t vr = have_sched ? dit.video_row(s) : 0;
+                    const int row = (vr < static_cast<uint32_t>(temb.size() / td)) ? static_cast<int>(vr)
+                                                                                   : 0;
+                    linear_bias(fmod.data(), temb.data() + static_cast<size_t>(row) * td,
+                                fin_adaln_w_.data(),
+                                fin_adaln_b_.size() >= static_cast<size_t>(2) * hidden
+                                    ? fin_adaln_b_.data()
+                                    : nullptr,
+                                1, td, 2 * hidden);
+                    sc = fmod.data();
+                    sh = fmod.data() + hidden;
+                }
+                rms_adaln_final(vnorm.data(), vin, fn, sc, sh, tokens, hidden, 1e-5f);
+                std::vector<float> v96(static_cast<size_t>(tokens) * patch, 0.f);
+                linear_bias(v96.data(), vnorm.data(), vid_out_w_.data(),
+                            vid_out_b_.size() >= static_cast<size_t>(patch) ? vid_out_b_.data()
+                                                                           : nullptr,
+                            tokens, hidden, patch);
+                std::vector<float> z_vel(z.size(), 0.f);
+                if (can_patch && tokens == pack_lt * (pack_lh / 2) * (pack_lw / 2)) {
+                    if (pack_lt == vg.latent_t && pack_lh == vg.latent_h && pack_lw == vg.latent_w)
+                        h3_dit_unpatchify(v96.data(), C, vg.latent_t, vg.latent_h, vg.latent_w,
+                                          z_vel.data());
+                    else {
+                        const int nsmall = pack_lt * pack_lh * pack_lw;
+                        std::vector<float> zs(static_cast<size_t>(C) * nsmall, 0.f);
+                        h3_dit_unpatchify(v96.data(), C, pack_lt, pack_lh, pack_lw, zs.data());
+                        for (int c = 0; c < C; ++c)
+                            for (int t = 0; t < pack_lt; ++t)
+                                for (int y = 0; y < pack_lh; ++y)
+                                    for (int x = 0; x < pack_lw; ++x) {
+                                        const size_t si =
+                                            ((static_cast<size_t>(c) * pack_lt + t) * pack_lh + y) *
+                                                pack_lw +
+                                            x;
+                                        const size_t di =
+                                            ((static_cast<size_t>(c) * vg.latent_t + t) *
+                                                 vg.latent_h +
+                                             y) *
+                                                vg.latent_w +
+                                            x;
+                                        z_vel[di] = zs[si];
+                                    }
+                    }
+                }
+                const float sigma = sigmas[static_cast<size_t>(s)];
+                std::vector<float> z0(z.size());
+                for (size_t i = 0; i < z.size(); ++i)
+                    z0[i] = z[i] + sigma * z_vel[i];
+                std::vector<float> zn(z.size());
+                const float *oldp = old_vid.size() == z.size() ? old_vid.data() : nullptr;
+                if (h3_res_step(zn.data(), z.data(), z0.data(), oldp, static_cast<int>(z.size()),
+                                sigmas.data(), s, evals) == 1) {
+                    old_vid = z0;
+                    z.swap(zn);
+                }
+                if (vel_aud && audio_rows > 0) {
+                    std::vector<float> anorm(static_cast<size_t>(audio_rows) * hidden);
+                    const float *ain = latent.data() + static_cast<size_t>(audio_off) * hidden;
+                    rms_adaln_final(anorm.data(), ain, fn, sc, sh, audio_rows, hidden, 1e-5f);
+                    std::vector<float> a32(static_cast<size_t>(audio_rows) * AC, 0.f);
+                    linear_bias(a32.data(), anorm.data(), aud_out_w_.data(),
+                                aud_out_b_.size() >= static_cast<size_t>(AC) ? aud_out_b_.data()
+                                                                            : nullptr,
+                                audio_rows, hidden, AC);
+                    std::vector<float> az_vel(az.size(), 0.f);
+                    h3_dit_unpack_audio(a32.data(), AC, audio_t, az_vel.data());
+                    const float aslope = static_cast<float>(
+                        h3_time_shift_slope(sigma, kH3VideoSigmaShift, kH3AudioSigmaShift));
+                    std::vector<float> a0(az.size());
+                    for (size_t i = 0; i < az.size(); ++i)
+                        a0[i] = az[i] + sigma * az_vel[i] * aslope;
+                    std::vector<float> an(az.size());
+                    const float *olda = old_aud.size() == az.size() ? old_aud.data() : nullptr;
+                    if (h3_res_step(an.data(), az.data(), a0.data(), olda, static_cast<int>(az.size()),
+                                    sigmas.data(), s, evals) == 1) {
+                        old_aud = a0;
+                        az.swap(an);
+                    }
+                }
+            } else if (computed) {
+                // Synth fallback: no official patch/final heads. Treat DiT hidden
+                // as x0 and keep text/cond frozen.
                 if (audio_off > 0)
                     std::memcpy(latent.data(), prev.data(),
                                 static_cast<size_t>(audio_off) * hidden * sizeof(float));
-                auto step_seg = [&](int off, int rows, const float *sig, std::vector<float> &oldd) {
-                    if (rows <= 0 || off < 0)
+                auto step_seg = [&](int off, int nrows, const float *sig, std::vector<float> &oldd) {
+                    if (nrows <= 0 || off < 0)
                         return;
-                    const int n = rows * hidden;
+                    const int n = nrows * hidden;
                     const size_t base = static_cast<size_t>(off) * hidden;
                     std::vector<float> nxt(static_cast<size_t>(n));
                     const float *oldp = oldd.size() == static_cast<size_t>(n) ? oldd.data() : nullptr;
@@ -898,21 +1072,23 @@ public:
         }
         {
             AccTimer t(t_emm_);
-            unpack_z();
-            if (audio_rows > 0) {
-                const float *aud = latent.data() + static_cast<size_t>(audio_off) * hidden;
-                for (int i = 0; i < audio_rows; ++i)
-                    for (int d = 0; d < AC; ++d) {
-                        float acc = 0.f;
-                        int n = 0;
-                        for (int h = d; h < hidden; h += AC) {
-                            acc += aud[static_cast<size_t>(i) * hidden + h];
-                            ++n;
+            if (!vel_path) {
+                unpack_z();
+                if (audio_rows > 0) {
+                    const float *aud = latent.data() + static_cast<size_t>(audio_off) * hidden;
+                    for (int i = 0; i < audio_rows; ++i)
+                        for (int d = 0; d < AC; ++d) {
+                            float acc = 0.f;
+                            int n = 0;
+                            for (int h = d; h < hidden; h += AC) {
+                                acc += aud[static_cast<size_t>(i) * hidden + h];
+                                ++n;
+                            }
+                            arows[static_cast<size_t>(i) * AC + d] =
+                                n > 0 ? acc / static_cast<float>(n) : 0.f;
                         }
-                        arows[static_cast<size_t>(i) * AC + d] =
-                            n > 0 ? acc / static_cast<float>(n) : 0.f;
-                    }
-                h3_dit_unpack_audio(arows.data(), AC, audio_t, az.data());
+                    h3_dit_unpack_audio(arows.data(), AC, audio_t, az.data());
+                }
             }
         }
         float checksum = 0.f;
@@ -1045,6 +1221,7 @@ public:
                 out.note += std::string(" sdpa=") + sdpa;
         }
         out.note += " sampler=res";
+        out.note += vel_path ? " head=vel" : " head=tile";
         out.note += " text_tokens=" + std::to_string(text_tokens);
         if (text_tokens > 0)
             out.note += text_.from_checkpoint()
@@ -1268,6 +1445,17 @@ private:
         load_f("time_embedder.proj_in.bias", time_in_b_);
         load_f("time_embedder.proj_out.weight", time_out_w_);
         load_f("time_embedder.proj_out.bias", time_out_b_);
+        load_f("video_patch_proj.weight", vid_in_w_);
+        load_f("video_patch_proj.bias", vid_in_b_);
+        load_f("audio_patch_proj.weight", aud_in_w_);
+        load_f("audio_patch_proj.bias", aud_in_b_);
+        load_f("final_layer.norm.weight", fin_norm_);
+        load_f("final_layer.adaln_proj.linear.weight", fin_adaln_w_);
+        load_f("final_layer.adaln_proj.linear.bias", fin_adaln_b_);
+        load_f("final_layer.video_out.weight", vid_out_w_);
+        load_f("final_layer.video_out.bias", vid_out_b_);
+        load_f("final_layer.audio_out.weight", aud_out_w_);
+        load_f("final_layer.audio_out.bias", aud_out_b_);
         q_norm_.assign(static_cast<size_t>(n_blocks), {});
         k_norm_.assign(static_cast<size_t>(n_blocks), {});
         for (int i = 0; i < n_blocks; ++i) {
@@ -1334,6 +1522,9 @@ private:
     bool from_checkpoint_ = false;
     std::vector<float> time_in_w_, time_in_b_, time_out_w_, time_out_b_;
     std::vector<float> cond_w_, cond_b_, rope_inv_;
+    std::vector<float> vid_in_w_, vid_in_b_, aud_in_w_, aud_in_b_;
+    std::vector<float> fin_norm_, fin_adaln_w_, fin_adaln_b_;
+    std::vector<float> vid_out_w_, vid_out_b_, aud_out_w_, aud_out_b_;
     H3AdalnStore adaln_;
     std::vector<std::vector<float>> q_norm_, k_norm_;
     H3TextEncoder text_;

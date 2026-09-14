@@ -337,6 +337,11 @@ the layer tensor is tall enough; `dit_residual` takes `[groups,6,H]` +
 per-token map), CUDA SDPA is batched-head (online when `heads*T*T*4>64MiB`
 or `MVLLM_H3_CUDA_SDPA=online`), and official RES multistep
 (`h3_res_step`; Euler when `next==0` or no previous denoised).
+Official DiT emits **velocity** in 96-d patch space (`video_patch_proj`
+96→H, 50 residual blocks, `final_layer` AdaLN + `video_out` H→96).
+Generate packs z through that head each step, forms
+`x0 = z + σ·v`, then applies RES only to the video/audio latent (text/cond
+stay frozen). Missing heads keep the synth tile fallback (`head=tile`).
 Generate applies RES only to audio/video tokens and freezes text/cond.
 Default video-patch cap is 512 (`MVLLM_H3_LATENT_CAP`, `0` = none); a
 smaller cap keeps a spatial prefix of the 2×2 patch grid so unpatchify

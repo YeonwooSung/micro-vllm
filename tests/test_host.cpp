@@ -3952,6 +3952,10 @@ static void test_h3_checkpoint() {
             nts.push_back({p + "mlp.fc1.weight", "BF16", {nf * 2, nh}, fill(nf * 2 * nh)});
             nts.push_back({p + "mlp.fc2.weight", "BF16", {nh, nf}, fill(nh * nf)});
         }
+        nts.push_back({"video_patch_proj.weight", "BF16", {nh, 96}, fill(nh * 96)});
+        nts.push_back({"video_patch_proj.bias", "BF16", {nh}, fill(nh)});
+        nts.push_back({"final_layer.video_out.weight", "BF16", {96, nh}, fill(96 * nh)});
+        nts.push_back({"final_layer.video_out.bias", "BF16", {96}, fill(96)});
         write_safetensors_file(ndir + "/model.safetensors", nts);
         Engine en;
         CHECK(en.load(ndir, rt, err) == Status::Ok);
@@ -3969,6 +3973,7 @@ static void test_h3_checkpoint() {
         np.output_path = ndir + "/s8.txt";
         CHECK(en.generate_video(np, b, err) == Status::Ok);
         CHECK(a.note.find("sampler=res") != std::string::npos);
+        CHECK(a.note.find("head=vel") != std::string::npos);
         CHECK(a.note.find("text_tokens=") != std::string::npos);
         auto l2_of = [](const std::string &path) {
             std::ifstream in(path);
