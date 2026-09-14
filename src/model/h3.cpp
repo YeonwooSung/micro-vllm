@@ -420,9 +420,10 @@ public:
             }
             if (th.empty()) {
                 std::vector<int> tids;
-                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids);
+                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, 16);
                 text_.encode(tids, th);
             }
+            text_.release_embed();
             const int thid = text_.config().hidden;
             if (!th.empty() && thid > 0) {
                 text_tokens = static_cast<int>(th.size() / static_cast<size_t>(thid));

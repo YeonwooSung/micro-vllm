@@ -42,6 +42,9 @@ public:
     H3TextEncoder &operator=(H3TextEncoder &&) = delete;
 
     Status load(const std::string &model_dir, std::string &err);
+    // Drop a resident embed table after encode so DiT can reuse the RAM.
+    void release_embed();
+    bool embed_resident() const { return !embed_.empty(); }
     void encode(const std::vector<int> &ids, std::vector<float> &out) const;
     // Official multimodal path: splice vision rows, 3-axis mRoPE, add deepstack
     // residuals after layers 0, 1, 2. positions is [3, seq] axis-major.
@@ -57,14 +60,20 @@ public:
     bool streamed() const { return streamed_; }
 
 private:
+    struct LayerHits {
+        io::StHit wq, wk, wv, wo, gate, up, down;
+    };
+
     void alloc_synth();
     bool load_layer_mats(int l, quant::QuantMat &wq, quant::QuantMat &wk, quant::QuantMat &wv,
                          quant::QuantMat &wo, quant::QuantMat &gate, quant::QuantMat &up,
                          quant::QuantMat &down) const;
+    bool gather_embed(const std::vector<int> &ids, std::vector<float> &out) const;
+    bool gemm_from_hit(const io::StHit &w, float *y, const float *x, int S) const;
     void apply_layer(int l, int T, const quant::QuantMat *wq, const quant::QuantMat *wk,
                      const quant::QuantMat *wv, const quant::QuantMat *wo,
                      const quant::QuantMat *gate, const quant::QuantMat *up,
-                     const quant::QuantMat *down, const uint32_t *positions,
+                     const quant::QuantMat *down, const LayerHits *hits, const uint32_t *positions,
                      const H3VisionSpan *spans, int span_count, std::vector<float> &out,
                      std::vector<float> &n, std::vector<float> &q, std::vector<float> &k,
                      std::vector<float> &v, std::vector<float> &ctx, std::vector<float> &attn,
@@ -79,12 +88,11 @@ private:
     std::vector<std::vector<float>> in_n_, post_n_, qn_, kn_;
     // Keep fds open so encode() can stream one layer at a time.
     std::vector<io::StFile> files_;
-    struct LayerHits {
-        io::StHit wq, wk, wv, wo, gate, up, down;
-    };
     std::vector<LayerHits> hits_;
+    io::StHit embed_hit_;
 };
 
-void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids);
+void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids,
+                            int max_tokens = 64);
 
 } // namespace mvllm

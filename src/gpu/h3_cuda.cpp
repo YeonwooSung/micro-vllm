@@ -1,8 +1,11 @@
 #include "h3_cuda.hpp"
 
 #include "../model/family.hpp"
+#include "../quant/quant.hpp"
 
 #include <cstdint>
+#include <cstring>
+#include <vector>
 
 #if defined(MVLLM_WITH_CUDA_GEMM)
 extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
@@ -14,6 +17,8 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
 extern "C" int h3_cuda_probe(void);
 extern "C" void h3_cuda_ws_free(void);
 extern "C" size_t h3_cuda_workspace_bytes(void);
+extern "C" int h3_cuda_gemm_bf16_dev(const float *x, const uint16_t *w, float *y, int S, int I,
+                                     int O);
 #endif
 
 namespace mvllm {
@@ -75,6 +80,22 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
 #endif
     run_cpu(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn, head_dim, x,
             tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin);
+    return true;
+}
+
+bool gemm_bf16(float *y, const float *x, const uint16_t *w, int S, int I, int O) {
+    if (!y || !x || !w || S <= 0 || I <= 0 || O <= 0)
+        return false;
+#if defined(MVLLM_WITH_CUDA_GEMM)
+    if (h3_cuda_probe() == 0 && h3_cuda_gemm_bf16_dev(x, w, y, S, I, O) == 0)
+        return true;
+#endif
+    std::vector<float> wf(static_cast<size_t>(O) * static_cast<size_t>(I));
+    for (size_t i = 0; i < wf.size(); ++i) {
+        uint32_t bits = static_cast<uint32_t>(w[i]) << 16;
+        std::memcpy(&wf[i], &bits, sizeof(float));
+    }
+    quant::matmul_f32(y, x, wf.data(), S, I, O);
     return true;
 }
 

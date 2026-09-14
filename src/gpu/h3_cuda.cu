@@ -317,6 +317,72 @@ __global__ void k_swiglu_pack(const float *h1, float *gated, int T, int ffn) {
     gated[static_cast<size_t>(t) * ffn + i] = g * sig * u;
 }
 
+struct GemmWs {
+    float *x = nullptr;
+    float *y = nullptr;
+    uint16_t *w = nullptr;
+    int cap_S = 0, cap_I = 0, cap_O = 0;
+};
+GemmWs g_gemm;
+
+void gemm_ws_free() {
+    dfree(g_gemm.x);
+    dfree(g_gemm.y);
+    dfree(g_gemm.w);
+    g_gemm = GemmWs{};
+}
+
+bool gemm_ws_ensure(int S, int I, int O) {
+    if (S <= g_gemm.cap_S && I <= g_gemm.cap_I && O <= g_gemm.cap_O && g_gemm.w)
+        return true;
+    const int nS = S > g_gemm.cap_S ? S : g_gemm.cap_S;
+    const int nI = I > g_gemm.cap_I ? I : g_gemm.cap_I;
+    const int nO = O > g_gemm.cap_O ? O : g_gemm.cap_O;
+    GemmWs nxt{};
+    nxt.x = dalloc<float>(static_cast<size_t>(nS) * nI);
+    nxt.y = dalloc<float>(static_cast<size_t>(nS) * nO);
+    nxt.w = dalloc<uint16_t>(static_cast<size_t>(nO) * nI);
+    if (!nxt.x || !nxt.y || !nxt.w) {
+        dfree(nxt.x);
+        dfree(nxt.y);
+        dfree(nxt.w);
+        return false;
+    }
+    nxt.cap_S = nS;
+    nxt.cap_I = nI;
+    nxt.cap_O = nO;
+    gemm_ws_free();
+    g_gemm = nxt;
+    return true;
+}
+
+int gemm_bf16_dev(const float *x, const uint16_t *w, float *y, int S, int I, int O) {
+    if (!x || !w || !y || S <= 0 || I <= 0 || O <= 0)
+        return 1;
+    if (!gemm_ws_ensure(S, I, O))
+        return 2;
+    const size_t xb = sizeof(float) * static_cast<size_t>(S) * I;
+    const size_t yb = sizeof(float) * static_cast<size_t>(S) * O;
+    const size_t wb = sizeof(uint16_t) * static_cast<size_t>(O) * I;
+    bool ok = ck(cudaMemcpy(g_gemm.x, x, xb, cudaMemcpyHostToDevice)) &&
+              ck(cudaMemcpy(g_gemm.w, w, wb, cudaMemcpyHostToDevice));
+    if (!ok)
+        return 2;
+    k_gemm_bf16_tiled<<<grid2(O, S), dim3(16, 16)>>>(g_gemm.x, g_gemm.w, g_gemm.y, S, I, O);
+    if (!ck(cudaDeviceSynchronize()) || !ck(cudaMemcpy(y, g_gemm.y, yb, cudaMemcpyDeviceToHost)))
+        return 2;
+    return 0;
+}
+
+size_t gemm_ws_bytes() {
+    if (!g_gemm.w)
+        return 0;
+    size_t n = sizeof(float) * static_cast<size_t>(g_gemm.cap_S) * g_gemm.cap_I;
+    n += sizeof(float) * static_cast<size_t>(g_gemm.cap_S) * g_gemm.cap_O;
+    n += sizeof(uint16_t) * static_cast<size_t>(g_gemm.cap_O) * g_gemm.cap_I;
+    return n;
+}
+
 } // namespace
 
 extern "C" int h3_cuda_probe(void) {
@@ -326,9 +392,17 @@ extern "C" int h3_cuda_probe(void) {
     return 0;
 }
 
-extern "C" void h3_cuda_ws_free(void) { ws_free(); }
+extern "C" void h3_cuda_ws_free(void) {
+    ws_free();
+    gemm_ws_free();
+}
 
-extern "C" size_t h3_cuda_workspace_bytes(void) { return ws_bytes(); }
+extern "C" size_t h3_cuda_workspace_bytes(void) { return ws_bytes() + gemm_ws_bytes(); }
+
+extern "C" int h3_cuda_gemm_bf16_dev(const float *x, const uint16_t *w, float *y, int S, int I,
+                                     int O) {
+    return gemm_bf16_dev(x, w, y, S, I, O);
+}
 
 extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                                         int64_t fc1_bytes, int64_t fc2_bytes, int hidden, int inner,

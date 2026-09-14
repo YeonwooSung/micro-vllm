@@ -2919,6 +2919,26 @@ static void test_h3_cuda_dit() {
     CHECK(ws_after_t3 > 0);
     CHECK(ws_after_t300 > ws_after_t3);
 #endif
+    {
+        const int S = 3, I = 8, O = 5;
+        std::vector<float> x(static_cast<size_t>(S) * I), wc(static_cast<size_t>(O) * I);
+        std::vector<uint16_t> wb(static_cast<size_t>(O) * I);
+        for (int i = 0; i < S * I; ++i)
+            x[static_cast<size_t>(i)] = ((i % 5) - 2) * 0.1f;
+        for (int i = 0; i < O * I; ++i) {
+            wc[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.05f;
+            wb[static_cast<size_t>(i)] = bf16_encode(wc[static_cast<size_t>(i)]);
+            uint32_t bits = static_cast<uint32_t>(wb[static_cast<size_t>(i)]) << 16;
+            std::memcpy(&wc[static_cast<size_t>(i)], &bits, sizeof(float));
+        }
+        std::vector<float> yc(static_cast<size_t>(S) * O, 0.f), yg(static_cast<size_t>(S) * O, 0.f);
+        quant::matmul_f32(yc.data(), x.data(), wc.data(), S, I, O);
+        CHECK(h3_cuda::gemm_bf16(yg.data(), x.data(), wb.data(), S, I, O));
+        bool gemm_ok = true;
+        for (int i = 0; i < S * O; ++i)
+            gemm_ok = gemm_ok && std::fabs(yc[static_cast<size_t>(i)] - yg[static_cast<size_t>(i)]) < 2e-4f;
+        CHECK(gemm_ok);
+    }
     h3_cuda::shutdown();
     CHECK(h3_cuda::workspace_bytes() == 0);
 }
@@ -5464,6 +5484,7 @@ int main() {
         CHECK(stenc.ready());
         CHECK(stenc.from_checkpoint());
         CHECK(stenc.streamed());
+        CHECK(!stenc.embed_resident());
         CHECK(stenc.config().layers == 2);
         std::vector<int> stids = {1, 2, 3};
         std::vector<float> sthid;
@@ -5480,6 +5501,7 @@ int main() {
         unsetenv("MVLLM_H3_TEXT_RESIDENT");
         CHECK(rsenc.from_checkpoint());
         CHECK(!rsenc.streamed());
+        CHECK(rsenc.embed_resident());
         std::vector<float> rshid;
         rsenc.encode(stids, rshid);
         CHECK(rshid.size() == sthid.size());
@@ -5487,6 +5509,81 @@ int main() {
         for (size_t i = 0; i < sthid.size(); ++i)
             st_eq = st_eq && std::fabs(sthid[i] - rshid[i]) < 1e-5f;
         CHECK(st_eq);
+        rsenc.release_embed();
+        CHECK(!rsenc.embed_resident());
+        setenv("MVLLM_H3_TEXT_LAYERS", "1", 1);
+        std::vector<float> onehid;
+        stenc.encode(stids, onehid);
+        unsetenv("MVLLM_H3_TEXT_LAYERS");
+        CHECK(onehid.size() == sthid.size());
+        bool one_fin = !onehid.empty();
+        for (float v : onehid)
+            one_fin = one_fin && std::isfinite(v);
+        CHECK(one_fin);
+    }
+    {
+        using namespace mvllm;
+        std::string bdir = tmpdir();
+        const int H = 8, V = 8;
+        std::vector<float> table(static_cast<size_t>(V) * H);
+        for (int i = 0; i < V * H; ++i)
+            table[static_cast<size_t>(i)] = static_cast<float>((i % 7) + 1) * 0.125f;
+        std::vector<std::tuple<std::string, std::string, std::vector<int64_t>, std::vector<uint8_t>>>
+            bts;
+        bts.emplace_back("model.language_model.embed_tokens.weight", "BF16",
+                         std::vector<int64_t>{V, H}, pack_bf16_bytes(table));
+        bts.emplace_back("model.language_model.norm.weight", "F32", std::vector<int64_t>{H},
+                         pack_f32_bytes(std::vector<float>(H, 1.f)));
+        const int Q = 8, I = 16;
+        auto ones = [](int n, float v) { return std::vector<float>(static_cast<size_t>(n), v); };
+        for (int l = 0; l < 2; ++l) {
+            const std::string p = "model.language_model.layers." + std::to_string(l) + ".";
+            bts.emplace_back(p + "input_layernorm.weight", "F32", std::vector<int64_t>{H},
+                             pack_f32_bytes(ones(H, 1.f)));
+            bts.emplace_back(p + "post_attention_layernorm.weight", "F32", std::vector<int64_t>{H},
+                             pack_f32_bytes(ones(H, 1.f)));
+            bts.emplace_back(p + "self_attn.q_proj.weight", "BF16", std::vector<int64_t>{Q, H},
+                             pack_bf16_bytes(ones(Q * H, 0.02f)));
+            bts.emplace_back(p + "self_attn.k_proj.weight", "BF16", std::vector<int64_t>{Q, H},
+                             pack_bf16_bytes(ones(Q * H, 0.02f)));
+            bts.emplace_back(p + "self_attn.v_proj.weight", "BF16", std::vector<int64_t>{Q, H},
+                             pack_bf16_bytes(ones(Q * H, 0.02f)));
+            bts.emplace_back(p + "self_attn.o_proj.weight", "BF16", std::vector<int64_t>{H, Q},
+                             pack_bf16_bytes(ones(H * Q, 0.02f)));
+            bts.emplace_back(p + "self_attn.q_norm.weight", "F32", std::vector<int64_t>{1},
+                             pack_f32_bytes(ones(1, 1.f)));
+            bts.emplace_back(p + "self_attn.k_norm.weight", "F32", std::vector<int64_t>{1},
+                             pack_f32_bytes(ones(1, 1.f)));
+            bts.emplace_back(p + "mlp.gate_proj.weight", "BF16", std::vector<int64_t>{I, H},
+                             pack_bf16_bytes(ones(I * H, 0.02f)));
+            bts.emplace_back(p + "mlp.up_proj.weight", "BF16", std::vector<int64_t>{I, H},
+                             pack_bf16_bytes(ones(I * H, 0.02f)));
+            bts.emplace_back(p + "mlp.down_proj.weight", "BF16", std::vector<int64_t>{H, I},
+                             pack_bf16_bytes(ones(H * I, 0.02f)));
+        }
+        write_safetensors_file(bdir + "/model.safetensors", bts);
+        H3TextEncoder benc;
+        std::string berr;
+        CHECK(benc.load(bdir, berr) == Status::Ok);
+        CHECK(benc.streamed());
+        CHECK(!benc.embed_resident());
+        std::vector<int> bids = {0, 3, 7};
+        std::vector<float> bhid;
+        benc.encode(bids, bhid);
+        CHECK(static_cast<int>(bhid.size()) == 3 * H);
+        for (float v : bhid)
+            CHECK(std::isfinite(v));
+        setenv("MVLLM_H3_TEXT_RESIDENT", "1", 1);
+        H3TextEncoder br;
+        CHECK(br.load(bdir, berr) == Status::Ok);
+        unsetenv("MVLLM_H3_TEXT_RESIDENT");
+        std::vector<float> rhid;
+        br.encode(bids, rhid);
+        CHECK(rhid.size() == bhid.size());
+        bool beq = true;
+        for (size_t i = 0; i < bhid.size(); ++i)
+            beq = beq && std::fabs(bhid[i] - rhid[i]) < 2e-4f;
+        CHECK(beq);
     }
     {
         using namespace mvllm;

@@ -1,5 +1,8 @@
 #include "h3_text.hpp"
 #include "family.hpp"
+#include "../gpu/backend.hpp"
+#include "../gpu/h3_cuda.hpp"
+#include "../io/file_io.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
 
@@ -60,23 +63,32 @@ bool hit_mat(const io::StHit &h) {
 
 H3TextEncoder::~H3TextEncoder() { io::st_close_dir(files_); }
 
-void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids) {
+void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids,
+                            int max_tokens) {
     ids.clear();
     if (vocab < 2)
         vocab = 256;
+    if (max_tokens < 1)
+        max_tokens = 64;
     if (prompt.empty()) {
         ids.push_back(1);
         return;
     }
     for (unsigned char c : prompt)
         ids.push_back(1 + static_cast<int>(c) % (vocab - 1));
-    if (static_cast<int>(ids.size()) > 64)
-        ids.resize(64);
+    if (static_cast<int>(ids.size()) > max_tokens)
+        ids.resize(static_cast<size_t>(max_tokens));
+}
+
+void H3TextEncoder::release_embed() {
+    embed_.clear();
+    embed_.shrink_to_fit();
 }
 
 void H3TextEncoder::alloc_synth() {
     streamed_ = false;
     hits_.clear();
+    embed_hit_ = {};
     io::st_close_dir(files_);
     if (cfg_.hidden <= 0)
         cfg_.hidden = 32;
@@ -157,11 +169,99 @@ bool H3TextEncoder::load_layer_mats(int l, quant::QuantMat &wq, quant::QuantMat 
     return ok;
 }
 
+bool H3TextEncoder::gather_embed(const std::vector<int> &ids, std::vector<float> &out) const {
+    const int T = static_cast<int>(ids.size());
+    const int H = cfg_.hidden;
+    if (T < 1 || H < 1)
+        return false;
+    out.assign(static_cast<size_t>(T) * H, 0.f);
+    if (!embed_.empty()) {
+        for (int t = 0; t < T; ++t) {
+            int id = ids[static_cast<size_t>(t)];
+            if (id < 0 || id >= cfg_.vocab)
+                id = 0;
+            if (static_cast<size_t>(id + 1) * H > embed_.size())
+                continue;
+            std::memcpy(out.data() + static_cast<size_t>(t) * H,
+                        embed_.data() + static_cast<size_t>(id) * H,
+                        static_cast<size_t>(H) * sizeof(float));
+        }
+        return true;
+    }
+    if (!embed_hit_.file || !embed_hit_.tensor || embed_hit_.tensor->shape.size() != 2)
+        return false;
+    const io::StTensor &t = *embed_hit_.tensor;
+    if (t.shape[1] != H || t.shape[0] < 1)
+        return false;
+    const bool is_bf16 = t.dtype == "BF16";
+    const bool is_f32 = t.dtype == "F32" || t.dtype == "F32_";
+    if (!is_bf16 && !is_f32)
+        return false;
+    const size_t elem = is_bf16 ? 2 : 4;
+    const int64_t base = io::st_file_offset(*embed_hit_.file, t);
+    std::vector<uint8_t> raw(static_cast<size_t>(H) * elem);
+    for (int i = 0; i < T; ++i) {
+        int id = ids[static_cast<size_t>(i)];
+        if (id < 0 || id >= t.shape[0])
+            id = 0;
+        std::string err;
+        const int64_t off = base + static_cast<int64_t>(id) * static_cast<int64_t>(H) * elem;
+        if (io::pread_full(embed_hit_.file->fd, raw.data(), raw.size(), off, err) != Status::Ok)
+            return false;
+        float *dst = out.data() + static_cast<size_t>(i) * H;
+        if (is_f32) {
+            std::memcpy(dst, raw.data(), raw.size());
+            continue;
+        }
+        const uint16_t *src = reinterpret_cast<const uint16_t *>(raw.data());
+        for (int d = 0; d < H; ++d) {
+            uint32_t bits = static_cast<uint32_t>(src[d]) << 16;
+            std::memcpy(dst + d, &bits, sizeof(float));
+        }
+    }
+    return true;
+}
+
+bool H3TextEncoder::gemm_from_hit(const io::StHit &w, float *y, const float *x, int S) const {
+    if (!y || !x || S < 1 || !hit_mat(w))
+        return false;
+    const int O = static_cast<int>(w.tensor->shape[0]);
+    const int I = static_cast<int>(w.tensor->shape[1]);
+    const bool is_bf16 = w.tensor->dtype == "BF16";
+    const bool is_f32 = w.tensor->dtype == "F32" || w.tensor->dtype == "F32_";
+    if (!is_bf16 && !is_f32)
+        return false;
+    const size_t n = static_cast<size_t>(O) * static_cast<size_t>(I);
+    const size_t elem = is_bf16 ? 2 : 4;
+    std::vector<uint8_t> raw(n * elem);
+    std::string err;
+    if (io::pread_full(w.file->fd, raw.data(), raw.size(), io::st_file_offset(*w.file, *w.tensor),
+                       err) != Status::Ok)
+        return false;
+    if (is_bf16) {
+        const uint16_t *bw = reinterpret_cast<const uint16_t *>(raw.data());
+        if (gpu::device() == Device::Cuda && std::strcmp(h3_cuda::backend_name(), "cuda") == 0 &&
+            h3_cuda::gemm_bf16(y, x, bw, S, I, O))
+            return true;
+        std::vector<float> wf(n);
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t bits = static_cast<uint32_t>(bw[i]) << 16;
+            std::memcpy(&wf[i], &bits, sizeof(float));
+        }
+        quant::matmul_f32(y, x, wf.data(), S, I, O);
+        return true;
+    }
+    quant::matmul_f32(y, x, reinterpret_cast<const float *>(raw.data()), S, I, O);
+    return true;
+}
+
 Status H3TextEncoder::load(const std::string &model_dir, std::string &err) {
     ready_ = false;
     from_checkpoint_ = false;
     streamed_ = false;
     hits_.clear();
+    embed_hit_ = {};
+    embed_.clear();
     io::st_close_dir(files_);
     // Official Qwen3-VL-32B is ~67 GiB BF16; the host materializes f32 mats.
     // Skip on 64 GiB boxes (or any host that sets the env).
@@ -299,7 +399,7 @@ Status H3TextEncoder::load(const std::string &model_dir, std::string &err) {
 
     const int H = cfg_.hidden;
     const int L = cfg_.layers;
-    read_f(P + "embed_tokens.weight", embed_, cfg_.vocab * H);
+    embed_hit_ = io::st_find_dir(files_, P + "embed_tokens.weight");
     read_f(P + "norm.weight", norm_, H);
     if (norm_.empty())
         norm_.assign(static_cast<size_t>(H), 1.f);
@@ -337,6 +437,8 @@ Status H3TextEncoder::load(const std::string &model_dir, std::string &err) {
             if (post_n_[li].empty())
                 post_n_[li].assign(static_cast<size_t>(H), 1.f);
         }
+        // Official embed is ~3 GiB f32; gather token rows at encode time.
+        embed_.clear();
     } else {
         streamed_ = false;
         hits_.clear();
@@ -366,11 +468,14 @@ Status H3TextEncoder::load(const std::string &model_dir, std::string &err) {
             if (post_n_[li].empty())
                 post_n_[li].assign(static_cast<size_t>(H), 1.f);
         }
+        read_f(P + "embed_tokens.weight", embed_, cfg_.vocab * H);
         io::st_close_dir(files_);
+        embed_hit_ = {};
     }
 
-    ready_ = !embed_.empty() && (streamed_ ? (!hits_.empty() && hits_[0].wq.tensor)
-                                           : (!wq_.empty() && !wq_[0].empty()));
+    const bool have_embed = !embed_.empty() || (embed_hit_.file && embed_hit_.tensor);
+    ready_ = have_embed && (streamed_ ? (!hits_.empty() && hits_[0].wq.tensor)
+                                      : (!wq_.empty() && !wq_[0].empty()));
     from_checkpoint_ = ready_;
     if (!ready_) {
         alloc_synth();
@@ -383,10 +488,10 @@ Status H3TextEncoder::load(const std::string &model_dir, std::string &err) {
 void H3TextEncoder::apply_layer(int l, int T, const quant::QuantMat *wq, const quant::QuantMat *wk,
                                const quant::QuantMat *wv, const quant::QuantMat *wo,
                                const quant::QuantMat *gate, const quant::QuantMat *up,
-                               const quant::QuantMat *down, const uint32_t *positions,
-                               const H3VisionSpan *spans, int span_count, std::vector<float> &out,
-                               std::vector<float> &n, std::vector<float> &q, std::vector<float> &k,
-                               std::vector<float> &v, std::vector<float> &ctx,
+                               const quant::QuantMat *down, const LayerHits *hits,
+                               const uint32_t *positions, const H3VisionSpan *spans, int span_count,
+                               std::vector<float> &out, std::vector<float> &n, std::vector<float> &q,
+                               std::vector<float> &k, std::vector<float> &v, std::vector<float> &ctx,
                                std::vector<float> &attn, std::vector<float> &g, std::vector<float> &u,
                                std::vector<float> &d) const {
     const int H = cfg_.hidden;
@@ -398,15 +503,22 @@ void H3TextEncoder::apply_layer(int l, int T, const quant::QuantMat *wq, const q
     const int group = std::max(nq / nkv, 1);
     const size_t li = static_cast<size_t>(l);
     auto empty = [](const quant::QuantMat *m) { return !m || m->empty(); };
-    const bool all_empty = empty(wq) && empty(wk) && empty(wv) && empty(wo) && empty(gate) &&
-                           empty(up) && empty(down);
+    const bool have_hits = hits && (hit_mat(hits->wq) || hit_mat(hits->gate));
+    const bool all_empty = !have_hits && empty(wq) && empty(wk) && empty(wv) && empty(wo) &&
+                           empty(gate) && empty(up) && empty(down);
     if (!all_empty) {
         const float *in_w = (li < in_n_.size() && !in_n_[li].empty()) ? in_n_[li].data() : nullptr;
         const float *post_w =
             (li < post_n_.size() && !post_n_[li].empty()) ? post_n_[li].data() : nullptr;
         for (int t = 0; t < T; ++t)
             quant::rmsnorm(out.data() + t * H, in_w, n.data() + t * H, H, cfg_.rms_eps);
-        auto gemm = [](const quant::QuantMat *w, float *y, const float *x, int S, size_t nelt) {
+        auto gemm = [&](const quant::QuantMat *w, const io::StHit *hit, float *y, const float *x,
+                        int S, size_t nelt) {
+            if (hit && hit_mat(*hit)) {
+                if (!gemm_from_hit(*hit, y, x, S) && y && nelt)
+                    std::fill(y, y + nelt, 0.f);
+                return;
+            }
             if (!w || w->empty()) {
                 if (y && nelt)
                     std::fill(y, y + nelt, 0.f);
@@ -414,9 +526,9 @@ void H3TextEncoder::apply_layer(int l, int T, const quant::QuantMat *wq, const q
             }
             w->gemm(y, x, S);
         };
-        gemm(wq, q.data(), n.data(), T, q.size());
-        gemm(wk, k.data(), n.data(), T, k.size());
-        gemm(wv, v.data(), n.data(), T, v.size());
+        gemm(wq, hits ? &hits->wq : nullptr, q.data(), n.data(), T, q.size());
+        gemm(wk, hits ? &hits->wk : nullptr, k.data(), n.data(), T, k.size());
+        gemm(wv, hits ? &hits->wv : nullptr, v.data(), n.data(), T, v.size());
         for (int t = 0; t < T; ++t) {
             for (int h = 0; h < nq; ++h) {
                 float *qh = q.data() + static_cast<size_t>(t) * nq * hd + h * hd;
@@ -467,18 +579,18 @@ void H3TextEncoder::apply_layer(int l, int T, const quant::QuantMat *wq, const q
                 }
             }
         }
-        gemm(wo, attn.data(), ctx.data(), T, attn.size());
+        gemm(wo, hits ? &hits->wo : nullptr, attn.data(), ctx.data(), T, attn.size());
         for (int i = 0; i < T * H; ++i)
             out[static_cast<size_t>(i)] += attn[static_cast<size_t>(i)];
         for (int t = 0; t < T; ++t)
             quant::rmsnorm(out.data() + t * H, post_w, n.data() + t * H, H, cfg_.rms_eps);
-        gemm(gate, g.data(), n.data(), T, g.size());
-        gemm(up, u.data(), n.data(), T, u.size());
+        gemm(gate, hits ? &hits->gate : nullptr, g.data(), n.data(), T, g.size());
+        gemm(up, hits ? &hits->up : nullptr, u.data(), n.data(), T, u.size());
         for (int i = 0; i < T * I; ++i)
             g[static_cast<size_t>(i)] =
                 g[static_cast<size_t>(i)] * quant::sigmoid(g[static_cast<size_t>(i)]) *
                 u[static_cast<size_t>(i)];
-        gemm(down, d.data(), g.data(), T, d.size());
+        gemm(down, hits ? &hits->down : nullptr, d.data(), g.data(), T, d.size());
         for (int i = 0; i < T * H; ++i)
             out[static_cast<size_t>(i)] += d[static_cast<size_t>(i)];
     }
@@ -524,13 +636,14 @@ void H3TextEncoder::encode_mm(const std::vector<int> &ids, const H3VisionSpan *s
     int L = layer_count;
     if (L <= 0 || L > cfg_.layers)
         L = cfg_.layers;
-    out.assign(static_cast<size_t>(T) * H, 0.f);
-    for (int t = 0; t < T; ++t) {
-        int id = ids[static_cast<size_t>(t)];
-        if (id < 0 || id >= cfg_.vocab)
-            id = 0;
-        std::memcpy(out.data() + static_cast<size_t>(t) * H,
-                    embed_.data() + static_cast<size_t>(id) * H, static_cast<size_t>(H) * sizeof(float));
+    if (const char *el = std::getenv("MVLLM_H3_TEXT_LAYERS")) {
+        const int v = std::atoi(el);
+        if (v > 0 && v < L)
+            L = v;
+    }
+    if (!gather_embed(ids, out)) {
+        out.clear();
+        return;
     }
     if (spans && span_count > 0) {
         for (int s = 0; s < span_count; ++s) {
@@ -550,22 +663,15 @@ void H3TextEncoder::encode_mm(const std::vector<int> &ids, const H3VisionSpan *s
         ctx(static_cast<size_t>(T) * nq * hd), attn(static_cast<size_t>(T) * H),
         g(static_cast<size_t>(T) * I), u(static_cast<size_t>(T) * I), d(static_cast<size_t>(T) * H);
     for (int l = 0; l < L; ++l) {
-        if (streamed_) {
-            // Peak: one layer of f32 mats; locals free before the next layer.
-            quant::QuantMat lwq, lwk, lwv, lwo, lgate, lup, ldown;
-            load_layer_mats(l, lwq, lwk, lwv, lwo, lgate, lup, ldown);
-            apply_layer(l, T, &lwq, &lwk, &lwv, &lwo, &lgate, &lup, &ldown, positions, spans,
-                        span_count, out, n, q, k, v, ctx, attn, g, u, d);
-        } else {
-            const size_t li = static_cast<size_t>(l);
-            apply_layer(l, T, li < wq_.size() ? &wq_[li] : nullptr,
-                        li < wk_.size() ? &wk_[li] : nullptr, li < wv_.size() ? &wv_[li] : nullptr,
-                        li < wo_.size() ? &wo_[li] : nullptr,
-                        li < gate_.size() ? &gate_[li] : nullptr,
-                        li < up_.size() ? &up_[li] : nullptr,
-                        li < down_.size() ? &down_[li] : nullptr, positions, spans, span_count, out,
-                        n, q, k, v, ctx, attn, g, u, d);
-        }
+        const LayerHits *lh =
+            (streamed_ && static_cast<size_t>(l) < hits_.size()) ? &hits_[static_cast<size_t>(l)]
+                                                                 : nullptr;
+        const size_t li = static_cast<size_t>(l);
+        apply_layer(l, T, li < wq_.size() ? &wq_[li] : nullptr,
+                    li < wk_.size() ? &wk_[li] : nullptr, li < wv_.size() ? &wv_[li] : nullptr,
+                    li < wo_.size() ? &wo_[li] : nullptr, li < gate_.size() ? &gate_[li] : nullptr,
+                    li < up_.size() ? &up_[li] : nullptr, li < down_.size() ? &down_[li] : nullptr,
+                    lh, positions, spans, span_count, out, n, q, k, v, ctx, attn, g, u, d);
     }
     if (!norm_.empty()) {
         for (int t = 0; t < T; ++t)
