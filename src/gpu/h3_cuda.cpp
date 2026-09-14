@@ -13,7 +13,8 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
                                         int ffn, int head_dim, float *x, int tokens, float eps,
                                         const float *adaln_mod, const float *q_norm,
                                         const float *k_norm, const float *rope_cos,
-                                        const float *rope_sin);
+                                        const float *rope_sin, const uint32_t *row_map,
+                                        int adaln_groups);
 extern "C" int h3_cuda_probe(void);
 extern "C" void h3_cuda_ws_free(void);
 extern "C" size_t h3_cuda_workspace_bytes(void);
@@ -30,9 +31,11 @@ bool g_inited = false;
 void run_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
              int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x, int tokens,
              float eps, const float *adaln_mod, const float *q_norm, const float *k_norm,
-             const float *rope_cos, const float *rope_sin) {
+             const float *rope_cos, const float *rope_sin, const uint32_t *row_map,
+             int adaln_groups) {
     h3_dit_block_cpu(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn, head_dim,
-                     x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin);
+                     x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin, row_map,
+                     adaln_groups);
 }
 
 } // namespace
@@ -70,16 +73,17 @@ const char *backend_name() {
 bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
-                  const float *k_norm, const float *rope_cos, const float *rope_sin) {
+                  const float *k_norm, const float *rope_cos, const float *rope_sin,
+                  const uint32_t *row_map, int adaln_groups) {
 #if defined(MVLLM_WITH_CUDA_GEMM)
     if (h3_cuda_probe() == 0 &&
         h3_cuda_dit_residual_dev(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner,
                                  ffn, head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos,
-                                 rope_sin) == 0)
+                                 rope_sin, row_map, adaln_groups) == 0)
         return true;
 #endif
     run_cpu(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn, head_dim, x,
-            tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin);
+            tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin, row_map, adaln_groups);
     return true;
 }
 

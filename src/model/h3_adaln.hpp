@@ -9,6 +9,22 @@ constexpr int kH3AdalnModalities = 3;
 // Official time MLP widths are 256 -> 5376 -> 2688; callers may use any positive dims.
 int h3_adaln_out(int hidden);
 
+// Groups in a packed mod buffer [temb_rows, modalities, 6, hidden].
+// mrows is the W prefix (6*H or 3*6*H). 1 on bad args.
+inline int h3_adaln_groups(int mrows, int hidden, int temb_rows) {
+    if (hidden < 1 || temb_rows < 1 || mrows < kH3AdalnSlots * hidden)
+        return 1;
+    return temb_rows * (mrows / (kH3AdalnSlots * hidden));
+}
+
+// Token t → group in [0, groups). Null map or groups<=1 → 0.
+inline int h3_adaln_group_index(const unsigned int *row_map, int token, int groups) {
+    if (!row_map || groups <= 1 || token < 0)
+        return 0;
+    const int g = static_cast<int>(row_map[token]);
+    return (g >= 0 && g < groups) ? g : 0;
+}
+
 // SiLU: x * sigmoid(x) = x / (1 + exp(-x)).
 void h3_silu(float *x, int n);
 

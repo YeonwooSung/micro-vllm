@@ -1,4 +1,5 @@
 #include "family.hpp"
+#include "h3_adaln.hpp"
 #include "../gpu/coli_cuda.hpp"
 #include "../gpu/metal_ops.hpp"
 #include "../quant/quant.hpp"
@@ -1107,7 +1108,8 @@ void bf16_to_f32(const uint16_t *src, float *dst, int64_t n) {
 void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                       int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                       int tokens, float eps, const float *adaln_mod, const float *q_norm,
-                      const float *k_norm, const float *rope_cos, const float *rope_sin) {
+                      const float *k_norm, const float *rope_cos, const float *rope_sin,
+                      const uint32_t *row_map, int adaln_groups) {
     if (!blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
         return;
     const int64_t qkv_n = qkv_bytes / 2;
@@ -1133,13 +1135,15 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     const int H = hidden;
     std::vector<float> xn(static_cast<size_t>(T) * H);
     std::vector<float> ones(H, 1.f);
+    const int groups = adaln_groups > 0 ? adaln_groups : 1;
     auto apply_adaln = [&](const float *src, float *dst, int scale_slot, int shift_slot) {
         for (int t = 0; t < T; ++t) {
             quant::rmsnorm(src + t * H, ones.data(), dst + t * H, H, eps);
             if (!adaln_mod)
                 continue;
-            const float *s = adaln_mod + scale_slot * H;
-            const float *b = adaln_mod + shift_slot * H;
+            const int g = h3_adaln_group_index(row_map, t, groups);
+            const float *s = adaln_mod + (static_cast<size_t>(g) * kH3AdalnSlots + scale_slot) * H;
+            const float *b = adaln_mod + (static_cast<size_t>(g) * kH3AdalnSlots + shift_slot) * H;
             for (int i = 0; i < H; ++i)
                 dst[t * H + i] = dst[t * H + i] * (1.f + s[i]) + b[i];
         }
@@ -1218,8 +1222,11 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     quant::matmul_f32(attn.data(), ctx.data(), Wout.data(), T, I, H);
     for (int t = 0; t < T; ++t)
         for (int i = 0; i < H; ++i) {
-            float g = adaln_mod ? adaln_mod[2 * H + i] : 1.f;
-            x[t * H + i] += g * attn[t * H + i];
+            const int g = h3_adaln_group_index(row_map, t, groups);
+            float gate = adaln_mod
+                             ? adaln_mod[(static_cast<size_t>(g) * kH3AdalnSlots + 2) * H + i]
+                             : 1.f;
+            x[t * H + i] += gate * attn[t * H + i];
         }
 
     apply_adaln(x, xn.data(), 3, 4);
@@ -1240,8 +1247,11 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     quant::matmul_f32(down.data(), gated.data(), Wfc2.data(), T, ffn, H);
     for (int t = 0; t < T; ++t)
         for (int i = 0; i < H; ++i) {
-            float g = adaln_mod ? adaln_mod[5 * H + i] : 1.f;
-            x[t * H + i] += g * down[t * H + i];
+            const int g = h3_adaln_group_index(row_map, t, groups);
+            float gate = adaln_mod
+                             ? adaln_mod[(static_cast<size_t>(g) * kH3AdalnSlots + 5) * H + i]
+                             : 1.f;
+            x[t * H + i] += gate * down[t * H + i];
         }
 }
 

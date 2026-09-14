@@ -4,7 +4,7 @@
 | --- | --- |
 | Author | TBD |
 | Date | 2026-09-14 |
-| Status | Draft |
+| Status | Landed (stream + tiled GEMM); 3-mod AdaLN + CUDA SDPA follow-up in tree |
 | Scope | `H3Engine` AdaLN host load + `h3_cuda::dit_residual` device path |
 | Out of scope | official_metal generate, physical TP2, Vulkan kernels, `MVLLM_H3_SKIP_TEXT=0` 32B encode |
 | Baseline | `f1cef47` (H3 CUDA DiT, streamed Qwen text encoder, prepare/run scripts) |
@@ -827,4 +827,13 @@ Two incremental local commits. Either is independently reviewable; commit 2 does
   - Extend `test_h3_cuda_dit` with a two-call workspace-reuse check (second call still within 2e-4 of a fresh CPU residual). Existing AdaLN / T=300 / RoPE / `backend_name==cuda` checks stay. Do not tighten to 1e-5.
 - **Verify:** `mvllm_tests` with `-DMVLLM_GPU_CUDA=ON` on a machine that has a device. CPU-only builds still compile (`workspace_bytes()==0`, residual is CPU).
 
-No further PRs in this design. Batched-head / online SDPA, residual-gate GEMM epilogue, and `set_rope` are explicit follow-ups, not blockers.
+### Follow-up landed — 3-modality AdaLN + CUDA SDPA
+
+- Generate loads `mrows = 3*6*H` when the layer tensor is tall enough, else `6*H`.
+- `H3DitSchedule` supplies time features + `row_map` (`time_row * 3 + tag`).
+- `dit_residual` / `h3_dit_block_cpu` take optional `row_map` + `adaln_groups`; null map is the old `[6,H]` contract.
+- CUDA SDPA: batched-head `scores[heads,T,T]` when `heads*T*T*4 ≤ 64 MiB`; else online softmax. `MVLLM_H3_CUDA_SDPA=online|batched` overrides.
+- Metal GPU path falls back to CPU when `groups > 1`.
+- `describe()` appends `,3mod` when any usable layer has `3*6*H` rows. Generate note adds `adaln_groups=N`.
+
+No further PRs in this design. Residual-gate GEMM epilogue and `set_rope` remain optional.

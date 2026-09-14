@@ -4,9 +4,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 // Device kernels for H3 DiT residual. Semantics match h3_dit_block_cpu.
-// Scores live in device memory [T,T]; no tokens<=256 cap.
+// SDPA: batched-head scores[heads,T,T] when it fits 64 MiB, else online.
 
 namespace {
 
@@ -36,10 +38,13 @@ dim3 grid2(int gx, int gy) {
 struct DitWs {
     uint8_t *blob;
     float *x, *xn, *qkv, *ctx, *attn, *h1, *gated, *down, *scores, *mod, *qn, *kn, *cos, *sin;
-    int cap_T, cap_H, cap_I, cap_ffn, cap_hd;
+    uint32_t *rmap;
+    int cap_T, cap_H, cap_I, cap_ffn, cap_hd, cap_G, cap_heads;
     int64_t cap_blob;
 };
 DitWs g_ws;
+
+constexpr size_t kSdpaScoreCapBytes = 64ull << 20;
 
 void ws_release(DitWs &w) {
     dfree(w.blob);
@@ -57,6 +62,7 @@ void ws_release(DitWs &w) {
     dfree(w.kn);
     dfree(w.cos);
     dfree(w.sin);
+    dfree(w.rmap);
     w = DitWs{};
 }
 
@@ -79,19 +85,48 @@ size_t ws_bytes() {
     n += sizeof(float) * T * 2 * ffn; // h1
     n += sizeof(float) * T * ffn;     // gated
     n += sizeof(float) * T * H;       // down
-    n += sizeof(float) * T * T;       // scores
-    n += sizeof(float) * 6 * H;       // mod
+    n += sizeof(float) * static_cast<size_t>(g_ws.cap_heads) * T * T; // scores
+    n += sizeof(float) * static_cast<size_t>(g_ws.cap_G > 0 ? g_ws.cap_G : 1) * 6 * H;
     n += sizeof(float) * hd;          // qn
     n += sizeof(float) * hd;          // kn
     n += sizeof(float) * T * 48;      // cos
     n += sizeof(float) * T * 48;      // sin
+    n += sizeof(uint32_t) * T;        // rmap
     return n;
 }
 
+int sdpa_mode_env() {
+    const char *e = std::getenv("MVLLM_H3_CUDA_SDPA");
+    if (!e || !e[0])
+        return 0; // auto
+    if (std::strcmp(e, "online") == 0)
+        return 1;
+    if (std::strcmp(e, "batched") == 0)
+        return 2;
+    return 0;
+}
+
+bool sdpa_use_batched(int T, int heads) {
+    if (T < 1 || heads < 1)
+        return false;
+    const int mode = sdpa_mode_env();
+    if (mode == 1)
+        return false;
+    const size_t want = sizeof(float) * static_cast<size_t>(heads) * static_cast<size_t>(T) *
+                        static_cast<size_t>(T);
+    if (mode == 2)
+        return true;
+    return want <= kSdpaScoreCapBytes;
+}
+
 // One transaction: alloc new first; on any failure free nxt and keep g_ws.
-bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n) {
+bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n, int groups, int heads,
+               bool batched) {
+    const int G = groups > 0 ? groups : 1;
+    const int Hs = (batched && heads > 0) ? heads : 0;
     if (T <= g_ws.cap_T && H <= g_ws.cap_H && I <= g_ws.cap_I && ffn <= g_ws.cap_ffn &&
-        hd <= g_ws.cap_hd && blob_n <= g_ws.cap_blob && g_ws.blob)
+        hd <= g_ws.cap_hd && blob_n <= g_ws.cap_blob && G <= g_ws.cap_G && Hs <= g_ws.cap_heads &&
+        g_ws.blob)
         return true;
 
     const int nT = T > g_ws.cap_T ? T : g_ws.cap_T;
@@ -99,6 +134,8 @@ bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n) {
     const int nI = I > g_ws.cap_I ? I : g_ws.cap_I;
     const int nffn = ffn > g_ws.cap_ffn ? ffn : g_ws.cap_ffn;
     const int nhd = hd > g_ws.cap_hd ? hd : g_ws.cap_hd;
+    const int nG = G > g_ws.cap_G ? G : g_ws.cap_G;
+    const int nHs = Hs > g_ws.cap_heads ? Hs : g_ws.cap_heads;
     const int64_t nblob = blob_n > g_ws.cap_blob ? blob_n : g_ws.cap_blob;
 
     DitWs nxt{};
@@ -111,16 +148,18 @@ bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n) {
     nxt.h1 = dalloc<float>(static_cast<size_t>(nT) * 2 * nffn);
     nxt.gated = dalloc<float>(static_cast<size_t>(nT) * nffn);
     nxt.down = dalloc<float>(static_cast<size_t>(nT) * nH);
-    nxt.scores = dalloc<float>(static_cast<size_t>(nT) * nT);
-    nxt.mod = dalloc<float>(static_cast<size_t>(6) * nH);
+    const size_t score_n = nHs > 0 ? static_cast<size_t>(nHs) * nT * nT : 1;
+    nxt.scores = dalloc<float>(score_n);
+    nxt.mod = dalloc<float>(static_cast<size_t>(nG > 0 ? nG : 1) * 6 * nH);
     nxt.qn = dalloc<float>(static_cast<size_t>(nhd));
     nxt.kn = dalloc<float>(static_cast<size_t>(nhd));
     nxt.cos = dalloc<float>(static_cast<size_t>(nT) * 48);
     nxt.sin = dalloc<float>(static_cast<size_t>(nT) * 48);
+    nxt.rmap = dalloc<uint32_t>(static_cast<size_t>(nT));
 
     const bool ok = nxt.blob && nxt.x && nxt.xn && nxt.qkv && nxt.ctx && nxt.attn && nxt.h1 &&
                     nxt.gated && nxt.down && nxt.scores && nxt.mod && nxt.qn && nxt.kn && nxt.cos &&
-                    nxt.sin;
+                    nxt.sin && nxt.rmap;
     if (!ok) {
         ws_release(nxt);
         return false;
@@ -130,15 +169,25 @@ bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n) {
     nxt.cap_I = nI;
     nxt.cap_ffn = nffn;
     nxt.cap_hd = nhd;
+    nxt.cap_G = nG > 0 ? nG : 1;
+    nxt.cap_heads = nHs;
     nxt.cap_blob = nblob;
     ws_release(g_ws);
     g_ws = nxt;
     return true;
 }
 
+__device__ inline int d_group(const uint32_t *row_map, int t, int groups) {
+    if (!row_map || groups <= 1)
+        return 0;
+    int g = static_cast<int>(row_map[t]);
+    return (g >= 0 && g < groups) ? g : 0;
+}
+
 // RMSNorm with ones, then y = y * (1 + scale) + shift when has_mod.
 __global__ void k_adaln(const float *x, const float *mod, float *y, int T, int H, float eps,
-                        int has_mod, int scale_slot, int shift_slot) {
+                        int has_mod, int scale_slot, int shift_slot, const uint32_t *row_map,
+                        int groups) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T)
         return;
@@ -149,8 +198,9 @@ __global__ void k_adaln(const float *x, const float *mod, float *y, int T, int H
         ss += xs[i] * xs[i];
     float inv = rsqrtf(ss / static_cast<float>(H) + eps);
     if (has_mod) {
-        const float *s = mod + static_cast<size_t>(scale_slot) * H;
-        const float *b = mod + static_cast<size_t>(shift_slot) * H;
+        const int g = d_group(row_map, t, groups);
+        const float *s = mod + (static_cast<size_t>(g) * 6 + scale_slot) * H;
+        const float *b = mod + (static_cast<size_t>(g) * 6 + shift_slot) * H;
         for (int i = 0; i < H; ++i)
             ys[i] = xs[i] * inv * (1.f + s[i]) + b[i];
     } else {
@@ -245,11 +295,12 @@ __global__ void k_rope_qk(float *qkv, const float *cos, const float *sin, int T,
     }
 }
 
-// Full (non-causal) scores for one head into scores[T,T].
-__global__ void k_attn_scores(const float *qkv, float *scores, int T, int I, int hd, int h) {
+// Batched-head scores[heads, T, T].
+__global__ void k_attn_scores_bh(const float *qkv, float *scores, int T, int I, int hd, int heads) {
     int ki = blockIdx.x * blockDim.x + threadIdx.x;
     int qi = blockIdx.y * blockDim.y + threadIdx.y;
-    if (qi >= T || ki >= T)
+    int h = static_cast<int>(blockIdx.z);
+    if (qi >= T || ki >= T || h >= heads)
         return;
     const float scale = rsqrtf(static_cast<float>(hd));
     const float *q = qkv + static_cast<size_t>(qi) * (3 * I) + h * hd;
@@ -257,14 +308,15 @@ __global__ void k_attn_scores(const float *qkv, float *scores, int T, int I, int
     float acc = 0.f;
     for (int d = 0; d < hd; ++d)
         acc += q[d] * k[d];
-    scores[static_cast<size_t>(qi) * T + ki] = acc * scale;
+    scores[(static_cast<size_t>(h) * T + qi) * T + ki] = acc * scale;
 }
 
-__global__ void k_attn_softmax(float *scores, int T) {
+__global__ void k_attn_softmax_bh(float *scores, int T, int heads) {
     int qi = blockIdx.x * blockDim.x + threadIdx.x;
-    if (qi >= T)
+    int h = static_cast<int>(blockIdx.y);
+    if (qi >= T || h >= heads)
         return;
-    float *row = scores + static_cast<size_t>(qi) * T;
+    float *row = scores + (static_cast<size_t>(h) * T + qi) * T;
     float m = row[0];
     for (int i = 1; i < T; ++i) {
         if (row[i] > m)
@@ -280,13 +332,14 @@ __global__ void k_attn_softmax(float *scores, int T) {
         row[i] *= inv;
 }
 
-__global__ void k_attn_av(const float *qkv, const float *scores, float *ctx, int T, int I, int hd,
-                          int h) {
+__global__ void k_attn_av_bh(const float *qkv, const float *scores, float *ctx, int T, int I, int hd,
+                             int heads) {
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     int qi = blockIdx.y * blockDim.y + threadIdx.y;
-    if (qi >= T || d >= hd)
+    int h = static_cast<int>(blockIdx.z);
+    if (qi >= T || d >= hd || h >= heads)
         return;
-    const float *srow = scores + static_cast<size_t>(qi) * T;
+    const float *srow = scores + (static_cast<size_t>(h) * T + qi) * T;
     float acc = 0.f;
     for (int vi = 0; vi < T; ++vi) {
         const float *v = qkv + static_cast<size_t>(vi) * (3 * I) + 2 * I + h * hd;
@@ -295,14 +348,52 @@ __global__ void k_attn_av(const float *qkv, const float *scores, float *ctx, int
     ctx[static_cast<size_t>(qi) * I + h * hd + d] = acc;
 }
 
-// x += (has_mod ? mod[slot] : 1) * y
+// Exact online softmax SDPA: one thread per (head, query).
+__global__ void k_sdpa_online(const float *qkv, float *ctx, int T, int I, int hd, int heads) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    int qi = blockIdx.y * blockDim.y + threadIdx.y;
+    if (h >= heads || qi >= T)
+        return;
+    const float scale = rsqrtf(static_cast<float>(hd));
+    const float *q = qkv + static_cast<size_t>(qi) * (3 * I) + h * hd;
+    float *o = ctx + static_cast<size_t>(qi) * I + h * hd;
+    for (int d = 0; d < hd; ++d)
+        o[d] = 0.f;
+    float m = -1e30f;
+    float l = 0.f;
+    for (int ki = 0; ki < T; ++ki) {
+        const float *k = qkv + static_cast<size_t>(ki) * (3 * I) + I + h * hd;
+        const float *v = qkv + static_cast<size_t>(ki) * (3 * I) + 2 * I + h * hd;
+        float s = 0.f;
+        for (int d = 0; d < hd; ++d)
+            s += q[d] * k[d];
+        s *= scale;
+        const float m2 = s > m ? s : m;
+        const float alpha = expf(m - m2);
+        const float e = expf(s - m2);
+        l = l * alpha + e;
+        for (int d = 0; d < hd; ++d)
+            o[d] = o[d] * alpha + e * v[d];
+        m = m2;
+    }
+    const float inv = (l == 0.f) ? 0.f : 1.f / l;
+    for (int d = 0; d < hd; ++d)
+        o[d] *= inv;
+}
+
+// x += (has_mod ? mod[group, slot] : 1) * y
 __global__ void k_residual_gate(float *x, const float *y, const float *mod, int n, int H,
-                                int has_mod, int slot) {
+                                int has_mod, int slot, const uint32_t *row_map, int groups) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n)
         return;
+    int t = i / H;
     int col = i % H;
-    float g = has_mod ? mod[static_cast<size_t>(slot) * H + col] : 1.f;
+    float g = 1.f;
+    if (has_mod) {
+        const int grp = d_group(row_map, t, groups);
+        g = mod[(static_cast<size_t>(grp) * 6 + slot) * H + col];
+    }
     x[i] += g * y[i];
 }
 
@@ -409,7 +500,8 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
                                         int ffn, int head_dim, float *x, int tokens, float eps,
                                         const float *adaln_mod, const float *q_norm,
                                         const float *k_norm, const float *rope_cos,
-                                        const float *rope_sin) {
+                                        const float *rope_sin, const uint32_t *row_map,
+                                        int adaln_groups) {
     if (!blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
         return 1;
     if (qkv_bytes < 2 || out_bytes < 2 || fc1_bytes < 2 || fc2_bytes < 2)
@@ -432,18 +524,25 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
         return 1;
     const int64_t blob_n = qkv_bytes + out_bytes + fc1_bytes + fc2_bytes;
     const int has_mod = adaln_mod ? 1 : 0;
+    const int groups = adaln_groups > 0 ? adaln_groups : 1;
     const int do_q = q_norm ? 1 : 0;
     const int do_k = k_norm ? 1 : 0;
     const bool do_rope = rope_cos && rope_sin && hd >= 96;
+    const bool batched = sdpa_use_batched(T, heads);
+    const bool use_map = has_mod && row_map && groups > 1;
 
-    if (!ws_ensure(T, H, I, ffn, hd, blob_n))
+    if (!ws_ensure(T, H, I, ffn, hd, blob_n, groups, heads, batched))
         return 2;
 
     bool ok = ck(cudaMemcpy(g_ws.blob, blob, static_cast<size_t>(blob_n), cudaMemcpyHostToDevice)) &&
               ck(cudaMemcpy(g_ws.x, x, sizeof(float) * static_cast<size_t>(T) * H,
                             cudaMemcpyHostToDevice));
     if (ok && has_mod)
-        ok = ck(cudaMemcpy(g_ws.mod, adaln_mod, sizeof(float) * static_cast<size_t>(6) * H,
+        ok = ck(cudaMemcpy(g_ws.mod, adaln_mod,
+                           sizeof(float) * static_cast<size_t>(groups) * 6 * H,
+                           cudaMemcpyHostToDevice));
+    if (ok && use_map)
+        ok = ck(cudaMemcpy(g_ws.rmap, row_map, sizeof(uint32_t) * static_cast<size_t>(T),
                            cudaMemcpyHostToDevice));
     if (ok && do_q)
         ok = ck(cudaMemcpy(g_ws.qn, q_norm, sizeof(float) * static_cast<size_t>(hd),
@@ -464,8 +563,10 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
             reinterpret_cast<const uint16_t *>(g_ws.blob + qkv_bytes + out_bytes);
         const uint16_t *w_fc2 =
             reinterpret_cast<const uint16_t *>(g_ws.blob + qkv_bytes + out_bytes + fc1_bytes);
+        const uint32_t *dmap = use_map ? g_ws.rmap : nullptr;
 
-        k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 0, 1);
+        k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 0, 1, dmap,
+                                  groups);
         k_gemm_bf16_tiled<<<grid2(3 * I, T), dim3(16, 16)>>>(g_ws.xn, w_qkv, g_ws.qkv, T, H, 3 * I);
         if (do_q || do_k)
             k_qk_rmsnorm<<<grid2(heads, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.qn, g_ws.kn, T, I, hd,
@@ -474,25 +575,33 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
             k_rope_qk<<<grid2(heads, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.cos, g_ws.sin, T, I, hd,
                                                          heads);
 
-        ok = ck(cudaMemset(g_ws.ctx, 0, sizeof(float) * static_cast<size_t>(T) * I));
-        for (int h = 0; ok && h < heads; ++h) {
-            k_attn_scores<<<grid2(T, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.scores, T, I, hd, h);
-            k_attn_softmax<<<grid1(T), 64>>>(g_ws.scores, T);
-            k_attn_av<<<grid2(hd, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.scores, g_ws.ctx, T, I, hd, h);
+        if (batched) {
+            dim3 sgrid((T + 15) / 16, (T + 15) / 16, heads);
+            k_attn_scores_bh<<<sgrid, dim3(16, 16)>>>(g_ws.qkv, g_ws.scores, T, I, hd, heads);
+            k_attn_softmax_bh<<<dim3((T + 63) / 64, heads, 1), 64>>>(g_ws.scores, T, heads);
+            dim3 aggrid((hd + 15) / 16, (T + 15) / 16, heads);
+            k_attn_av_bh<<<aggrid, dim3(16, 16)>>>(g_ws.qkv, g_ws.scores, g_ws.ctx, T, I, hd,
+                                                   heads);
+            ok = ck(cudaGetLastError());
+        } else {
+            k_sdpa_online<<<grid2(heads, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.ctx, T, I, hd, heads);
             ok = ck(cudaGetLastError());
         }
 
         if (ok) {
             k_gemm_bf16_tiled<<<grid2(H, T), dim3(16, 16)>>>(g_ws.ctx, w_out, g_ws.attn, T, I, H);
-            k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.attn, g_ws.mod, T * H, H, has_mod, 2);
+            k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.attn, g_ws.mod, T * H, H, has_mod, 2,
+                                                  dmap, groups);
 
-            k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 3, 4);
+            k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 3, 4, dmap,
+                                      groups);
             k_gemm_bf16_tiled<<<grid2(2 * ffn, T), dim3(16, 16)>>>(g_ws.xn, w_fc1, g_ws.h1, T, H,
                                                                   2 * ffn);
             k_swiglu_pack<<<grid2(ffn, T), dim3(16, 16)>>>(g_ws.h1, g_ws.gated, T, ffn);
             k_gemm_bf16_tiled<<<grid2(H, T), dim3(16, 16)>>>(g_ws.gated, w_fc2, g_ws.down, T, ffn,
                                                             H);
-            k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.down, g_ws.mod, T * H, H, has_mod, 5);
+            k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.down, g_ws.mod, T * H, H, has_mod, 5,
+                                                  dmap, groups);
 
             ok = ck(cudaDeviceSynchronize()) &&
                  ck(cudaMemcpy(x, g_ws.x, sizeof(float) * static_cast<size_t>(T) * H,

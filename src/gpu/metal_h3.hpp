@@ -20,13 +20,14 @@ bool vendor_loaded();
 const char *vendor_status();
 
 // AdaLN / QK-norm / RoPE DiT residual. CPU fallback if Metal is missing or
-// the call fails. adaln_mod is [6, hidden] (scale0, shift0, scale1, shift1,
-// scale2, shift2). q_norm/k_norm are [head_dim] or null. rope_cos/sin are
-// [tokens, 48] or null (applied when head_dim >= 96, same as the CPU path).
+// the call fails. adaln_mod is [adaln_groups, 6, hidden]; row_map[t] selects
+// the group (null → group 0). q_norm/k_norm are [head_dim] or null.
+// rope_cos/sin are [tokens, 48] or null (applied when head_dim >= 96).
 bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
-                  const float *k_norm, const float *rope_cos, const float *rope_sin);
+                  const float *k_norm, const float *rope_cos, const float *rope_sin,
+                  const uint32_t *row_map = nullptr, int adaln_groups = 1);
 
 // Host port of the h3.c int8 GEMM. y[S,O] = x[S,I] @ W[O,I]^T with
 // int8-row weights and per-row scales. False on bad args.

@@ -2939,6 +2939,73 @@ static void test_h3_cuda_dit() {
             gemm_ok = gemm_ok && std::fabs(yc[static_cast<size_t>(i)] - yg[static_cast<size_t>(i)]) < 2e-4f;
         CHECK(gemm_ok);
     }
+
+    // 3-modality AdaLN: packed [3,6,H] + row_map. Group-0-only equals the
+    // original [6,H] contract; mixed groups change the residual; CUDA matches.
+    {
+        std::vector<float> mod3(static_cast<size_t>(3) * 6 * H, 0.f);
+        for (int g = 0; g < 3; ++g)
+            for (int sl = 0; sl < 6; ++sl)
+                for (int i = 0; i < H; ++i)
+                    mod3[static_cast<size_t>((g * 6 + sl) * H + i)] =
+                        static_cast<float>(g + 1) * 0.04f + static_cast<float>(sl - 2) * 0.015f;
+        std::vector<uint32_t> zmap(static_cast<size_t>(T), 0u);
+        std::vector<uint32_t> mmap(static_cast<size_t>(T), 0u);
+        mmap[0] = 0;
+        mmap[1] = 2;
+        if (T > 2)
+            mmap[2] = 1;
+        std::vector<float> x0(static_cast<size_t>(T) * H), x1(static_cast<size_t>(T) * H),
+            xm(static_cast<size_t>(T) * H), xg(static_cast<size_t>(T) * H);
+        for (int i = 0; i < T * H; ++i)
+            x0[static_cast<size_t>(i)] = x1[static_cast<size_t>(i)] = xm[static_cast<size_t>(i)] =
+                xg[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+        h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                         x0.data(), T, 1e-6f, mod3.data(), qn.data(), kn.data(), nullptr, nullptr);
+        h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                         x1.data(), T, 1e-6f, mod3.data(), qn.data(), kn.data(), nullptr, nullptr,
+                         zmap.data(), 3);
+        bool same0 = true;
+        for (int i = 0; i < T * H; ++i)
+            same0 = same0 && std::fabs(x0[static_cast<size_t>(i)] - x1[static_cast<size_t>(i)]) < 1e-6f;
+        CHECK(same0);
+        h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                         xm.data(), T, 1e-6f, mod3.data(), qn.data(), kn.data(), nullptr, nullptr,
+                         mmap.data(), 3);
+        float mix_d = 0.f;
+        for (int i = 0; i < T * H; ++i)
+            mix_d += std::fabs(xm[static_cast<size_t>(i)] - x0[static_cast<size_t>(i)]);
+        CHECK(mix_d > 1e-4f);
+        CHECK(h3_cuda::dit_residual(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn,
+                                    Ffn, hd, xg.data(), T, 1e-6f, mod3.data(), qn.data(), kn.data(),
+                                    nullptr, nullptr, mmap.data(), 3));
+        bool mix_match = true;
+        for (int i = 0; i < T * H; ++i)
+            mix_match = mix_match &&
+                        std::fabs(xm[static_cast<size_t>(i)] - xg[static_cast<size_t>(i)]) < 2e-4f;
+        CHECK(mix_match);
+    }
+
+    // Forced online SDPA must still match CPU (same AdaLN / QK-norm residual).
+    {
+        setenv("MVLLM_H3_CUDA_SDPA", "online", 1);
+        std::vector<float> xc_on(static_cast<size_t>(T) * H), xg_on(static_cast<size_t>(T) * H);
+        for (int i = 0; i < T * H; ++i)
+            xc_on[static_cast<size_t>(i)] = xg_on[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+        h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                         xc_on.data(), T, 1e-6f, mod.data(), qn.data(), kn.data(), nullptr,
+                         nullptr);
+        CHECK(h3_cuda::dit_residual(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn,
+                                    Ffn, hd, xg_on.data(), T, 1e-6f, mod.data(), qn.data(),
+                                    kn.data(), nullptr, nullptr));
+        bool on_match = true;
+        for (int i = 0; i < T * H; ++i)
+            on_match = on_match &&
+                       std::fabs(xc_on[static_cast<size_t>(i)] - xg_on[static_cast<size_t>(i)]) <
+                           2e-4f;
+        CHECK(on_match);
+        unsetenv("MVLLM_H3_CUDA_SDPA");
+    }
     h3_cuda::shutdown();
     CHECK(h3_cuda::workspace_bytes() == 0);
 }
@@ -3785,10 +3852,18 @@ static void test_h3_adaln_stream() {
         CHECK(st.mode() == H3AdalnMode::Stream);
         std::vector<float> temb(8, 1.f);
         std::vector<float> mod;
+        CHECK(st.w_rows(0) == 48);
+        CHECK(st.w_rows(1) == 144);
         CHECK(st.load_mod(0, temb.data(), 8, 48, mod));
         CHECK(max_abs(mod) > 0.f);
         CHECK(st.load_mod(1, temb.data(), 8, 48, mod));
         CHECK(max_abs(mod) > 0.f);
+        CHECK(st.load_mod(1, temb.data(), 8, 144, mod));
+        CHECK(mod.size() == 144);
+        CHECK(max_abs(mod) > 0.f);
+        std::vector<float> temb2(16, 1.f);
+        CHECK(st.load_mod(1, temb2.data(), 8, 144, mod, 2));
+        CHECK(mod.size() == 288);
         CHECK(st.load_mod(0, temb.data(), 8, 48, mod));
         CHECK(!mod.empty());
         CHECK(!st.load_mod(5, temb.data(), 8, 48, mod));
@@ -3829,10 +3904,12 @@ static void test_h3_adaln_stream() {
         CHECK(eh.load(edir, rt, err) == Status::Ok);
         std::string info = eh.info();
         CHECK(info.find("adaln=stream") != std::string::npos);
+        CHECK(info.find("3mod") != std::string::npos);
         CHECK(info.find("adaln=off") == std::string::npos);
         H3GenResult hr;
         run_gen(eh, edir + "/out_s.txt", hr);
         CHECK(hr.note.find("adaln_mod=on") != std::string::npos);
+        CHECK(hr.note.find("adaln_groups=") != std::string::npos);
         const float l2s = read_latent_l2(edir + "/out_s.txt");
 
         setenv("MVLLM_H3_ADALN_RESIDENT", "1", 1);
@@ -7211,6 +7288,13 @@ int main() {
         using namespace mvllm;
         CHECK(h3_adaln_out(1) == 18);
         CHECK(h3_adaln_out(0) == 0);
+        CHECK(h3_adaln_groups(18, 1, 1) == 3);
+        CHECK(h3_adaln_groups(6, 1, 2) == 2);
+        CHECK(h3_adaln_groups(5, 1, 1) == 1);
+        CHECK(h3_adaln_group_index(nullptr, 0, 3) == 0);
+        const unsigned int tags[2] = {2u, 9u};
+        CHECK(h3_adaln_group_index(tags, 0, 3) == 2);
+        CHECK(h3_adaln_group_index(tags, 1, 3) == 0);
         float x[2] = {1.f, 0.f};
         h3_silu(x, 2);
         CHECK_NEAR(x[0], 1.f / (1.f + std::exp(-1.f)), 1e-6);

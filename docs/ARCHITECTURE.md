@@ -325,7 +325,10 @@ nominal, cap `768*1344`. Ref2VA images are down-only; ref video never enlarges.
 PCG + Box-Muller seeds DiT noise. Independent video/audio sigma grids
 (`h3_schedule_build` / serving linear base), timestep row maps (shared row when
 `1-σ_v == 1-σ_a`, plus condition rows at 0.999/1.0), sinusoidal 256-d time
-features, AdaLN `row_map` by segment kind, and official RES multistep
+features, AdaLN `row_map` by segment kind (generate consumes `3*6*H` when
+the layer tensor is tall enough; `dit_residual` takes `[groups,6,H]` +
+per-token map), CUDA SDPA is batched-head (online when `heads*T*T*4>64MiB`
+or `MVLLM_H3_CUDA_SDPA=online`), and official RES multistep
 (`h3_res_step`; Euler when `next==0` or no previous denoised).
 
 K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R

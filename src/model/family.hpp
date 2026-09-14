@@ -8,6 +8,7 @@
 #include "../store/kv_persist.hpp"
 #include "../tok/tokenizer.hpp"
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -361,7 +362,8 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                       int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                       int tokens, float eps, const float *adaln_mod = nullptr,
                       const float *q_norm = nullptr, const float *k_norm = nullptr,
-                      const float *rope_cos = nullptr, const float *rope_sin = nullptr);
+                      const float *rope_cos = nullptr, const float *rope_sin = nullptr,
+                      const uint32_t *row_map = nullptr, int adaln_groups = 1);
 
 void attnres_mix(const std::vector<std::vector<float>> &snapshots, const float *prefix,
                  const float *res_norm, const float *res_proj, float *hidden, int n, float eps);

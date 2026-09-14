@@ -45,9 +45,11 @@ void H3AdalnStore::close() {
     hits_.clear();
     w_res_.clear();
     b_res_.clear();
+    w_rows_.clear();
     pref_w_.clear();
     pref_layer_ = -1;
     mode_ = H3AdalnMode::Off;
+    three_mod_n_ = 0;
 }
 
 bool H3AdalnStore::has(int layer) const {
@@ -78,7 +80,20 @@ const char *H3AdalnStore::tag() const {
     }
     if (skip_n_ > 0 && mode_ != H3AdalnMode::Off && mode_ != H3AdalnMode::Skip)
         tag_ += ",skip=" + std::to_string(skip_n_);
+    if (three_mod_n_ > 0 && mode_ != H3AdalnMode::Off && mode_ != H3AdalnMode::Skip)
+        tag_ += ",3mod";
     return tag_.c_str();
+}
+
+int H3AdalnStore::w_rows(int layer) const {
+    if (layer < 0)
+        return 0;
+    if (layer < static_cast<int>(w_rows_.size()) && w_rows_[static_cast<size_t>(layer)] > 0)
+        return w_rows_[static_cast<size_t>(layer)];
+    if (!files_.empty() && layer < static_cast<int>(hits_.size()) &&
+        hits_[static_cast<size_t>(layer)].usable)
+        return hits_[static_cast<size_t>(layer)].w_rows;
+    return 0;
 }
 
 void H3AdalnStore::wait_prefetch() {
@@ -91,6 +106,7 @@ void H3AdalnStore::bind(std::vector<io::StFile> &files, int n_blocks, int hidden
     hidden_ = hidden;
     cap_ = 0;
     skip_n_ = 0;
+    three_mod_n_ = 0;
 
     bool force_resident = false;
     if (const char *e = std::getenv("MVLLM_H3_ADALN_RESIDENT"))
@@ -122,8 +138,10 @@ void H3AdalnStore::bind(std::vector<io::StFile> &files, int n_blocks, int hidden
     hits_.assign(static_cast<size_t>(n_blocks), {});
     w_res_.assign(static_cast<size_t>(n_blocks), {});
     b_res_.assign(static_cast<size_t>(n_blocks), {});
+    w_rows_.assign(static_cast<size_t>(n_blocks), 0);
 
-    const int need = hidden >= 1 ? 6 * hidden : 0;
+    const int need = hidden >= 1 ? kH3AdalnSlots * hidden : 0;
+    const int need3 = hidden >= 1 ? h3_adaln_out(hidden) : 0;
     int usable_n = 0;
     for (int i = 0; i < n_blocks; ++i) {
         const std::string p = "blocks." + std::to_string(i) + ".";
@@ -136,8 +154,13 @@ void H3AdalnStore::bind(std::vector<io::StFile> &files, int n_blocks, int hidden
             const bool dtype_ok = dt == "BF16" || dt == "F32" || dt == "F32_";
             if (need > 0 && sh.size() == 2 && sh[0] >= need && sh[1] > 0 && dtype_ok) {
                 hits_[static_cast<size_t>(i)].cols = static_cast<int>(sh[1]);
+                const int rows = static_cast<int>(sh[0]);
+                hits_[static_cast<size_t>(i)].w_rows = rows;
                 hits_[static_cast<size_t>(i)].usable = true;
+                w_rows_[static_cast<size_t>(i)] = rows;
                 ++usable_n;
+                if (need3 > 0 && rows >= need3)
+                    ++three_mod_n_;
             } else {
                 ++skip_n_;
             }
@@ -158,7 +181,9 @@ void H3AdalnStore::bind(std::vector<io::StFile> &files, int n_blocks, int hidden
         }
         if (hits_[static_cast<size_t>(i)].usable && mode_ != H3AdalnMode::Skip &&
             (mode_ == H3AdalnMode::Resident || i < cap_)) {
-            h3_adaln_read_w(hits_[static_cast<size_t>(i)].w, need,
+            const int prefix = hits_[static_cast<size_t>(i)].w_rows;
+            const int take = (need3 > 0 && prefix > need3) ? need3 : prefix;
+            h3_adaln_read_w(hits_[static_cast<size_t>(i)].w, take,
                             hits_[static_cast<size_t>(i)].cols, w_res_[static_cast<size_t>(i)]);
         }
     }
@@ -171,6 +196,8 @@ void H3AdalnStore::bind(std::vector<io::StFile> &files, int n_blocks, int hidden
         hits_.clear();
         w_res_.clear();
         b_res_.clear();
+        w_rows_.clear();
+        three_mod_n_ = 0;
         return;
     }
     if (mode_ == H3AdalnMode::Resident || mode_ == H3AdalnMode::Off) {
@@ -207,14 +234,14 @@ void H3AdalnStore::prefetch(int layer, int td, int mrows) {
 }
 
 bool H3AdalnStore::load_mod(int layer, const float *temb, int td, int mrows,
-                           std::vector<float> &mod) {
+                           std::vector<float> &mod, int temb_rows) {
     wait_prefetch();
     std::lock_guard<std::mutex> g(mu_);
     auto fail = [&]() {
         mod.clear();
         return false;
     };
-    if (!has(layer) || !temb || td < 1 || mrows < 1)
+    if (!has(layer) || !temb || td < 1 || mrows < 1 || temb_rows < 1)
         return fail();
     const float *W = nullptr;
     std::vector<float> tmp;
@@ -238,12 +265,12 @@ bool H3AdalnStore::load_mod(int layer, const float *temb, int td, int mrows,
     }
     if (!W)
         return fail();
-    mod.assign(static_cast<size_t>(mrows), 0.f);
+    mod.assign(static_cast<size_t>(temb_rows) * static_cast<size_t>(mrows), 0.f);
     const float *bias = (layer < static_cast<int>(b_res_.size()) &&
                          b_res_[static_cast<size_t>(layer)].size() >= static_cast<size_t>(mrows))
                             ? b_res_[static_cast<size_t>(layer)].data()
                             : nullptr;
-    if (!h3_adaln_mod(temb, 1, td, W, bias, mrows, mod.data()))
+    if (!h3_adaln_mod(temb, temb_rows, td, W, bias, mrows, mod.data()))
         return fail();
     return true;
 }

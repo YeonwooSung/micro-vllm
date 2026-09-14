@@ -1,6 +1,8 @@
 #include "family.hpp"
+#include "h3_adaln.hpp"
 #include "h3_adaln_store.hpp"
 #include "h3_audio_vae.hpp"
+#include "h3_dit_schedule.hpp"
 #include "h3_layout.hpp"
 #include "h3_mm.hpp"
 #include "h3_text.hpp"
@@ -616,35 +618,91 @@ public:
                        cfg_.h3.audio_sigma_shift > 0.f ? cfg_.h3.audio_sigma_shift
                                                        : kH3AudioSigmaShift);
         const int tdim = cfg_.h3.time_input > 0 ? cfg_.h3.time_input : 256;
-        std::vector<float> tfeat(static_cast<size_t>(tdim), 0.f);
         const bool do_adaln = adaln_.mode() != H3AdalnMode::Off &&
                               adaln_.mode() != H3AdalnMode::Skip && !time_in_w_.empty() &&
                               !time_out_w_.empty();
         const int th = static_cast<int>(time_in_w_.size()) / std::max(tdim, 1);
         const int td = th > 0 ? static_cast<int>(time_out_w_.size()) / th : 0;
         const bool hoist_adaln = do_adaln && th > 0 && td > 0;
+        H3SigmaSchedule sch;
+        H3DitSchedule dit;
+        bool have_sched = false;
+        if (hoist_adaln && tdim == kH3TimeInput) {
+            const float vshift =
+                cfg_.h3.video_sigma_shift > 0.f ? cfg_.h3.video_sigma_shift : kH3VideoSigmaShift;
+            const float ashift = cfg_.h3.audio_sigma_shift > 0.f ? cfg_.h3.audio_sigma_shift
+                                                                 : kH3AudioSigmaShift;
+            if (h3_schedule_build(evals, sch, vshift, ashift) &&
+                dit.prepare(sch, layout.img_cond_rows > 0, layout.audio_cond_rows > 0))
+                have_sched = true;
+        }
+        std::vector<float> tfeat;
         std::vector<float> temb;
         std::vector<float> mod;
+        std::vector<uint32_t> rmap(static_cast<size_t>(seq), 0u);
+        std::vector<uint32_t> rmap_use(static_cast<size_t>(seq), 0u);
         bool any_mod = false;
+        int max_groups = 0;
         uint32_t ph = 0;
         for (unsigned char c : hp.prompt)
             ph = ph * 131u + c;
+        const int slot = 6 * hidden;
+        auto layer_mrows = [&](int layer) {
+            const int wr = adaln_.w_rows(layer);
+            if (wr >= h3_adaln_out(hidden) && h3_adaln_out(hidden) > 0)
+                return h3_adaln_out(hidden);
+            return slot;
+        };
         for (int s = 0; s < evals; ++s) {
             if (hp.on_progress)
                 hp.on_progress(s, evals, "denoise");
-            h3_time_features(1.f - sigmas[static_cast<size_t>(s)], tfeat.data(), tdim);
-            tfeat[0] += 0.01f * static_cast<float>(ph % 100u);
+            int temb_rows = 1;
+            if (have_sched) {
+                tfeat = dit.time_features();
+                temb_rows = static_cast<int>(dit.time_rows());
+                if (temb_rows < 1)
+                    temb_rows = 1;
+                const uint32_t vr = dit.video_row(s);
+                if (vr < dit.time_rows() && !tfeat.empty())
+                    tfeat[static_cast<size_t>(vr) * static_cast<size_t>(tdim)] +=
+                        0.01f * static_cast<float>(ph % 100u);
+                if (!(layout_ok && dit.row_map(s, layout, nullptr, 0, rmap.data(), seq)))
+                    std::fill(rmap.begin(), rmap.end(), 0u);
+            } else {
+                tfeat.assign(static_cast<size_t>(tdim), 0.f);
+                h3_time_features(1.f - sigmas[static_cast<size_t>(s)], tfeat.data(), tdim);
+                tfeat[0] += 0.01f * static_cast<float>(ph % 100u);
+                std::fill(rmap.begin(), rmap.end(), 0u);
+                if (layout_ok) {
+                    for (const H3Segment &seg : layout.segments) {
+                        uint32_t tag = 0;
+                        if (seg.kind == H3SegKind::Text)
+                            tag = 1;
+                        else if (seg.kind == H3SegKind::Audio || seg.kind == H3SegKind::RefAudio)
+                            tag = 2;
+                        for (int r = seg.start; r < seg.stop && r < seq; ++r)
+                            rmap[static_cast<size_t>(r)] = tag;
+                    }
+                }
+            }
             if (hoist_adaln) {
-                std::vector<float> hid(static_cast<size_t>(th), 0.f);
-                temb.assign(static_cast<size_t>(td), 0.f);
-                quant::matmul_f32(hid.data(), tfeat.data(), time_in_w_.data(), 1, tdim, th);
-                for (int i = 0; i < th && i < static_cast<int>(time_in_b_.size()); ++i)
-                    hid[static_cast<size_t>(i)] += time_in_b_[static_cast<size_t>(i)];
-                for (float &v : hid)
-                    v = v * quant::sigmoid(v);
-                quant::matmul_f32(temb.data(), hid.data(), time_out_w_.data(), 1, th, td);
-                for (int i = 0; i < td && i < static_cast<int>(time_out_b_.size()); ++i)
-                    temb[static_cast<size_t>(i)] += time_out_b_[static_cast<size_t>(i)];
+                std::vector<float> hid(static_cast<size_t>(temb_rows) * static_cast<size_t>(th),
+                                       0.f);
+                temb.assign(static_cast<size_t>(temb_rows) * static_cast<size_t>(td), 0.f);
+                quant::matmul_f32(hid.data(), tfeat.data(), time_in_w_.data(), temb_rows, tdim, th);
+                for (int r = 0; r < temb_rows; ++r) {
+                    float *hr = hid.data() + static_cast<size_t>(r) * th;
+                    for (int i = 0; i < th && i < static_cast<int>(time_in_b_.size()); ++i)
+                        hr[i] += time_in_b_[static_cast<size_t>(i)];
+                    for (int i = 0; i < th; ++i)
+                        hr[i] = hr[i] * quant::sigmoid(hr[i]);
+                }
+                quant::matmul_f32(temb.data(), hid.data(), time_out_w_.data(), temb_rows, th, td);
+                for (int r = 0; r < temb_rows; ++r) {
+                    float *tr = temb.data() + static_cast<size_t>(r) * td;
+                    for (int i = 0; i < td && i < static_cast<int>(time_out_b_.size()); ++i)
+                        tr[i] += time_out_b_[static_cast<size_t>(i)];
+                }
             }
             std::vector<float> prev = latent;
             for (int b = 0; b < layers; ++b) {
@@ -664,26 +722,45 @@ public:
                     if (b < static_cast<int>(k_norm_.size()) && !k_norm_[static_cast<size_t>(b)].empty())
                         kn = k_norm_[static_cast<size_t>(b)].data();
                     const float *mp = nullptr;
+                    const uint32_t *rp = nullptr;
+                    int groups = 1;
+                    int mrows = slot;
+                    if (hoist_adaln) {
+                        mrows = layer_mrows(b);
+                        mp = adaln_.load_mod(b, temb.data(), td, mrows, mod, temb_rows)
+                                 ? mod.data()
+                                 : nullptr;
+                        if (mp) {
+                            groups = h3_adaln_groups(mrows, hidden, temb_rows);
+                            const int mods = (hidden > 0 && mrows >= slot) ? mrows / slot : 1;
+                            if (mods == 1 && groups > 1) {
+                                for (int t = 0; t < seq; ++t)
+                                    rmap_use[static_cast<size_t>(t)] = rmap[static_cast<size_t>(t)] / 3u;
+                            } else {
+                                rmap_use = rmap;
+                            }
+                            rp = (groups > 1) ? rmap_use.data() : nullptr;
+                            if (groups > max_groups)
+                                max_groups = groups;
+                        }
+                    }
                     if (hoist_adaln)
-                        mp = adaln_.load_mod(b, temb.data(), td, 6 * hidden, mod) ? mod.data()
-                                                                                  : nullptr;
-                    if (hoist_adaln)
-                        adaln_.prefetch(b + 1, td, 6 * hidden);
+                        adaln_.prefetch(b + 1, td, layer_mrows(b + 1));
                     {
                         AccTimer t(t_attn_);
                         bool ran = false;
                         if (gpu::device() == Device::Cuda)
                             ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                         inner, ffn, hd, latent.data(), seq, 1e-6f,
-                                                        mp, qn, kn, r_cos, r_sin);
+                                                        mp, qn, kn, r_cos, r_sin, rp, groups);
                         if (!ran)
                             ran = metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                          inner, ffn, hd, latent.data(), seq, 1e-6f,
-                                                         mp, qn, kn, r_cos, r_sin);
+                                                         mp, qn, kn, r_cos, r_sin, rp, groups);
                         if (!ran)
                             h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
                                              hd, latent.data(), seq, 1e-6f, mp, qn, kn, r_cos,
-                                             r_sin);
+                                             r_sin, rp, groups);
                     }
                     if (mp)
                         any_mod = true;
@@ -876,7 +953,13 @@ public:
             out.note += " mux=mp4";
         else if (mux_skip)
             out.note += " mux=skip";
-        out.note += any_mod ? " adaln_mod=on" : " adaln_mod=off";
+        if (any_mod) {
+            out.note += " adaln_mod=on";
+            if (max_groups > 1)
+                out.note += " adaln_groups=" + std::to_string(max_groups);
+        } else {
+            out.note += " adaln_mod=off";
+        }
         err.clear();
         return Status::Ok;
     }
