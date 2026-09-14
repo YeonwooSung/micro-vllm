@@ -3186,6 +3186,67 @@ static void test_h3_cuda_dit() {
         CHECK(on_match);
         unsetenv("MVLLM_H3_CUDA_SDPA");
     }
+
+    // Official-like T=118 and long T=260: online, batched, and CPU must agree.
+    // Also 8 sequential residuals (longer denoise) stay finite and match CPU.
+    {
+        const int lens[2] = {118, 260};
+        for (int li = 0; li < 2; ++li) {
+            const int TL = lens[li];
+            std::vector<float> xcpu(static_cast<size_t>(TL) * H);
+            for (int i = 0; i < TL * H; ++i)
+                xcpu[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.04f;
+            std::vector<uint32_t> lmap(static_cast<size_t>(TL), 0u);
+            for (int t = 0; t < TL; ++t)
+                lmap[static_cast<size_t>(t)] = static_cast<uint32_t>(t % 3);
+            std::vector<float> mod3(static_cast<size_t>(3) * 6 * H, 0.f);
+            for (int g = 0; g < 3; ++g)
+                for (int sl = 0; sl < 6; ++sl)
+                    for (int i = 0; i < H; ++i)
+                        mod3[static_cast<size_t>((g * 6 + sl) * H + i)] =
+                            static_cast<float>(g + 1) * 0.03f + static_cast<float>(sl - 2) * 0.01f;
+            std::vector<float> xc = xcpu;
+            h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn,
+                             hd, xc.data(), TL, 1e-6f, mod3.data(), qn.data(), kn.data(), nullptr,
+                             nullptr, lmap.data(), 3);
+            const char *modes[2] = {"online", "batched"};
+            for (int mi = 0; mi < 2; ++mi) {
+                setenv("MVLLM_H3_CUDA_SDPA", modes[mi], 1);
+                std::vector<float> xg = xcpu;
+                CHECK(h3_cuda::dit_residual(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2,
+                                            H, Inn, Ffn, hd, xg.data(), TL, 1e-6f, mod3.data(),
+                                            qn.data(), kn.data(), nullptr, nullptr, lmap.data(),
+                                            3));
+                bool ok = true;
+                for (int i = 0; i < TL * H; ++i)
+                    ok = ok && std::fabs(xc[static_cast<size_t>(i)] - xg[static_cast<size_t>(i)]) <
+                                   3e-4f;
+                CHECK(ok);
+                unsetenv("MVLLM_H3_CUDA_SDPA");
+            }
+        }
+        setenv("MVLLM_H3_CUDA_SDPA", "online", 1);
+        std::vector<float> xstep_c(static_cast<size_t>(T) * H), xstep_g(static_cast<size_t>(T) * H);
+        for (int i = 0; i < T * H; ++i)
+            xstep_c[static_cast<size_t>(i)] = xstep_g[static_cast<size_t>(i)] =
+                ((i % 7) - 3) * 0.1f;
+        for (int s = 0; s < 8; ++s) {
+            h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn,
+                             hd, xstep_c.data(), T, 1e-6f, mod.data(), qn.data(), kn.data(),
+                             nullptr, nullptr);
+            CHECK(h3_cuda::dit_residual(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H,
+                                        Inn, Ffn, hd, xstep_g.data(), T, 1e-6f, mod.data(),
+                                        qn.data(), kn.data(), nullptr, nullptr));
+        }
+        bool step_ok = true;
+        for (int i = 0; i < T * H; ++i) {
+            step_ok = step_ok && std::isfinite(xstep_g[static_cast<size_t>(i)]) &&
+                      std::fabs(xstep_c[static_cast<size_t>(i)] - xstep_g[static_cast<size_t>(i)]) <
+                          3e-4f;
+        }
+        CHECK(step_ok);
+        unsetenv("MVLLM_H3_CUDA_SDPA");
+    }
     h3_cuda::shutdown();
     CHECK(h3_cuda::workspace_bytes() == 0);
 }
@@ -3843,6 +3904,86 @@ static void test_h3_checkpoint() {
     CHECK(hr.vae_used);
     CHECK(hr.frames == 5);
     CHECK(hr.width == 32 && hr.height == 32);
+
+    setenv("MVLLM_H3_CUDA_SDPA", "online", 1);
+    hp.steps = 8;
+    hp.width = 256;
+    hp.height = 256;
+    hp.frames = 8;
+    hp.output_path = dir + "/out_long.txt";
+    H3GenResult hr2;
+    CHECK(eh.generate_video(hp, hr2, err) == Status::Ok);
+    CHECK(hr2.steps_run == 8);
+    CHECK(hr2.width == 256 && hr2.height == 256);
+    CHECK(hr2.frames == 8);
+    CHECK(hr2.note.find("sdpa=online") != std::string::npos);
+    CHECK(hr2.note.find("sampler=res") != std::string::npos);
+    // 256x256 / 16 spatial, VAE align 22 → latent 7x16x16, 2x2 patch = 448.
+    // Default cap is 512 so this no longer slims (old cap 256 broke unpatchify).
+    CHECK(hr2.note.find("latent_tokens=448") != std::string::npos);
+    CHECK(hr2.note.find("latent_slimmed=") == std::string::npos);
+    unsetenv("MVLLM_H3_CUDA_SDPA");
+
+    setenv("MVLLM_H3_LATENT_CAP", "256", 1);
+    hp.output_path = dir + "/out_slim.txt";
+    H3GenResult hr3;
+    CHECK(eh.generate_video(hp, hr3, err) == Status::Ok);
+    CHECK(hr3.note.find("latent_slimmed=448") != std::string::npos);
+    CHECK(hr3.note.find("latent_tokens=224") != std::string::npos);
+    unsetenv("MVLLM_H3_LATENT_CAP");
+
+    {
+        std::string ndir = tmpdir();
+        write_file(ndir + "/config.json",
+                   R"({"model_type":"minimax_h3","architectures":["MiniMaxH3"]})");
+        const int nh = 8, ni = 4, nf = 8;
+        auto fill = [&](int64_t n) {
+            std::vector<uint8_t> raw(static_cast<size_t>(n) * 2);
+            auto *bf = reinterpret_cast<uint16_t *>(raw.data());
+            for (int64_t i = 0; i < n; ++i)
+                bf[i] = bf16_encode(((i * 17) % 11 - 5) * 0.08f);
+            return raw;
+        };
+        std::vector<T> nts;
+        for (int b = 0; b < 2; ++b) {
+            const std::string p = "blocks." + std::to_string(b) + ".";
+            nts.push_back({p + "attn.qkv_proj.weight", "BF16", {ni * 3, nh}, fill(ni * 3 * nh)});
+            nts.push_back({p + "attn.out_proj.weight", "BF16", {nh, ni}, fill(nh * ni)});
+            nts.push_back({p + "mlp.fc1.weight", "BF16", {nf * 2, nh}, fill(nf * 2 * nh)});
+            nts.push_back({p + "mlp.fc2.weight", "BF16", {nh, nf}, fill(nh * nf)});
+        }
+        write_safetensors_file(ndir + "/model.safetensors", nts);
+        Engine en;
+        CHECK(en.load(ndir, rt, err) == Status::Ok);
+        H3GenParams np = hp;
+        np.dit_layers = 2;
+        np.width = 32;
+        np.height = 32;
+        np.frames = 5;
+        np.seed = 1;
+        np.steps = 2;
+        np.output_path = ndir + "/s2.txt";
+        H3GenResult a, b;
+        CHECK(en.generate_video(np, a, err) == Status::Ok);
+        np.steps = 8;
+        np.output_path = ndir + "/s8.txt";
+        CHECK(en.generate_video(np, b, err) == Status::Ok);
+        CHECK(a.note.find("sampler=res") != std::string::npos);
+        CHECK(a.note.find("text_tokens=") != std::string::npos);
+        auto l2_of = [](const std::string &path) {
+            std::ifstream in(path);
+            std::string line;
+            while (std::getline(in, line)) {
+                const auto pos = line.find("latent_l2=");
+                if (pos != std::string::npos)
+                    return std::stof(line.substr(pos + 10));
+            }
+            return 0.f;
+        };
+        CHECK(std::fabs(l2_of(ndir + "/s2.txt") - l2_of(ndir + "/s8.txt")) > 1e-6f);
+        if (std::strcmp(mvllm::h3_cuda::backend_name(), "cuda") != 0)
+            CHECK(!mvllm::h3_cuda::last_on_device());
+    }
 }
 
 static std::vector<uint8_t> pack_f32_bytes(const std::vector<float> &v) {

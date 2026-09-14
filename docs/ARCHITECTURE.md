@@ -337,6 +337,14 @@ the layer tensor is tall enough; `dit_residual` takes `[groups,6,H]` +
 per-token map), CUDA SDPA is batched-head (online when `heads*T*T*4>64MiB`
 or `MVLLM_H3_CUDA_SDPA=online`), and official RES multistep
 (`h3_res_step`; Euler when `next==0` or no previous denoised).
+Generate applies RES only to audio/video tokens and freezes text/cond.
+Default video-patch cap is 512 (`MVLLM_H3_LATENT_CAP`, `0` = none); a
+smaller cap keeps a spatial prefix of the 2×2 patch grid so unpatchify
+still writes a contiguous latent block. Text tokens default to 128
+(`MVLLM_H3_TEXT_CAP`). `--frames N` still runs the VAE on an aligned
+length (`h3_align_frames`) and then uniformly subsamples the RGB to N.
+`describe`/note report `sampler=res`, `text_tokens=`, `latent_slimmed=`,
+and `dit` is `CUDA` only when every residual used the device kernels.
 
 K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R
 rows, optional DSA index). `nrec` is fsynced last. Mismatched geometry is

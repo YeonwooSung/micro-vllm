@@ -310,6 +310,8 @@ public:
                                (vg.latent_w % 2 == 0);
         const int patch = 96;
         int tokens = 0;
+        int tokens_full = 0;
+        int pack_lt = vg.latent_t, pack_lh = vg.latent_h, pack_lw = vg.latent_w;
         std::vector<float> rows;
         std::vector<float> latent;
         {
@@ -326,18 +328,55 @@ public:
                         rows[static_cast<size_t>(i) * patch + d] =
                             z[static_cast<size_t>(d % C) * nlat + i];
             }
-            const int cap = 256;
-            if (tokens > cap) {
-                const int keep = cap;
-                std::vector<float> slim(static_cast<size_t>(keep) * patch);
-                for (int i = 0; i < keep; ++i) {
-                    int src = i * tokens / keep;
+            // 256x256 official is 448 patches; the old default 256 broke unpatchify.
+            int cap = 512;
+            if (const char *ce = std::getenv("MVLLM_H3_LATENT_CAP")) {
+                const int v = std::atoi(ce);
+                if (v == 0)
+                    cap = tokens;
+                else if (v > 0)
+                    cap = v;
+            }
+            tokens_full = tokens;
+            if (can_patch && tokens > cap) {
+                const int nh = vg.latent_h / 2;
+                const int nw = vg.latent_w / 2;
+                const int nt = vg.latent_t;
+                int nt2 = nt, nh2 = nh, nw2 = nw;
+                while (nt2 * nh2 * nw2 > cap && nh2 > 1)
+                    --nh2;
+                while (nt2 * nh2 * nw2 > cap && nw2 > 1)
+                    --nw2;
+                while (nt2 * nh2 * nw2 > cap && nt2 > 1)
+                    --nt2;
+                if (nt2 * nh2 * nw2 >= 1 && nt2 * nh2 * nw2 < tokens) {
+                    std::vector<float> slim(static_cast<size_t>(nt2 * nh2 * nw2) * patch);
+                    int o = 0;
+                    for (int ti = 0; ti < nt2; ++ti)
+                        for (int y = 0; y < nh2; ++y)
+                            for (int x = 0; x < nw2; ++x) {
+                                const int src = (ti * nh + y) * nw + x;
+                                std::memcpy(slim.data() + static_cast<size_t>(o) * patch,
+                                            rows.data() + static_cast<size_t>(src) * patch,
+                                            static_cast<size_t>(patch) * sizeof(float));
+                                ++o;
+                            }
+                    rows.swap(slim);
+                    tokens = nt2 * nh2 * nw2;
+                    pack_lt = nt2;
+                    pack_lh = nh2 * 2;
+                    pack_lw = nw2 * 2;
+                }
+            } else if (!can_patch && tokens > cap) {
+                std::vector<float> slim(static_cast<size_t>(cap) * patch);
+                for (int i = 0; i < cap; ++i) {
+                    const int src = i * tokens / cap;
                     std::memcpy(slim.data() + static_cast<size_t>(i) * patch,
                                 rows.data() + static_cast<size_t>(src) * patch,
                                 static_cast<size_t>(patch) * sizeof(float));
                 }
                 rows.swap(slim);
-                tokens = keep;
+                tokens = cap;
             }
             latent.assign(static_cast<size_t>(tokens) * hidden, 0.f);
             for (int i = 0; i < tokens; ++i)
@@ -424,15 +463,31 @@ public:
             }
             if (th.empty()) {
                 std::vector<int> tids;
-                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, 16);
+                int id_cap = 128;
+                if (const char *te = std::getenv("MVLLM_H3_TEXT_CAP")) {
+                    const int v = std::atoi(te);
+                    if (v == 0)
+                        id_cap = 4096;
+                    else if (v > 0)
+                        id_cap = v;
+                }
+                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, id_cap);
                 text_.encode(tids, th);
             }
             text_.release_embed();
             const int thid = text_.config().hidden;
             if (!th.empty() && thid > 0) {
                 text_tokens = static_cast<int>(th.size() / static_cast<size_t>(thid));
-                if (text_tokens > 16)
-                    text_tokens = 16;
+                int text_cap = 128;
+                if (const char *te = std::getenv("MVLLM_H3_TEXT_CAP")) {
+                    const int v = std::atoi(te);
+                    if (v == 0)
+                        text_cap = text_tokens;
+                    else if (v > 0)
+                        text_cap = v;
+                }
+                if (text_tokens > text_cap)
+                    text_tokens = text_cap;
                 tproj.assign(static_cast<size_t>(text_tokens) * hidden, 0.f);
                 AccTimer tm(t_emm_);
                 if (!cond_w_.empty() && static_cast<int>(cond_w_.size()) >= hidden * thid) {
@@ -602,9 +657,33 @@ public:
                     }
                     rows[static_cast<size_t>(i) * patch + d] = n > 0 ? acc / static_cast<float>(n) : 0.f;
                 }
-            if (can_patch && tokens == vg.latent_t * (vg.latent_h / 2) * (vg.latent_w / 2))
-                h3_dit_unpatchify(rows.data(), C, vg.latent_t, vg.latent_h, vg.latent_w, z.data());
-            else {
+            if (can_patch && tokens == pack_lt * (pack_lh / 2) * (pack_lw / 2) && pack_lh >= 2 &&
+                pack_lw >= 2) {
+                if (pack_lt == vg.latent_t && pack_lh == vg.latent_h && pack_lw == vg.latent_w)
+                    h3_dit_unpatchify(rows.data(), C, vg.latent_t, vg.latent_h, vg.latent_w,
+                                      z.data());
+                else {
+                    const int nsmall = pack_lt * pack_lh * pack_lw;
+                    std::vector<float> zs(static_cast<size_t>(C) * nsmall, 0.f);
+                    h3_dit_unpatchify(rows.data(), C, pack_lt, pack_lh, pack_lw, zs.data());
+                    for (int c = 0; c < C; ++c)
+                        for (int t = 0; t < pack_lt; ++t)
+                            for (int y = 0; y < pack_lh; ++y)
+                                for (int x = 0; x < pack_lw; ++x) {
+                                    const size_t si = ((static_cast<size_t>(c) * pack_lt + t) *
+                                                           pack_lh +
+                                                       y) *
+                                                          pack_lw +
+                                                      x;
+                                    const size_t di =
+                                        ((static_cast<size_t>(c) * vg.latent_t + t) * vg.latent_h +
+                                         y) *
+                                            vg.latent_w +
+                                        x;
+                                    z[di] = zs[si];
+                                }
+                }
+            } else {
                 for (int i = 0; i < std::min(tokens, nlat); ++i)
                     for (int c = 0; c < C; ++c)
                         z[static_cast<size_t>(c) * nlat + i] = rows[static_cast<size_t>(i) * patch + c];
@@ -645,6 +724,10 @@ public:
         std::vector<uint32_t> rmap_use(static_cast<size_t>(seq), 0u);
         bool any_mod = false;
         int max_groups = 0;
+        int dit_calls = 0;
+        int cuda_hits = 0;
+        std::vector<float> old_vid;
+        std::vector<float> old_aud;
         uint32_t ph = 0;
         for (unsigned char c : hp.prompt)
             ph = ph * 131u + c;
@@ -751,10 +834,14 @@ public:
                     {
                         AccTimer t(t_attn_);
                         bool ran = false;
-                        if (gpu::device() == Device::Cuda)
+                        ++dit_calls;
+                        if (gpu::device() == Device::Cuda) {
                             ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                         inner, ffn, hd, latent.data(), seq, 1e-6f,
                                                         mp, qn, kn, r_cos, r_sin, rp, groups);
+                            if (ran && h3_cuda::last_on_device())
+                                ++cuda_hits;
+                        }
                         if (!ran && official_metal::h3_available())
                             ran = official_metal::dit_residual(
                                 data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
@@ -784,28 +871,29 @@ public:
                 blocks_.release(b);
             }
             if (computed) {
-                std::vector<float> vel(latent.size());
-                for (size_t i = 0; i < latent.size(); ++i)
-                    vel[i] = latent[i] - prev[i];
-                latent = prev;
-                if (audio_rows > 0) {
-                    if (audio_off > 0)
-                        h3_euler_step(latent.data(), vel.data(), audio_off * hidden,
-                                      sigmas[static_cast<size_t>(s)],
-                                      sigmas[static_cast<size_t>(s) + 1]);
-                    h3_euler_step(latent.data() + static_cast<size_t>(audio_off) * hidden,
-                                  vel.data() + static_cast<size_t>(audio_off) * hidden,
-                                  audio_rows * hidden, asigmas[static_cast<size_t>(s)],
-                                  asigmas[static_cast<size_t>(s) + 1]);
-                    h3_euler_step(latent.data() + static_cast<size_t>(video_off) * hidden,
-                                  vel.data() + static_cast<size_t>(video_off) * hidden,
-                                  tokens * hidden, sigmas[static_cast<size_t>(s)],
-                                  sigmas[static_cast<size_t>(s) + 1]);
-                } else {
-                    h3_euler_step(latent.data(), vel.data(), static_cast<int>(latent.size()),
-                                  sigmas[static_cast<size_t>(s)],
-                                  sigmas[static_cast<size_t>(s) + 1]);
-                }
+                // Keep text/cond tokens as the encoded condition. Official RES
+                // treats DiT output as x0; do not Euler-step the prompt.
+                if (audio_off > 0)
+                    std::memcpy(latent.data(), prev.data(),
+                                static_cast<size_t>(audio_off) * hidden * sizeof(float));
+                auto step_seg = [&](int off, int rows, const float *sig, std::vector<float> &oldd) {
+                    if (rows <= 0 || off < 0)
+                        return;
+                    const int n = rows * hidden;
+                    const size_t base = static_cast<size_t>(off) * hidden;
+                    std::vector<float> nxt(static_cast<size_t>(n));
+                    const float *oldp = oldd.size() == static_cast<size_t>(n) ? oldd.data() : nullptr;
+                    if (h3_res_step(nxt.data(), prev.data() + base, latent.data() + base, oldp, n,
+                                    sig, s, evals) == 1) {
+                        oldd.assign(latent.data() + base, latent.data() + base + n);
+                        std::memcpy(prev.data() + base, nxt.data(),
+                                    static_cast<size_t>(n) * sizeof(float));
+                    }
+                };
+                if (audio_rows > 0)
+                    step_seg(audio_off, audio_rows, asigmas.data(), old_aud);
+                step_seg(video_off, tokens, sigmas.data(), old_vid);
+                latent.swap(prev);
             }
         }
         {
@@ -833,6 +921,19 @@ public:
 
         std::vector<float> rgb(static_cast<size_t>(vg.frames) * vg.height * vg.width * 3, 0.f);
         vae_.decode(z.data(), vg, rgb.data());
+        int out_frames = vg.frames;
+        if (hp.frames > 0 && hp.frames < vg.frames) {
+            const int want = hp.frames;
+            const size_t fpix = static_cast<size_t>(vg.height) * vg.width * 3;
+            std::vector<float> slim(static_cast<size_t>(want) * fpix);
+            for (int i = 0; i < want; ++i) {
+                const int src = i * vg.frames / want;
+                std::memcpy(slim.data() + static_cast<size_t>(i) * fpix,
+                            rgb.data() + static_cast<size_t>(src) * fpix, fpix * sizeof(float));
+            }
+            rgb.swap(slim);
+            out_frames = want;
+        }
         if (hp.on_progress)
             hp.on_progress(evals, evals, "vae");
         vae_.geom = vg;
@@ -841,7 +942,7 @@ public:
 
         out.blocks_streamed = streamed;
         out.steps_run = evals;
-        out.frames = vg.frames;
+        out.frames = out_frames;
         out.width = vg.width;
         out.height = vg.height;
         out.vae_used = true;
@@ -850,10 +951,12 @@ public:
         out.audio_rate = kH3AudioRate;
         out.output_path = hp.output_path.empty() ? (model_dir_ + "/h3_dryrun.txt") : hp.output_path;
         const char *dit_tag = "CPU";
-        if (std::strcmp(gpu::name(), "metal") == 0)
-            dit_tag = "Metal";
-        else if (std::strcmp(gpu::name(), "cuda") == 0)
+        if (cuda_hits > 0 && dit_calls > 0 && cuda_hits == dit_calls)
             dit_tag = "CUDA";
+        else if (cuda_hits > 0)
+            dit_tag = "CUDA+CPU";
+        else if (std::strcmp(gpu::name(), "metal") == 0)
+            dit_tag = "Metal";
         const bool ppm = ends_with(out.output_path, ".ppm");
         const bool raw = ends_with(out.output_path, ".rgb");
         const bool wav = ends_with(out.output_path, ".wav");
@@ -868,12 +971,12 @@ public:
         }
         if (mp4) {
             std::string merr;
-            Status mst = h3_write_mp4(out.output_path, rgb.data(), vg.frames, vg.height, vg.width, 24,
+            Status mst = h3_write_mp4(out.output_path, rgb.data(), out_frames, vg.height, vg.width, 24,
                                       pcm.data(), kH3AudioStereo, out.audio_samples, out.audio_rate,
                                       merr);
             if (mst == Status::Unsupported) {
                 mux_skip = true;
-                h3_write_ppm(out.output_path + ".ppm", rgb.data(), vg.frames, vg.height, vg.width,
+                h3_write_ppm(out.output_path + ".ppm", rgb.data(), out_frames, vg.height, vg.width,
                              err);
                 err.clear();
             } else if (mst != Status::Ok) {
@@ -883,7 +986,7 @@ public:
                 muxed = true;
             }
         } else if (ppm) {
-            Status wst = h3_write_ppm(out.output_path, rgb.data(), vg.frames, vg.height, vg.width, err);
+            Status wst = h3_write_ppm(out.output_path, rgb.data(), out_frames, vg.height, vg.width, err);
             if (wst != Status::Ok)
                 return wst;
         } else if (raw) {
@@ -892,7 +995,7 @@ public:
                 err = "h3: open rgb failed: " + out.output_path;
                 return Status::IoError;
             }
-            const size_t npix = static_cast<size_t>(vg.frames) * vg.height * vg.width * 3;
+            const size_t npix = static_cast<size_t>(out_frames) * vg.height * vg.width * 3;
             std::vector<unsigned char> bytes(npix);
             for (size_t i = 0; i < npix; ++i) {
                 float v = rgb[i];
@@ -909,7 +1012,7 @@ public:
                 std::ofstream f(out.output_path);
                 f << "micro-vllm H3\n"
                   << "prompt: " << hp.prompt << "\n"
-                  << "canvas: " << vg.width << "x" << vg.height << " frames=" << vg.frames << "\n"
+                  << "canvas: " << vg.width << "x" << vg.height << " frames=" << out_frames << "\n"
                   << "steps=" << steps << " reuse=" << reuse << " layers=" << layers << "\n"
                   << "blocks_streamed=" << streamed << " cpu_blocks=" << computed
                   << " slots=" << blocks_.n_slots() << "\n"
@@ -924,7 +1027,7 @@ public:
                   << "\n";
             }
             std::string ppath = out.output_path + ".ppm";
-            h3_write_ppm(ppath, rgb.data(), vg.frames, vg.height, vg.width, err);
+            h3_write_ppm(ppath, rgb.data(), out_frames, vg.height, vg.width, err);
             err.clear();
         }
         out.note = computed ? std::string("checkpoint: ") + dit_tag +
@@ -934,8 +1037,15 @@ public:
                         ? " vae=official"
                         : (vae_.from_checkpoint ? " vae=real" : " vae=synth");
         out.note += " latent_tokens=" + std::to_string(tokens);
+        if (tokens_full > tokens)
+            out.note += " latent_slimmed=" + std::to_string(tokens_full);
         out.note += can_patch ? " patchify=2x2" : " patchify=flat";
-        out.note += " euler";
+        if (const char *sdpa = std::getenv("MVLLM_H3_CUDA_SDPA")) {
+            if (sdpa[0])
+                out.note += std::string(" sdpa=") + sdpa;
+        }
+        out.note += " sampler=res";
+        out.note += " text_tokens=" + std::to_string(text_tokens);
         if (text_tokens > 0)
             out.note += text_.from_checkpoint()
                             ? (text_.streamed() ? " text=qwen-stream" : " text=qwen")

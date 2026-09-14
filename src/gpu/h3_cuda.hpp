@@ -17,6 +17,8 @@ void shutdown();
 bool available();
 const char *backend_name(); // "cuda" or "cpu"
 size_t workspace_bytes();   // 0 if nothing allocated
+// True if the last dit_residual ran the device kernels (not the CPU fallback).
+bool last_on_device();
 
 // AdaLN / QK-norm / RoPE DiT residual. CPU fallback if CUDA is missing or
 // the device call fails. adaln_mod is [adaln_groups, 6, hidden]; row_map[t]
