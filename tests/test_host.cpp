@@ -33,6 +33,7 @@
 #include "model/h3_dit_schedule.hpp"
 #include "model/h3_canvas.hpp"
 #include "model/h3_adaln.hpp"
+#include "model/h3_adaln_store.hpp"
 #include "model/h3_reuse.hpp"
 #include "model/h3_token_reduce.hpp"
 #include "model/moe_pick.hpp"
@@ -2836,6 +2837,21 @@ static void test_h3_cuda_dit() {
     for (int i = 0; i < T * H; ++i)
         h3cuda_match = h3cuda_match && std::fabs(xc[static_cast<size_t>(i)] - xg[static_cast<size_t>(i)]) < 2e-4f;
     CHECK(h3cuda_match);
+    const size_t ws_after_t3 = h3_cuda::workspace_bytes();
+    std::vector<float> xg2 = xg;
+    for (int i = 0; i < T * H; ++i)
+        xg2[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+    const bool h3cuda_reuse = h3_cuda::dit_residual(
+        blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd, xg2.data(), T,
+        1e-6f, mod.data(), qn.data(), kn.data(), nullptr, nullptr);
+    CHECK(h3cuda_reuse);
+    bool h3cuda_reuse_match = true;
+    for (int i = 0; i < T * H; ++i)
+        h3cuda_reuse_match =
+            h3cuda_reuse_match &&
+            std::fabs(xc[static_cast<size_t>(i)] - xg2[static_cast<size_t>(i)]) < 2e-4f;
+    CHECK(h3cuda_reuse_match);
+    CHECK(h3_cuda::workspace_bytes() == ws_after_t3);
 
     const int Tw = 300;
     std::vector<float> xcw(static_cast<size_t>(Tw) * H), xgw(static_cast<size_t>(Tw) * H);
@@ -2853,6 +2869,8 @@ static void test_h3_cuda_dit() {
             h3cuda_wide_match &&
             std::fabs(xcw[static_cast<size_t>(i)] - xgw[static_cast<size_t>(i)]) < 2e-4f;
     CHECK(h3cuda_wide_match);
+    const size_t ws_after_t300 = h3_cuda::workspace_bytes();
+    CHECK(ws_after_t300 >= ws_after_t3);
 
     // RoPE path (hd >= 96): CPU vs h3_cuda, including AdaLN + QK-norm.
     const int Hr = 96, Ir = 96, Fr = 8, Tr = 2, hdr = 96;
@@ -2898,7 +2916,11 @@ static void test_h3_cuda_dit() {
     // suite only compared the CPU fallback to itself.
     const bool h3cuda_live = std::strcmp(h3_cuda::backend_name(), "cuda") == 0;
     CHECK(h3cuda_live);
+    CHECK(ws_after_t3 > 0);
+    CHECK(ws_after_t300 > ws_after_t3);
 #endif
+    h3_cuda::shutdown();
+    CHECK(h3_cuda::workspace_bytes() == 0);
 }
 
 static void test_llama_dims_helpers() {
@@ -3525,6 +3547,7 @@ static void test_h3_checkpoint() {
     CHECK(eh.config().h3.ffn == ffn);
     std::string info = eh.info();
     CHECK(info.find("checkpoint=yes") != std::string::npos);
+    CHECK(info.find("adaln=off") != std::string::npos);
     H3GenParams hp;
     hp.prompt = "fox";
     hp.steps = 2;
@@ -3544,6 +3567,327 @@ static void test_h3_checkpoint() {
     CHECK(hr.vae_used);
     CHECK(hr.frames == 5);
     CHECK(hr.width == 32 && hr.height == 32);
+}
+
+static std::vector<uint8_t> pack_f32_bytes(const std::vector<float> &v) {
+    std::vector<uint8_t> b(v.size() * sizeof(float));
+    if (!v.empty())
+        std::memcpy(b.data(), v.data(), b.size());
+    return b;
+}
+
+static std::vector<uint8_t> pack_bf16_bytes(const std::vector<float> &v) {
+    std::vector<uint8_t> b(v.size() * 2);
+    uint16_t *p = reinterpret_cast<uint16_t *>(b.data());
+    for (size_t i = 0; i < v.size(); ++i)
+        p[i] = mvllm::bf16_encode(v[i]);
+    return b;
+}
+
+static float read_latent_l2(const std::string &path) {
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto pos = line.find("latent_l2=");
+        if (pos != std::string::npos)
+            return std::stof(line.substr(pos + 10));
+    }
+    return 0.f;
+}
+
+static float max_abs(const std::vector<float> &v) {
+    float m = 0.f;
+    for (float x : v)
+        m = std::max(m, std::fabs(x));
+    return m;
+}
+
+static void test_h3_adaln_stream() {
+    using namespace mvllm;
+    const char *old_max = std::getenv("MVLLM_H3_ADALN_MAX");
+    const char *old_res = std::getenv("MVLLM_H3_ADALN_RESIDENT");
+    const std::string keep_max = old_max ? old_max : "";
+    const std::string keep_res = old_res ? old_res : "";
+    const bool had_max = old_max != nullptr;
+    const bool had_res = old_res != nullptr;
+    unsetenv("MVLLM_H3_ADALN_MAX");
+    unsetenv("MVLLM_H3_ADALN_RESIDENT");
+
+    auto restore_env = [&]() {
+        if (had_max)
+            setenv("MVLLM_H3_ADALN_MAX", keep_max.c_str(), 1);
+        else
+            unsetenv("MVLLM_H3_ADALN_MAX");
+        if (had_res)
+            setenv("MVLLM_H3_ADALN_RESIDENT", keep_res.c_str(), 1);
+        else
+            unsetenv("MVLLM_H3_ADALN_RESIDENT");
+    };
+
+    auto fill = [](int n, float scale) {
+        std::vector<float> v(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i)
+            v[static_cast<size_t>(i)] = static_cast<float>((i % 8) + 1) * scale;
+        return v;
+    };
+
+    std::string hdir = tmpdir();
+    using T = std::tuple<std::string, std::string, std::vector<int64_t>, std::vector<uint8_t>>;
+    std::vector<float> w12 = fill(12 * 4, 0.125f);
+    std::vector<float> w36 = fill(36 * 4, 0.125f);
+    std::vector<float> w_f32 = fill(12 * 4, 0.25f);
+    std::vector<float> w_wide = fill(12 * 8, 0.125f);
+    std::vector<float> b12 = fill(12, 0.5f);
+    std::vector<T> hts;
+    hts.push_back({"blocks.0.adaln_proj.linear.weight", "BF16", {12, 4}, pack_bf16_bytes(w12)});
+    hts.push_back({"blocks.0.adaln_proj.linear.bias", "F32", {12}, pack_f32_bytes(b12)});
+    hts.push_back({"blocks.1.adaln_proj.linear.weight", "BF16", {36, 4}, pack_bf16_bytes(w36)});
+    hts.push_back({"blocks.1.adaln_proj.linear.bias", "F32", {12}, pack_f32_bytes(b12)});
+    hts.push_back({"f32_w", "F32", {12, 4}, pack_f32_bytes(w_f32)});
+    hts.push_back({"wide_w", "BF16", {12, 8}, pack_bf16_bytes(w_wide)});
+    write_safetensors_file(hdir + "/model.safetensors", hts);
+
+    {
+        io::StFile f;
+        std::string err;
+        CHECK(io::st_open(hdir + "/model.safetensors", f, err) == Status::Ok);
+        io::StHit w0{&f, io::st_find(f, "blocks.0.adaln_proj.linear.weight")};
+        io::StHit wt{&f, io::st_find(f, "blocks.1.adaln_proj.linear.weight")};
+        io::StHit wf{&f, io::st_find(f, "f32_w")};
+        io::StHit ww{&f, io::st_find(f, "wide_w")};
+        CHECK(w0.tensor && wt.tensor && wf.tensor && ww.tensor);
+
+        std::vector<float> pref, full;
+        CHECK(h3_adaln_read_w(w0, 12, 4, pref));
+        full.assign(12 * 4, 0.f);
+        CHECK(io::st_read_f32(*w0.file, *w0.tensor, full.data(), 12 * 4, err) == Status::Ok);
+        CHECK(pref.size() == full.size());
+        bool same = true;
+        for (size_t i = 0; i < pref.size(); ++i)
+            same = same && pref[i] == full[i];
+        CHECK(same);
+
+        std::vector<float> pref12, all36;
+        CHECK(h3_adaln_read_w(wt, 12, 4, pref12));
+        all36.assign(36 * 4, 0.f);
+        CHECK(io::st_read_f32(*wt.file, *wt.tensor, all36.data(), 36 * 4, err) == Status::Ok);
+        bool pref_ok = pref12.size() == 12 * 4;
+        for (size_t i = 0; i < pref12.size(); ++i)
+            pref_ok = pref_ok && pref12[i] == all36[i];
+        CHECK(pref_ok);
+
+        std::vector<float> fpref, ffull;
+        CHECK(h3_adaln_read_w(wf, 12, 4, fpref));
+        ffull.assign(12 * 4, 0.f);
+        CHECK(io::st_read_f32(*wf.file, *wf.tensor, ffull.data(), 12 * 4, err) == Status::Ok);
+        bool f_ok = fpref.size() == ffull.size();
+        for (size_t i = 0; i < fpref.size(); ++i)
+            f_ok = f_ok && fpref[i] == ffull[i];
+        CHECK(f_ok);
+
+        std::vector<float> bad;
+        CHECK(!h3_adaln_read_w(ww, 12, 4, bad));
+        io::st_close(f);
+    }
+
+    {
+        std::vector<float> temb(4, 1.f);
+        std::vector<float> ms0, ms1, mr0, mr1;
+        {
+            std::vector<io::StFile> files;
+            std::string err;
+            CHECK(io::st_open_dir(hdir, files, err) == Status::Ok);
+            H3AdalnStore st;
+            st.bind(files, 2, 2);
+            CHECK(st.mode() == H3AdalnMode::Stream);
+            CHECK(st.load_mod(0, temb.data(), 4, 12, ms0));
+            CHECK(st.load_mod(1, temb.data(), 4, 12, ms1));
+        }
+        setenv("MVLLM_H3_ADALN_RESIDENT", "1", 1);
+        {
+            std::vector<io::StFile> files;
+            std::string err;
+            CHECK(io::st_open_dir(hdir, files, err) == Status::Ok);
+            H3AdalnStore st;
+            st.bind(files, 2, 2);
+            CHECK(st.mode() == H3AdalnMode::Resident);
+            CHECK(st.load_mod(0, temb.data(), 4, 12, mr0));
+            CHECK(st.load_mod(1, temb.data(), 4, 12, mr1));
+            st.prefetch(1, 4, 12);
+            std::vector<float> miss = mr0;
+            CHECK(!st.load_mod(9, temb.data(), 4, 12, miss));
+            CHECK(miss.empty());
+        }
+        unsetenv("MVLLM_H3_ADALN_RESIDENT");
+        CHECK(ms0.size() == mr0.size() && ms1.size() == mr1.size());
+        bool eq = !ms0.empty() && !ms1.empty();
+        for (size_t i = 0; i < ms0.size(); ++i)
+            eq = eq && std::fabs(ms0[i] - mr0[i]) < 1e-5f;
+        for (size_t i = 0; i < ms1.size(); ++i)
+            eq = eq && std::fabs(ms1[i] - mr1[i]) < 1e-5f;
+        CHECK(eq);
+    }
+
+    const int hidden = 8, inner = 4, ffn = 8;
+    std::string edir = tmpdir();
+    write_file(edir + "/config.json", R"({"model_type":"minimax_h3","architectures":["MiniMaxH3"]})");
+    auto bf16z = [&](size_t n) { return std::vector<uint8_t>(n * 2, 0); };
+    std::vector<T> ets;
+    for (int b = 0; b < 2; ++b) {
+        std::string p = "blocks." + std::to_string(b) + ".";
+        ets.push_back({p + "attn.qkv_proj.weight", "BF16", {inner * 3, hidden},
+                       bf16z(static_cast<size_t>(inner * 3 * hidden))});
+        ets.push_back({p + "attn.out_proj.weight", "BF16", {hidden, inner},
+                       bf16z(static_cast<size_t>(hidden * inner))});
+        ets.push_back({p + "mlp.fc1.weight", "BF16", {ffn * 2, hidden},
+                       bf16z(static_cast<size_t>(ffn * 2 * hidden))});
+        ets.push_back({p + "mlp.fc2.weight", "BF16", {hidden, ffn},
+                       bf16z(static_cast<size_t>(hidden * ffn))});
+    }
+    ets.push_back({"time_embedder.proj_in.weight", "F32", {8, 256}, pack_f32_bytes(fill(8 * 256, 0.125f))});
+    ets.push_back({"time_embedder.proj_in.bias", "F32", {8}, pack_f32_bytes(fill(8, 0.25f))});
+    ets.push_back({"time_embedder.proj_out.weight", "F32", {8, 8}, pack_f32_bytes(fill(8 * 8, 0.125f))});
+    ets.push_back({"time_embedder.proj_out.bias", "F32", {8}, pack_f32_bytes(fill(8, 0.25f))});
+    ets.push_back({"blocks.0.adaln_proj.linear.weight", "BF16", {48, 8},
+                   pack_bf16_bytes(fill(48 * 8, 0.125f))});
+    ets.push_back({"blocks.0.adaln_proj.linear.bias", "F32", {48}, pack_f32_bytes(fill(48, 0.25f))});
+    ets.push_back({"blocks.1.adaln_proj.linear.weight", "BF16", {144, 8},
+                   pack_bf16_bytes(fill(144 * 8, 0.125f))});
+    ets.push_back({"blocks.1.adaln_proj.linear.bias", "F32", {144}, pack_f32_bytes(fill(144, 0.25f))});
+    write_safetensors_file(edir + "/model.safetensors", ets);
+
+    {
+        std::vector<io::StFile> files;
+        std::string err;
+        CHECK(io::st_open_dir(edir, files, err) == Status::Ok);
+        H3AdalnStore st;
+        st.bind(files, 2, hidden);
+        CHECK(st.mode() == H3AdalnMode::Stream);
+        std::vector<float> temb(8, 1.f);
+        std::vector<float> mod;
+        CHECK(st.load_mod(0, temb.data(), 8, 48, mod));
+        CHECK(max_abs(mod) > 0.f);
+        CHECK(st.load_mod(1, temb.data(), 8, 48, mod));
+        CHECK(max_abs(mod) > 0.f);
+        CHECK(st.load_mod(0, temb.data(), 8, 48, mod));
+        CHECK(!mod.empty());
+        CHECK(!st.load_mod(5, temb.data(), 8, 48, mod));
+        CHECK(mod.empty());
+    }
+    {
+        setenv("MVLLM_H3_ADALN_MAX", "0", 1);
+        std::vector<io::StFile> files;
+        std::string err;
+        CHECK(io::st_open_dir(edir, files, err) == Status::Ok);
+        H3AdalnStore sk;
+        sk.bind(files, 2, hidden);
+        CHECK(sk.mode() == H3AdalnMode::Skip);
+        std::vector<float> temb(8, 1.f);
+        std::vector<float> mod(48, 1.f);
+        CHECK(!sk.load_mod(0, temb.data(), 8, 48, mod));
+        CHECK(mod.empty());
+        unsetenv("MVLLM_H3_ADALN_MAX");
+    }
+
+    auto run_gen = [&](Engine &e, const std::string &out_path, H3GenResult &hr) {
+        H3GenParams hp;
+        hp.prompt = "fox";
+        hp.steps = 2;
+        hp.dit_layers = 2;
+        hp.width = 32;
+        hp.height = 32;
+        hp.frames = 5;
+        hp.output_path = out_path;
+        std::string err;
+        CHECK(e.generate_video(hp, hr, err) == Status::Ok);
+    };
+
+    {
+        Engine eh;
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(eh.load(edir, rt, err) == Status::Ok);
+        std::string info = eh.info();
+        CHECK(info.find("adaln=stream") != std::string::npos);
+        CHECK(info.find("adaln=off") == std::string::npos);
+        H3GenResult hr;
+        run_gen(eh, edir + "/out_s.txt", hr);
+        CHECK(hr.note.find("adaln_mod=on") != std::string::npos);
+        const float l2s = read_latent_l2(edir + "/out_s.txt");
+
+        setenv("MVLLM_H3_ADALN_RESIDENT", "1", 1);
+        Engine er;
+        CHECK(er.load(edir, rt, err) == Status::Ok);
+        CHECK(er.info().find("adaln=resident") != std::string::npos);
+        H3GenResult hrr;
+        run_gen(er, edir + "/out_r.txt", hrr);
+        CHECK(hrr.note.find("adaln_mod=on") != std::string::npos);
+        const float l2r = read_latent_l2(edir + "/out_r.txt");
+        const float denom = std::max(std::max(std::fabs(l2s), std::fabs(l2r)), 1e-12f);
+        CHECK(std::fabs(l2s - l2r) / denom < 1e-5f);
+        unsetenv("MVLLM_H3_ADALN_RESIDENT");
+    }
+
+    {
+        setenv("MVLLM_H3_ADALN_RESIDENT", "1", 1);
+        std::vector<io::StFile> files;
+        std::string err;
+        CHECK(io::st_open_dir(edir, files, err) == Status::Ok);
+        H3AdalnStore st;
+        st.bind(files, 2, hidden);
+        CHECK(st.mode() == H3AdalnMode::Resident);
+        unsetenv("MVLLM_H3_ADALN_RESIDENT");
+        st.prefetch(1, 8, 48);
+        st.prefetch(99, 8, 48);
+        std::vector<float> temb(8, 1.f);
+        std::vector<float> mod;
+        CHECK(!st.load_mod(9, temb.data(), 8, 48, mod));
+        CHECK(mod.empty());
+    }
+
+    {
+        setenv("MVLLM_H3_ADALN_MAX", "1", 1);
+        Engine ec;
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(ec.load(edir, rt, err) == Status::Ok);
+        CHECK(ec.info().find("adaln=capped-1") != std::string::npos);
+        unsetenv("MVLLM_H3_ADALN_MAX");
+    }
+    {
+        setenv("MVLLM_H3_ADALN_MAX", "0", 1);
+        Engine ez;
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(ez.load(edir, rt, err) == Status::Ok);
+        CHECK(ez.info().find("adaln=skip") != std::string::npos);
+        H3GenResult hr;
+        run_gen(ez, edir + "/out_z.txt", hr);
+        CHECK(hr.note.find("adaln_mod=off") != std::string::npos);
+        unsetenv("MVLLM_H3_ADALN_MAX");
+    }
+
+    {
+        std::string sdir = tmpdir();
+        write_file(sdir + "/config.json",
+                   R"({"model_type":"minimax_h3","architectures":["MiniMaxH3"]})");
+        std::vector<T> sts = ets;
+        sts.erase(std::remove_if(sts.begin(), sts.end(),
+                                 [](const T &t) {
+                                     return std::get<0>(t).find("blocks.1.adaln_proj") == 0;
+                                 }),
+                  sts.end());
+        write_safetensors_file(sdir + "/model.safetensors", sts);
+        Engine es;
+        RuntimeConfig rt;
+        std::string err;
+        CHECK(es.load(sdir, rt, err) == Status::Ok);
+        H3GenResult hr;
+        run_gen(es, sdir + "/out_one.txt", hr);
+        CHECK(hr.note.find("adaln_mod=on") != std::string::npos);
+    }
+
+    restore_env();
 }
 
 static void test_shard_probe() {
@@ -4920,6 +5264,7 @@ int main() {
     test_glm53_container();
     test_k3_mxfp4_container();
     test_h3_checkpoint();
+    test_h3_adaln_stream();
     test_kda_short_conv();
     test_dsa();
     test_shard_probe();

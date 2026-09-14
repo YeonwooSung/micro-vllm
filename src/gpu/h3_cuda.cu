@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 // Device kernels for H3 DiT residual. Semantics match h3_dit_block_cpu.
@@ -32,11 +33,107 @@ dim3 grid2(int gx, int gy) {
     return dim3(static_cast<unsigned>((gx + 15) / 16), static_cast<unsigned>((gy + 15) / 16), 1);
 }
 
-__global__ void k_bf16_to_f32(const uint16_t *src, float *dst, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n)
-        return;
-    dst[i] = __uint_as_float(static_cast<unsigned>(src[i]) << 16);
+struct DitWs {
+    uint8_t *blob;
+    float *x, *xn, *qkv, *ctx, *attn, *h1, *gated, *down, *scores, *mod, *qn, *kn, *cos, *sin;
+    int cap_T, cap_H, cap_I, cap_ffn, cap_hd;
+    int64_t cap_blob;
+};
+DitWs g_ws;
+
+void ws_release(DitWs &w) {
+    dfree(w.blob);
+    dfree(w.x);
+    dfree(w.xn);
+    dfree(w.qkv);
+    dfree(w.ctx);
+    dfree(w.attn);
+    dfree(w.h1);
+    dfree(w.gated);
+    dfree(w.down);
+    dfree(w.scores);
+    dfree(w.mod);
+    dfree(w.qn);
+    dfree(w.kn);
+    dfree(w.cos);
+    dfree(w.sin);
+    w = DitWs{};
+}
+
+void ws_free() { ws_release(g_ws); }
+
+size_t ws_bytes() {
+    if (!g_ws.blob && !g_ws.x)
+        return 0;
+    const size_t T = static_cast<size_t>(g_ws.cap_T);
+    const size_t H = static_cast<size_t>(g_ws.cap_H);
+    const size_t I = static_cast<size_t>(g_ws.cap_I);
+    const size_t ffn = static_cast<size_t>(g_ws.cap_ffn);
+    const size_t hd = static_cast<size_t>(g_ws.cap_hd);
+    size_t n = static_cast<size_t>(g_ws.cap_blob);
+    n += sizeof(float) * T * H;       // x
+    n += sizeof(float) * T * H;       // xn
+    n += sizeof(float) * T * 3 * I;   // qkv
+    n += sizeof(float) * T * I;       // ctx
+    n += sizeof(float) * T * H;       // attn
+    n += sizeof(float) * T * 2 * ffn; // h1
+    n += sizeof(float) * T * ffn;     // gated
+    n += sizeof(float) * T * H;       // down
+    n += sizeof(float) * T * T;       // scores
+    n += sizeof(float) * 6 * H;       // mod
+    n += sizeof(float) * hd;          // qn
+    n += sizeof(float) * hd;          // kn
+    n += sizeof(float) * T * 48;      // cos
+    n += sizeof(float) * T * 48;      // sin
+    return n;
+}
+
+// One transaction: alloc new first; on any failure free nxt and keep g_ws.
+bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n) {
+    if (T <= g_ws.cap_T && H <= g_ws.cap_H && I <= g_ws.cap_I && ffn <= g_ws.cap_ffn &&
+        hd <= g_ws.cap_hd && blob_n <= g_ws.cap_blob && g_ws.blob)
+        return true;
+
+    const int nT = T > g_ws.cap_T ? T : g_ws.cap_T;
+    const int nH = H > g_ws.cap_H ? H : g_ws.cap_H;
+    const int nI = I > g_ws.cap_I ? I : g_ws.cap_I;
+    const int nffn = ffn > g_ws.cap_ffn ? ffn : g_ws.cap_ffn;
+    const int nhd = hd > g_ws.cap_hd ? hd : g_ws.cap_hd;
+    const int64_t nblob = blob_n > g_ws.cap_blob ? blob_n : g_ws.cap_blob;
+
+    DitWs nxt{};
+    nxt.blob = dalloc<uint8_t>(static_cast<size_t>(nblob));
+    nxt.x = dalloc<float>(static_cast<size_t>(nT) * nH);
+    nxt.xn = dalloc<float>(static_cast<size_t>(nT) * nH);
+    nxt.qkv = dalloc<float>(static_cast<size_t>(nT) * 3 * nI);
+    nxt.ctx = dalloc<float>(static_cast<size_t>(nT) * nI);
+    nxt.attn = dalloc<float>(static_cast<size_t>(nT) * nH);
+    nxt.h1 = dalloc<float>(static_cast<size_t>(nT) * 2 * nffn);
+    nxt.gated = dalloc<float>(static_cast<size_t>(nT) * nffn);
+    nxt.down = dalloc<float>(static_cast<size_t>(nT) * nH);
+    nxt.scores = dalloc<float>(static_cast<size_t>(nT) * nT);
+    nxt.mod = dalloc<float>(static_cast<size_t>(6) * nH);
+    nxt.qn = dalloc<float>(static_cast<size_t>(nhd));
+    nxt.kn = dalloc<float>(static_cast<size_t>(nhd));
+    nxt.cos = dalloc<float>(static_cast<size_t>(nT) * 48);
+    nxt.sin = dalloc<float>(static_cast<size_t>(nT) * 48);
+
+    const bool ok = nxt.blob && nxt.x && nxt.xn && nxt.qkv && nxt.ctx && nxt.attn && nxt.h1 &&
+                    nxt.gated && nxt.down && nxt.scores && nxt.mod && nxt.qn && nxt.kn && nxt.cos &&
+                    nxt.sin;
+    if (!ok) {
+        ws_release(nxt);
+        return false;
+    }
+    nxt.cap_T = nT;
+    nxt.cap_H = nH;
+    nxt.cap_I = nI;
+    nxt.cap_ffn = nffn;
+    nxt.cap_hd = nhd;
+    nxt.cap_blob = nblob;
+    ws_release(g_ws);
+    g_ws = nxt;
+    return true;
 }
 
 // RMSNorm with ones, then y = y * (1 + scale) + shift when has_mod.
@@ -62,18 +159,40 @@ __global__ void k_adaln(const float *x, const float *mod, float *y, int T, int H
     }
 }
 
-// y[S,O] = x[S,I] @ W[O,I]^T
-__global__ void k_gemm_f32(const float *x, const float *w, float *y, int S, int I, int O) {
-    int o = blockIdx.x * blockDim.x + threadIdx.x;
-    int s = blockIdx.y * blockDim.y + threadIdx.y;
-    if (o >= O || s >= S)
-        return;
-    const float *xs = x + static_cast<size_t>(s) * I;
-    const float *wo = w + static_cast<size_t>(o) * I;
+// y[S,O] = x[S,I] @ W_bf16[O,I]^T, IEEE f32 accumulate. Tile 16x16, BK=16.
+__global__ void k_gemm_bf16_tiled(const float *x, const uint16_t *w, float *y, int S, int I, int O) {
+    constexpr int BM = 16, BN = 16, BK = 16;
+    const int s0 = static_cast<int>(blockIdx.y) * BM;
+    const int o0 = static_cast<int>(blockIdx.x) * BN;
+    const int ty = static_cast<int>(threadIdx.y);
+    const int tx = static_cast<int>(threadIdx.x);
+    const int s = s0 + ty;
+    const int o = o0 + tx;
+
+    __shared__ float As[BM][BK];
+    __shared__ float Bs[BN][BK];
+
     float acc = 0.f;
-    for (int i = 0; i < I; ++i)
-        acc += xs[i] * wo[i];
-    y[static_cast<size_t>(s) * O + o] = acc;
+    for (int k0 = 0; k0 < I; k0 += BK) {
+        const int ka = k0 + tx;
+        if (s < S && ka < I)
+            As[ty][tx] = x[static_cast<size_t>(s) * I + ka];
+        else
+            As[ty][tx] = 0.f;
+        const int kb = k0 + ty;
+        if (o < O && kb < I)
+            Bs[tx][ty] = __uint_as_float(static_cast<unsigned>(w[static_cast<size_t>(o) * I + kb])
+                                         << 16);
+        else
+            Bs[tx][ty] = 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int k = 0; k < BK; ++k)
+            acc += As[ty][k] * Bs[tx][k];
+        __syncthreads();
+    }
+    if (s < S && o < O)
+        y[static_cast<size_t>(s) * O + o] = acc;
 }
 
 __global__ void k_qk_rmsnorm(float *qkv, const float *q_norm, const float *k_norm, int T, int I,
@@ -207,6 +326,10 @@ extern "C" int h3_cuda_probe(void) {
     return 0;
 }
 
+extern "C" void h3_cuda_ws_free(void) { ws_free(); }
+
+extern "C" size_t h3_cuda_workspace_bytes(void) { return ws_bytes(); }
+
 extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                                         int64_t fc1_bytes, int64_t fc2_bytes, int hidden, int inner,
                                         int ffn, int head_dim, float *x, int tokens, float eps,
@@ -233,124 +356,75 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
     const int fc2_n = static_cast<int>(fc2_bytes / 2);
     if (qkv_n <= 0 || out_n <= 0 || fc1_n <= 0 || fc2_n <= 0)
         return 1;
-    const size_t blob_n =
-        static_cast<size_t>(qkv_bytes) + static_cast<size_t>(out_bytes) +
-        static_cast<size_t>(fc1_bytes) + static_cast<size_t>(fc2_bytes);
+    const int64_t blob_n = qkv_bytes + out_bytes + fc1_bytes + fc2_bytes;
     const int has_mod = adaln_mod ? 1 : 0;
     const int do_q = q_norm ? 1 : 0;
     const int do_k = k_norm ? 1 : 0;
     const bool do_rope = rope_cos && rope_sin && hd >= 96;
 
-    uint8_t *dblob = dalloc<uint8_t>(blob_n);
-    float *dx = dalloc<float>(static_cast<size_t>(T) * H);
-    float *dxn = dalloc<float>(static_cast<size_t>(T) * H);
-    float *wqkv = dalloc<float>(static_cast<size_t>(qkv_n));
-    float *wout = dalloc<float>(static_cast<size_t>(out_n));
-    float *wfc1 = dalloc<float>(static_cast<size_t>(fc1_n));
-    float *wfc2 = dalloc<float>(static_cast<size_t>(fc2_n));
-    float *dqkv = dalloc<float>(static_cast<size_t>(T) * 3 * I);
-    float *dctx = dalloc<float>(static_cast<size_t>(T) * I);
-    float *dattn = dalloc<float>(static_cast<size_t>(T) * H);
-    float *dh1 = dalloc<float>(static_cast<size_t>(T) * 2 * ffn);
-    float *dgated = dalloc<float>(static_cast<size_t>(T) * ffn);
-    float *ddown = dalloc<float>(static_cast<size_t>(T) * H);
-    float *dscores = dalloc<float>(static_cast<size_t>(T) * T);
-    float *dmod = has_mod ? dalloc<float>(static_cast<size_t>(6) * H) : nullptr;
-    float *dqn = do_q ? dalloc<float>(static_cast<size_t>(hd)) : nullptr;
-    float *dkn = do_k ? dalloc<float>(static_cast<size_t>(hd)) : nullptr;
-    float *dcos = do_rope ? dalloc<float>(static_cast<size_t>(T) * 48) : nullptr;
-    float *dsin = do_rope ? dalloc<float>(static_cast<size_t>(T) * 48) : nullptr;
+    if (!ws_ensure(T, H, I, ffn, hd, blob_n))
+        return 2;
 
-    bool ok = dblob && dx && dxn && wqkv && wout && wfc1 && wfc2 && dqkv && dctx && dattn && dh1 &&
-              dgated && ddown && dscores;
-    if (has_mod)
-        ok = ok && dmod;
-    if (do_q)
-        ok = ok && dqn;
-    if (do_k)
-        ok = ok && dkn;
-    if (do_rope)
-        ok = ok && dcos && dsin;
-
-    if (ok)
-        ok = ck(cudaMemcpy(dblob, blob, blob_n, cudaMemcpyHostToDevice)) &&
-             ck(cudaMemcpy(dx, x, sizeof(float) * static_cast<size_t>(T) * H,
-                           cudaMemcpyHostToDevice));
+    bool ok = ck(cudaMemcpy(g_ws.blob, blob, static_cast<size_t>(blob_n), cudaMemcpyHostToDevice)) &&
+              ck(cudaMemcpy(g_ws.x, x, sizeof(float) * static_cast<size_t>(T) * H,
+                            cudaMemcpyHostToDevice));
     if (ok && has_mod)
-        ok = ck(cudaMemcpy(dmod, adaln_mod, sizeof(float) * static_cast<size_t>(6) * H,
+        ok = ck(cudaMemcpy(g_ws.mod, adaln_mod, sizeof(float) * static_cast<size_t>(6) * H,
                            cudaMemcpyHostToDevice));
     if (ok && do_q)
-        ok = ck(cudaMemcpy(dqn, q_norm, sizeof(float) * static_cast<size_t>(hd),
+        ok = ck(cudaMemcpy(g_ws.qn, q_norm, sizeof(float) * static_cast<size_t>(hd),
                            cudaMemcpyHostToDevice));
     if (ok && do_k)
-        ok = ck(cudaMemcpy(dkn, k_norm, sizeof(float) * static_cast<size_t>(hd),
+        ok = ck(cudaMemcpy(g_ws.kn, k_norm, sizeof(float) * static_cast<size_t>(hd),
                            cudaMemcpyHostToDevice));
     if (ok && do_rope) {
         const size_t rb = sizeof(float) * static_cast<size_t>(T) * 48;
-        ok = ck(cudaMemcpy(dcos, rope_cos, rb, cudaMemcpyHostToDevice)) &&
-             ck(cudaMemcpy(dsin, rope_sin, rb, cudaMemcpyHostToDevice));
+        ok = ck(cudaMemcpy(g_ws.cos, rope_cos, rb, cudaMemcpyHostToDevice)) &&
+             ck(cudaMemcpy(g_ws.sin, rope_sin, rb, cudaMemcpyHostToDevice));
     }
 
     if (ok) {
-        k_bf16_to_f32<<<grid1(qkv_n), 64>>>(reinterpret_cast<const uint16_t *>(dblob), wqkv, qkv_n);
-        k_bf16_to_f32<<<grid1(out_n), 64>>>(
-            reinterpret_cast<const uint16_t *>(dblob + qkv_bytes), wout, out_n);
-        k_bf16_to_f32<<<grid1(fc1_n), 64>>>(
-            reinterpret_cast<const uint16_t *>(dblob + qkv_bytes + out_bytes), wfc1, fc1_n);
-        k_bf16_to_f32<<<grid1(fc2_n), 64>>>(
-            reinterpret_cast<const uint16_t *>(dblob + qkv_bytes + out_bytes + fc1_bytes), wfc2,
-            fc2_n);
+        const uint16_t *w_qkv = reinterpret_cast<const uint16_t *>(g_ws.blob);
+        const uint16_t *w_out = reinterpret_cast<const uint16_t *>(g_ws.blob + qkv_bytes);
+        const uint16_t *w_fc1 =
+            reinterpret_cast<const uint16_t *>(g_ws.blob + qkv_bytes + out_bytes);
+        const uint16_t *w_fc2 =
+            reinterpret_cast<const uint16_t *>(g_ws.blob + qkv_bytes + out_bytes + fc1_bytes);
 
-        k_adaln<<<grid1(T), 64>>>(dx, dmod, dxn, T, H, eps, has_mod, 0, 1);
-        k_gemm_f32<<<grid2(3 * I, T), dim3(16, 16)>>>(dxn, wqkv, dqkv, T, H, 3 * I);
+        k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 0, 1);
+        k_gemm_bf16_tiled<<<grid2(3 * I, T), dim3(16, 16)>>>(g_ws.xn, w_qkv, g_ws.qkv, T, H, 3 * I);
         if (do_q || do_k)
-            k_qk_rmsnorm<<<grid2(heads, T), dim3(16, 16)>>>(dqkv, dqn, dkn, T, I, hd, heads, do_q,
-                                                            do_k, eps);
+            k_qk_rmsnorm<<<grid2(heads, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.qn, g_ws.kn, T, I, hd,
+                                                            heads, do_q, do_k, eps);
         if (do_rope)
-            k_rope_qk<<<grid2(heads, T), dim3(16, 16)>>>(dqkv, dcos, dsin, T, I, hd, heads);
+            k_rope_qk<<<grid2(heads, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.cos, g_ws.sin, T, I, hd,
+                                                         heads);
 
-        ok = ck(cudaMemset(dctx, 0, sizeof(float) * static_cast<size_t>(T) * I));
+        ok = ck(cudaMemset(g_ws.ctx, 0, sizeof(float) * static_cast<size_t>(T) * I));
         for (int h = 0; ok && h < heads; ++h) {
-            k_attn_scores<<<grid2(T, T), dim3(16, 16)>>>(dqkv, dscores, T, I, hd, h);
-            k_attn_softmax<<<grid1(T), 64>>>(dscores, T);
-            k_attn_av<<<grid2(hd, T), dim3(16, 16)>>>(dqkv, dscores, dctx, T, I, hd, h);
+            k_attn_scores<<<grid2(T, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.scores, T, I, hd, h);
+            k_attn_softmax<<<grid1(T), 64>>>(g_ws.scores, T);
+            k_attn_av<<<grid2(hd, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.scores, g_ws.ctx, T, I, hd, h);
             ok = ck(cudaGetLastError());
         }
 
         if (ok) {
-            k_gemm_f32<<<grid2(H, T), dim3(16, 16)>>>(dctx, wout, dattn, T, I, H);
-            k_residual_gate<<<grid1(T * H), 64>>>(dx, dattn, dmod, T * H, H, has_mod, 2);
+            k_gemm_bf16_tiled<<<grid2(H, T), dim3(16, 16)>>>(g_ws.ctx, w_out, g_ws.attn, T, I, H);
+            k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.attn, g_ws.mod, T * H, H, has_mod, 2);
 
-            k_adaln<<<grid1(T), 64>>>(dx, dmod, dxn, T, H, eps, has_mod, 3, 4);
-            k_gemm_f32<<<grid2(2 * ffn, T), dim3(16, 16)>>>(dxn, wfc1, dh1, T, H, 2 * ffn);
-            k_swiglu_pack<<<grid2(ffn, T), dim3(16, 16)>>>(dh1, dgated, T, ffn);
-            k_gemm_f32<<<grid2(H, T), dim3(16, 16)>>>(dgated, wfc2, ddown, T, ffn, H);
-            k_residual_gate<<<grid1(T * H), 64>>>(dx, ddown, dmod, T * H, H, has_mod, 5);
+            k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 3, 4);
+            k_gemm_bf16_tiled<<<grid2(2 * ffn, T), dim3(16, 16)>>>(g_ws.xn, w_fc1, g_ws.h1, T, H,
+                                                                  2 * ffn);
+            k_swiglu_pack<<<grid2(ffn, T), dim3(16, 16)>>>(g_ws.h1, g_ws.gated, T, ffn);
+            k_gemm_bf16_tiled<<<grid2(H, T), dim3(16, 16)>>>(g_ws.gated, w_fc2, g_ws.down, T, ffn,
+                                                            H);
+            k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.down, g_ws.mod, T * H, H, has_mod, 5);
 
             ok = ck(cudaDeviceSynchronize()) &&
-                 ck(cudaMemcpy(x, dx, sizeof(float) * static_cast<size_t>(T) * H,
+                 ck(cudaMemcpy(x, g_ws.x, sizeof(float) * static_cast<size_t>(T) * H,
                                cudaMemcpyDeviceToHost));
         }
     }
 
-    dfree(dblob);
-    dfree(dx);
-    dfree(dxn);
-    dfree(wqkv);
-    dfree(wout);
-    dfree(wfc1);
-    dfree(wfc2);
-    dfree(dqkv);
-    dfree(dctx);
-    dfree(dattn);
-    dfree(dh1);
-    dfree(dgated);
-    dfree(ddown);
-    dfree(dscores);
-    dfree(dmod);
-    dfree(dqn);
-    dfree(dkn);
-    dfree(dcos);
-    dfree(dsin);
     return ok ? 0 : 2;
 }

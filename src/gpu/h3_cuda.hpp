@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace mvllm {
@@ -15,6 +16,7 @@ bool init();
 void shutdown();
 bool available();
 const char *backend_name(); // "cuda" or "cpu"
+size_t workspace_bytes();   // 0 if nothing allocated
 
 // AdaLN / QK-norm / RoPE DiT residual. CPU fallback if CUDA is missing or
 // the device call fails. adaln_mod is [6, hidden] (scale0, shift0, scale1,

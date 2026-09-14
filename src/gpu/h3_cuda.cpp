@@ -12,6 +12,8 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
                                         const float *k_norm, const float *rope_cos,
                                         const float *rope_sin);
 extern "C" int h3_cuda_probe(void);
+extern "C" void h3_cuda_ws_free(void);
+extern "C" size_t h3_cuda_workspace_bytes(void);
 #endif
 
 namespace mvllm {
@@ -35,9 +37,22 @@ bool init() {
     return true;
 }
 
-void shutdown() { g_inited = false; }
+void shutdown() {
+#if defined(MVLLM_WITH_CUDA_GEMM)
+    h3_cuda_ws_free();
+#endif
+    g_inited = false;
+}
 
 bool available() { return g_inited; }
+
+size_t workspace_bytes() {
+#if defined(MVLLM_WITH_CUDA_GEMM)
+    return h3_cuda_workspace_bytes();
+#else
+    return 0;
+#endif
+}
 
 const char *backend_name() {
 #if defined(MVLLM_WITH_CUDA_GEMM)

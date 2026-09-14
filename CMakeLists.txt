@@ -104,6 +104,7 @@ set(MVLLM_HOST_SOURCES
     src/model/h3_dit_schedule.cpp
     src/model/h3_canvas.cpp
     src/model/h3_adaln.cpp
+    src/model/h3_adaln_store.cpp
     src/model/h3_reuse.cpp
     src/model/h3_token_reduce.cpp
     src/model/moe_pick.cpp

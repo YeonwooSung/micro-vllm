@@ -1,4 +1,5 @@
 #include "family.hpp"
+#include "h3_adaln_store.hpp"
 #include "h3_audio_vae.hpp"
 #include "h3_layout.hpp"
 #include "h3_mm.hpp"
@@ -615,6 +616,15 @@ public:
                                                        : kH3AudioSigmaShift);
         const int tdim = cfg_.h3.time_input > 0 ? cfg_.h3.time_input : 256;
         std::vector<float> tfeat(static_cast<size_t>(tdim), 0.f);
+        const bool do_adaln = adaln_.mode() != H3AdalnMode::Off &&
+                              adaln_.mode() != H3AdalnMode::Skip && !time_in_w_.empty() &&
+                              !time_out_w_.empty();
+        const int th = static_cast<int>(time_in_w_.size()) / std::max(tdim, 1);
+        const int td = th > 0 ? static_cast<int>(time_out_w_.size()) / th : 0;
+        const bool hoist_adaln = do_adaln && th > 0 && td > 0;
+        std::vector<float> temb;
+        std::vector<float> mod;
+        bool any_mod = false;
         uint32_t ph = 0;
         for (unsigned char c : hp.prompt)
             ph = ph * 131u + c;
@@ -623,6 +633,18 @@ public:
                 hp.on_progress(s, evals, "denoise");
             h3_time_features(1.f - sigmas[static_cast<size_t>(s)], tfeat.data(), tdim);
             tfeat[0] += 0.01f * static_cast<float>(ph % 100u);
+            if (hoist_adaln) {
+                std::vector<float> hid(static_cast<size_t>(th), 0.f);
+                temb.assign(static_cast<size_t>(td), 0.f);
+                quant::matmul_f32(hid.data(), tfeat.data(), time_in_w_.data(), 1, tdim, th);
+                for (int i = 0; i < th && i < static_cast<int>(time_in_b_.size()); ++i)
+                    hid[static_cast<size_t>(i)] += time_in_b_[static_cast<size_t>(i)];
+                for (float &v : hid)
+                    v = v * quant::sigmoid(v);
+                quant::matmul_f32(temb.data(), hid.data(), time_out_w_.data(), 1, th, td);
+                for (int i = 0; i < td && i < static_cast<int>(time_out_b_.size()); ++i)
+                    temb[static_cast<size_t>(i)] += time_out_b_[static_cast<size_t>(i)];
+            }
             std::vector<float> prev = latent;
             for (int b = 0; b < layers; ++b) {
                 const uint8_t *data = nullptr;
@@ -635,64 +657,37 @@ public:
                 if (data && bytes > 0)
                     streamed++;
                 if (from_checkpoint_ && data && bytes == expect) {
-                    std::vector<float> mod;
                     const float *qn = nullptr, *kn = nullptr;
                     if (b < static_cast<int>(q_norm_.size()) && !q_norm_[static_cast<size_t>(b)].empty())
                         qn = q_norm_[static_cast<size_t>(b)].data();
                     if (b < static_cast<int>(k_norm_.size()) && !k_norm_[static_cast<size_t>(b)].empty())
                         kn = k_norm_[static_cast<size_t>(b)].data();
-                    if (b < static_cast<int>(adaln_w_.size()) &&
-                        !adaln_w_[static_cast<size_t>(b)].empty() && !time_out_w_.empty() &&
-                        !time_in_w_.empty()) {
-                        const int tin = tdim;
-                        const int th = static_cast<int>(time_in_w_.size() / std::max(tin, 1));
-                        const int td = static_cast<int>(time_out_w_.size() / std::max(th, 1));
-                        std::vector<float> hid(static_cast<size_t>(std::max(th, 1)), 0.f),
-                            temb(static_cast<size_t>(std::max(td, 1)), 0.f);
-                        if (th > 0)
-                            quant::matmul_f32(hid.data(), tfeat.data(), time_in_w_.data(), 1, tin,
-                                              th);
-                        for (int i = 0; i < th && i < static_cast<int>(time_in_b_.size()); ++i)
-                            hid[static_cast<size_t>(i)] += time_in_b_[static_cast<size_t>(i)];
-                        for (float &v : hid)
-                            v = v * quant::sigmoid(v);
-                        if (td > 0)
-                            quant::matmul_f32(temb.data(), hid.data(), time_out_w_.data(), 1, th,
-                                              td);
-                        for (int i = 0; i < td && i < static_cast<int>(time_out_b_.size()); ++i)
-                            temb[static_cast<size_t>(i)] += time_out_b_[static_cast<size_t>(i)];
-                        const int mrows = 6 * hidden;
-                        if (static_cast<int>(adaln_w_[static_cast<size_t>(b)].size()) >=
-                            mrows * td) {
-                            mod.assign(static_cast<size_t>(mrows), 0.f);
-                            quant::matmul_f32(mod.data(), temb.data(),
-                                              adaln_w_[static_cast<size_t>(b)].data(), 1, td,
-                                              mrows);
-                            if (static_cast<int>(adaln_b_[static_cast<size_t>(b)].size()) >= mrows)
-                                for (int i = 0; i < mrows; ++i)
-                                    mod[static_cast<size_t>(i)] +=
-                                        adaln_b_[static_cast<size_t>(b)][static_cast<size_t>(i)];
-                        }
-                    }
+                    const float *mp = nullptr;
+                    if (hoist_adaln)
+                        mp = adaln_.load_mod(b, temb.data(), td, 6 * hidden, mod) ? mod.data()
+                                                                                  : nullptr;
+                    if (hoist_adaln)
+                        adaln_.prefetch(b + 1, td, 6 * hidden);
                     {
                         AccTimer t(t_attn_);
                         bool ran = false;
                         if (gpu::device() == Device::Cuda)
                             ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                         inner, ffn, hd, latent.data(), seq, 1e-6f,
-                                                        mod.empty() ? nullptr : mod.data(), qn, kn,
-                                                        r_cos, r_sin);
+                                                        mp, qn, kn, r_cos, r_sin);
                         if (!ran)
                             ran = metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                          inner, ffn, hd, latent.data(), seq, 1e-6f,
-                                                         mod.empty() ? nullptr : mod.data(), qn, kn,
-                                                         r_cos, r_sin);
+                                                         mp, qn, kn, r_cos, r_sin);
                         if (!ran)
                             h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
-                                             hd, latent.data(), seq, 1e-6f,
-                                             mod.empty() ? nullptr : mod.data(), qn, kn, r_cos,
+                                             hd, latent.data(), seq, 1e-6f, mp, qn, kn, r_cos,
                                              r_sin);
                     }
+                    if (mp)
+                        any_mod = true;
+                    if (hoist_adaln)
+                        adaln_.wait_prefetch();
                     ++computed;
                 }
                 if (hp.ssd_streaming) {
@@ -880,6 +875,7 @@ public:
             out.note += " mux=mp4";
         else if (mux_skip)
             out.note += " mux=skip";
+        out.note += any_mod ? " adaln_mod=on" : " adaln_mod=off";
         err.clear();
         return Status::Ok;
     }
@@ -918,6 +914,7 @@ public:
            << ((gpu::device() == Device::Cuda && std::strcmp(h3_cuda::backend_name(), "cuda") == 0)
                    ? "cuda"
                    : metal_h3::backend_name())
+           << " adaln=" << adaln_.tag()
            << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off")
@@ -930,6 +927,7 @@ public:
 
 private:
     Status write_synthetic_blocks(const std::string &model_dir, std::string &err) {
+        adaln_.close();
         const int n = cfg_.h3.dit_layers > 0 ? cfg_.h3.dit_layers : 50;
         const int64_t fake = 4096;
         Status st = blocks_.open(n, fake, cfg_.h3.stream_slots > 0 ? cfg_.h3.stream_slots : 2, err);
@@ -959,6 +957,7 @@ private:
     }
 
     Status bind_transformer(const std::string &dir, std::string &err) {
+        adaln_.close();
         std::vector<io::StFile> files;
         Status ost = io::st_open_dir(dir, files, err);
         if (ost != Status::Ok || files.empty() ||
@@ -1068,29 +1067,14 @@ private:
         load_f("time_embedder.proj_in.bias", time_in_b_);
         load_f("time_embedder.proj_out.weight", time_out_w_);
         load_f("time_embedder.proj_out.bias", time_out_b_);
-        adaln_w_.assign(static_cast<size_t>(n_blocks), {});
-        adaln_b_.assign(static_cast<size_t>(n_blocks), {});
         q_norm_.assign(static_cast<size_t>(n_blocks), {});
         k_norm_.assign(static_cast<size_t>(n_blocks), {});
-        // Official AdaLN is ~0.52 GiB BF16 / layer. Materializing all 50 as f32
-        // is ~52 GiB and OOMs a 64 GiB host. MVLLM_H3_ADALN_MAX caps how many
-        // layers we convert; q/k norms stay cheap and always load.
-        int adaln_max = n_blocks;
-        if (const char *e = std::getenv("MVLLM_H3_ADALN_MAX")) {
-            const int v = std::atoi(e);
-            if (v >= 0)
-                adaln_max = v < n_blocks ? v : n_blocks;
-        }
         for (int i = 0; i < n_blocks; ++i) {
             const std::string p = "blocks." + std::to_string(i) + ".";
-            if (i < adaln_max) {
-                load_f(p + "adaln_proj.linear.weight", adaln_w_[static_cast<size_t>(i)]);
-                load_f(p + "adaln_proj.linear.bias", adaln_b_[static_cast<size_t>(i)]);
-            }
             load_f(p + "attn.q_norm.weight", q_norm_[static_cast<size_t>(i)]);
             load_f(p + "attn.k_norm.weight", k_norm_[static_cast<size_t>(i)]);
         }
-        io::st_close_dir(files);
+        adaln_.bind(files, n_blocks, cfg_.h3.hidden);
         transformer_dir_ = dir;
         block_bytes_ = slot;
         from_checkpoint_ = true;
@@ -1149,7 +1133,8 @@ private:
     bool from_checkpoint_ = false;
     std::vector<float> time_in_w_, time_in_b_, time_out_w_, time_out_b_;
     std::vector<float> cond_w_, cond_b_, rope_inv_;
-    std::vector<std::vector<float>> adaln_w_, adaln_b_, q_norm_, k_norm_;
+    H3AdalnStore adaln_;
+    std::vector<std::vector<float>> q_norm_, k_norm_;
     H3TextEncoder text_;
     H3VisionEncoder vision_;
     Tokenizer h3_tok_;
