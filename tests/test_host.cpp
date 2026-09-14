@@ -4,6 +4,7 @@
 #include "gpu/coli_cuda.hpp"
 #include "gpu/dsv4_cuda.hpp"
 #include "gpu/metal_ops.hpp"
+#include "gpu/h3_cuda.hpp"
 #include "gpu/metal_h3.hpp"
 #include "gpu/official_metal.hpp"
 #include "gpu/vk_ops.hpp"
@@ -2801,6 +2802,105 @@ static void test_metal_h3_tier() {
     }
 }
 
+static void test_h3_cuda_dit() {
+    using namespace mvllm;
+    const bool h3cuda_init = h3_cuda::init();
+    CHECK(h3cuda_init);
+    const bool h3cuda_avail = h3_cuda::available();
+    CHECK(h3cuda_avail);
+    CHECK(h3_cuda::backend_name() != nullptr);
+
+    const int H = 8, Inn = 4, Ffn = 8, T = 3, hd = 2;
+    const int64_t qkv_n = static_cast<int64_t>(3) * Inn * H;
+    const int64_t out_n = static_cast<int64_t>(H) * Inn;
+    const int64_t fc1_n = static_cast<int64_t>(2) * Ffn * H;
+    const int64_t fc2_n = static_cast<int64_t>(H) * Ffn;
+    std::vector<uint8_t> blob(static_cast<size_t>(2 * (qkv_n + out_n + fc1_n + fc2_n)));
+    uint16_t *bf = reinterpret_cast<uint16_t *>(blob.data());
+    for (int64_t i = 0; i < qkv_n + out_n + fc1_n + fc2_n; ++i)
+        bf[i] = bf16_encode(((i * 17) % 11 - 5) * 0.05f);
+    std::vector<float> mod(static_cast<size_t>(6) * H);
+    for (int i = 0; i < 6 * H; ++i)
+        mod[static_cast<size_t>(i)] = ((i % 5) - 2) * 0.02f;
+    std::vector<float> qn(static_cast<size_t>(hd), 1.f), kn(static_cast<size_t>(hd), 1.f);
+    std::vector<float> xc(static_cast<size_t>(T) * H), xg(static_cast<size_t>(T) * H);
+    for (int i = 0; i < T * H; ++i)
+        xc[static_cast<size_t>(i)] = xg[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+    h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                     xc.data(), T, 1e-6f, mod.data(), qn.data(), kn.data(), nullptr, nullptr);
+    const bool h3cuda_dit = h3_cuda::dit_residual(
+        blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd, xg.data(), T,
+        1e-6f, mod.data(), qn.data(), kn.data(), nullptr, nullptr);
+    CHECK(h3cuda_dit);
+    bool h3cuda_match = true;
+    for (int i = 0; i < T * H; ++i)
+        h3cuda_match = h3cuda_match && std::fabs(xc[static_cast<size_t>(i)] - xg[static_cast<size_t>(i)]) < 2e-4f;
+    CHECK(h3cuda_match);
+
+    const int Tw = 300;
+    std::vector<float> xcw(static_cast<size_t>(Tw) * H), xgw(static_cast<size_t>(Tw) * H);
+    for (int i = 0; i < Tw * H; ++i)
+        xcw[static_cast<size_t>(i)] = xgw[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.05f;
+    h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                     xcw.data(), Tw, 1e-6f);
+    const bool h3cuda_wide = h3_cuda::dit_residual(
+        blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd, xgw.data(), Tw,
+        1e-6f, nullptr, nullptr, nullptr, nullptr, nullptr);
+    CHECK(h3cuda_wide);
+    bool h3cuda_wide_match = true;
+    for (int i = 0; i < Tw * H; ++i)
+        h3cuda_wide_match =
+            h3cuda_wide_match &&
+            std::fabs(xcw[static_cast<size_t>(i)] - xgw[static_cast<size_t>(i)]) < 2e-4f;
+    CHECK(h3cuda_wide_match);
+
+    // RoPE path (hd >= 96): CPU vs h3_cuda, including AdaLN + QK-norm.
+    const int Hr = 96, Ir = 96, Fr = 8, Tr = 2, hdr = 96;
+    const int64_t qkv_r = static_cast<int64_t>(3) * Ir * Hr;
+    const int64_t out_r = static_cast<int64_t>(Hr) * Ir;
+    const int64_t fc1_r = static_cast<int64_t>(2) * Fr * Hr;
+    const int64_t fc2_r = static_cast<int64_t>(Hr) * Fr;
+    std::vector<uint8_t> rblob(static_cast<size_t>(2 * (qkv_r + out_r + fc1_r + fc2_r)));
+    uint16_t *rbf = reinterpret_cast<uint16_t *>(rblob.data());
+    for (int64_t i = 0; i < qkv_r + out_r + fc1_r + fc2_r; ++i)
+        rbf[i] = bf16_encode(((i * 13) % 11 - 5) * 0.04f);
+    std::vector<float> rmod(static_cast<size_t>(6) * Hr, 0.f);
+    for (int i = 0; i < 6 * Hr; ++i)
+        rmod[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.01f;
+    std::vector<float> rqn(static_cast<size_t>(hdr), 1.f), rkn(static_cast<size_t>(hdr), 1.f);
+    std::vector<float> rcos(static_cast<size_t>(Tr) * 48), rsin(static_cast<size_t>(Tr) * 48);
+    for (int t = 0; t < Tr; ++t) {
+        for (int d = 0; d < 48; ++d) {
+            const float a = 0.05f * static_cast<float>(t + 1) * static_cast<float>(d + 1);
+            rcos[static_cast<size_t>(t) * 48 + d] = std::cos(a);
+            rsin[static_cast<size_t>(t) * 48 + d] = std::sin(a);
+        }
+    }
+    std::vector<float> xcr(static_cast<size_t>(Tr) * Hr), xgr(static_cast<size_t>(Tr) * Hr);
+    for (int i = 0; i < Tr * Hr; ++i)
+        xcr[static_cast<size_t>(i)] = xgr[static_cast<size_t>(i)] = ((i % 9) - 4) * 0.08f;
+    h3_dit_block_cpu(rblob.data(), qkv_r * 2, out_r * 2, fc1_r * 2, fc2_r * 2, Hr, Ir, Fr, hdr,
+                     xcr.data(), Tr, 1e-6f, rmod.data(), rqn.data(), rkn.data(), rcos.data(),
+                     rsin.data());
+    const bool h3cuda_rope = h3_cuda::dit_residual(
+        rblob.data(), qkv_r * 2, out_r * 2, fc1_r * 2, fc2_r * 2, Hr, Ir, Fr, hdr, xgr.data(), Tr,
+        1e-6f, rmod.data(), rqn.data(), rkn.data(), rcos.data(), rsin.data());
+    CHECK(h3cuda_rope);
+    bool h3cuda_rope_match = true;
+    for (int i = 0; i < Tr * Hr; ++i)
+        h3cuda_rope_match =
+            h3cuda_rope_match &&
+            std::fabs(xcr[static_cast<size_t>(i)] - xgr[static_cast<size_t>(i)]) < 3e-4f;
+    CHECK(h3cuda_rope_match);
+
+#if defined(MVLLM_WITH_CUDA_GEMM)
+    // Linked .cu + a live device must take the CUDA path; otherwise this
+    // suite only compared the CPU fallback to itself.
+    const bool h3cuda_live = std::strcmp(h3_cuda::backend_name(), "cuda") == 0;
+    CHECK(h3cuda_live);
+#endif
+}
+
 static void test_llama_dims_helpers() {
     const bool llama_dims_nlayers = N_LAYERS == 16;
     CHECK(llama_dims_nlayers);
@@ -4814,6 +4914,7 @@ int main() {
     test_vk_ops_tier();
     test_metal_ops_tier();
     test_metal_h3_tier();
+    test_h3_cuda_dit();
     test_llama_dims_helpers();
     test_offload_generate();
     test_glm53_container();
@@ -4969,6 +5070,7 @@ int main() {
         CHECK(enc.load("/tmp/does-not-exist-mvllm-text", e) == Status::Ok);
         CHECK(enc.ready());
         CHECK(!enc.from_checkpoint());
+        CHECK(!enc.streamed());
         std::vector<int> ids;
         h3_text_ids_from_prompt("a red fox", enc.config().vocab, ids);
         CHECK(!ids.empty());
@@ -4977,6 +5079,69 @@ int main() {
         CHECK(static_cast<int>(hid.size()) == static_cast<int>(ids.size()) * enc.config().hidden);
         for (float v : hid)
             CHECK(std::isfinite(v));
+    }
+    {
+        using namespace mvllm;
+        std::string tdir = tmpdir();
+        auto fbytes = [](const std::vector<float> &v) {
+            std::vector<uint8_t> b(v.size() * sizeof(float));
+            if (!v.empty())
+                std::memcpy(b.data(), v.data(), b.size());
+            return b;
+        };
+        auto ones = [](int n, float v = 1.f) { return std::vector<float>(static_cast<size_t>(n), v); };
+        const int H = 8, V = 16, I = 16, Q = 8;
+        std::vector<std::tuple<std::string, std::string, std::vector<int64_t>, std::vector<uint8_t>>>
+            ts;
+        auto add = [&](const std::string &n, const std::vector<int64_t> &sh, const std::vector<float> &v) {
+            ts.emplace_back(n, "F32", sh, fbytes(v));
+        };
+        add("model.language_model.embed_tokens.weight", {V, H}, ones(V * H, 0.01f));
+        add("model.language_model.norm.weight", {H}, ones(H));
+        for (int l = 0; l < 2; ++l) {
+            const std::string p = "model.language_model.layers." + std::to_string(l) + ".";
+            add(p + "input_layernorm.weight", {H}, ones(H));
+            add(p + "post_attention_layernorm.weight", {H}, ones(H));
+            add(p + "self_attn.q_proj.weight", {Q, H}, ones(Q * H, 0.02f));
+            add(p + "self_attn.k_proj.weight", {Q, H}, ones(Q * H, 0.02f));
+            add(p + "self_attn.v_proj.weight", {Q, H}, ones(Q * H, 0.02f));
+            add(p + "self_attn.o_proj.weight", {H, Q}, ones(H * Q, 0.02f));
+            add(p + "self_attn.q_norm.weight", {1}, ones(1));
+            add(p + "self_attn.k_norm.weight", {1}, ones(1));
+            add(p + "mlp.gate_proj.weight", {I, H}, ones(I * H, 0.02f));
+            add(p + "mlp.up_proj.weight", {I, H}, ones(I * H, 0.02f));
+            add(p + "mlp.down_proj.weight", {H, I}, ones(H * I, 0.02f));
+        }
+        write_safetensors_file(tdir + "/model.safetensors", ts);
+        H3TextEncoder stenc;
+        std::string sterr;
+        CHECK(stenc.load(tdir, sterr) == Status::Ok);
+        CHECK(stenc.ready());
+        CHECK(stenc.from_checkpoint());
+        CHECK(stenc.streamed());
+        CHECK(stenc.config().layers == 2);
+        std::vector<int> stids = {1, 2, 3};
+        std::vector<float> sthid;
+        stenc.encode(stids, sthid);
+        CHECK(static_cast<int>(sthid.size()) == 3 * stenc.config().hidden);
+        bool st_fin = true;
+        for (float v : sthid)
+            st_fin = st_fin && std::isfinite(v);
+        CHECK(st_fin);
+        setenv("MVLLM_H3_TEXT_RESIDENT", "1", 1);
+        H3TextEncoder rsenc;
+        std::string rserr;
+        CHECK(rsenc.load(tdir, rserr) == Status::Ok);
+        unsetenv("MVLLM_H3_TEXT_RESIDENT");
+        CHECK(rsenc.from_checkpoint());
+        CHECK(!rsenc.streamed());
+        std::vector<float> rshid;
+        rsenc.encode(stids, rshid);
+        CHECK(rshid.size() == sthid.size());
+        bool st_eq = true;
+        for (size_t i = 0; i < sthid.size(); ++i)
+            st_eq = st_eq && std::fabs(sthid[i] - rshid[i]) < 1e-5f;
+        CHECK(st_eq);
     }
     {
         using namespace mvllm;

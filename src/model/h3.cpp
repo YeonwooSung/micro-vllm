@@ -7,6 +7,7 @@
 #include "h3_tok.hpp"
 #include "h3_vision.hpp"
 #include "../gpu/backend.hpp"
+#include "../gpu/h3_cuda.hpp"
 #include "../gpu/metal_h3.hpp"
 #include "../gpu/vk_ops.hpp"
 #include "../io/av_mux.hpp"
@@ -19,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -191,6 +193,7 @@ public:
         }
         loaded_ = true;
         metal_h3::init();
+        h3_cuda::init();
         vk_ops::init();
         return Status::Ok;
     }
@@ -673,19 +676,22 @@ public:
                     }
                     {
                         AccTimer t(t_attn_);
-                        if (!metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner,
-                                                    ffn, hd, latent.data(), seq, 1e-6f,
-                                                    mod.empty() ? nullptr : mod.data(), qn, kn,
-                                                    r_cos, r_sin)) {
-                            if (!mod.empty() || r_cos)
-                                h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner,
-                                                 ffn, hd, latent.data(), seq, 1e-6f,
-                                                 mod.empty() ? nullptr : mod.data(), qn, kn, r_cos,
-                                                 r_sin);
-                            else
-                                gpu::dit_block(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
-                                               hd, latent.data(), seq, 1e-6f);
-                        }
+                        bool ran = false;
+                        if (gpu::device() == Device::Cuda)
+                            ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
+                                                        inner, ffn, hd, latent.data(), seq, 1e-6f,
+                                                        mod.empty() ? nullptr : mod.data(), qn, kn,
+                                                        r_cos, r_sin);
+                        if (!ran)
+                            ran = metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
+                                                         inner, ffn, hd, latent.data(), seq, 1e-6f,
+                                                         mod.empty() ? nullptr : mod.data(), qn, kn,
+                                                         r_cos, r_sin);
+                        if (!ran)
+                            h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
+                                             hd, latent.data(), seq, 1e-6f,
+                                             mod.empty() ? nullptr : mod.data(), qn, kn, r_cos,
+                                             r_sin);
                     }
                     ++computed;
                 }
@@ -852,7 +858,9 @@ public:
         out.note += can_patch ? " patchify=2x2" : " patchify=flat";
         out.note += " euler";
         if (text_tokens > 0)
-            out.note += text_.from_checkpoint() ? " text=qwen" : " text=enc";
+            out.note += text_.from_checkpoint()
+                            ? (text_.streamed() ? " text=qwen-stream" : " text=qwen")
+                            : " text=enc";
         out.note += avae_.from_checkpoint ? " audio=real" : " audio=synth";
         out.note += " audio_t=" + std::to_string(audio_t);
         out.note += audio_from_ref ? " audio=ref" : " pack=text+audio+video";
@@ -903,8 +911,13 @@ public:
            << " lh=" << vae_.geom.latent_h << " lw=" << vae_.geom.latent_w
            << " ch=" << vae_.geom.latent_ch
            << " audio=" << (avae_.from_checkpoint ? "real" : "synth")
+           << " text="
+           << (text_.from_checkpoint() ? (text_.streamed() ? "qwen-stream" : "qwen") : "synth")
            << " vision=" << (vision_.from_checkpoint() ? "qwen" : "off")
-           << " h3gpu=" << metal_h3::backend_name()
+           << " h3gpu="
+           << ((gpu::device() == Device::Cuda && std::strcmp(h3_cuda::backend_name(), "cuda") == 0)
+                   ? "cuda"
+                   : metal_h3::backend_name())
            << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off")
@@ -1059,10 +1072,21 @@ private:
         adaln_b_.assign(static_cast<size_t>(n_blocks), {});
         q_norm_.assign(static_cast<size_t>(n_blocks), {});
         k_norm_.assign(static_cast<size_t>(n_blocks), {});
+        // Official AdaLN is ~0.52 GiB BF16 / layer. Materializing all 50 as f32
+        // is ~52 GiB and OOMs a 64 GiB host. MVLLM_H3_ADALN_MAX caps how many
+        // layers we convert; q/k norms stay cheap and always load.
+        int adaln_max = n_blocks;
+        if (const char *e = std::getenv("MVLLM_H3_ADALN_MAX")) {
+            const int v = std::atoi(e);
+            if (v >= 0)
+                adaln_max = v < n_blocks ? v : n_blocks;
+        }
         for (int i = 0; i < n_blocks; ++i) {
             const std::string p = "blocks." + std::to_string(i) + ".";
-            load_f(p + "adaln_proj.linear.weight", adaln_w_[static_cast<size_t>(i)]);
-            load_f(p + "adaln_proj.linear.bias", adaln_b_[static_cast<size_t>(i)]);
+            if (i < adaln_max) {
+                load_f(p + "adaln_proj.linear.weight", adaln_w_[static_cast<size_t>(i)]);
+                load_f(p + "adaln_proj.linear.bias", adaln_b_[static_cast<size_t>(i)]);
+            }
             load_f(p + "attn.q_norm.weight", q_norm_[static_cast<size_t>(i)]);
             load_f(p + "attn.k_norm.weight", k_norm_[static_cast<size_t>(i)]);
         }

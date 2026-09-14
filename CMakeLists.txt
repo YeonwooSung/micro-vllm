@@ -13,6 +13,7 @@ option(MVLLM_GPU_VULKAN "Probe a Vulkan instance in vk_ops (ops stay CPU until k
 option(MVLLM_VENDOR_METAL "Compile-test vendored official MSL at Metal init (not the default link)" OFF)
 option(MVLLM_OFFICIAL_METAL_HOST "Build vendored colibri backend_metal.mm and h3_gpu.m" OFF)
 # DSV4 CUDA tier: src/gpu/dsv4_cuda.cpp is always-on (CPU API); .cu is optional.
+# H3 CUDA DiT: src/gpu/h3_cuda.cpp is always-on (CPU API); .cu is optional.
 
 if(NOT USE_HIP AND MVLLM_CUDA AND NOT MVLLM_HOST_ONLY)
     if(EXISTS "/opt/cuda/bin/nvcc")
@@ -119,6 +120,7 @@ set(MVLLM_HOST_SOURCES
     src/gpu/backend.cpp
     src/gpu/dsv4_cuda.cpp
     src/gpu/coli_cuda.cpp
+    src/gpu/h3_cuda.cpp
     src/gpu/metal_ops.cpp
     src/gpu/metal_h3.cpp
     src/gpu/vk_ops.cpp
@@ -137,7 +139,7 @@ if(MVLLM_GPU_CUDA)
     if(CMAKE_CUDA_COMPILER)
         enable_language(CUDA)
         list(APPEND MVLLM_HOST_SOURCES src/gpu/cuda_gemm.cu src/gpu/dsv4_cuda.cu
-             src/gpu/coli_cuda.cu)
+             src/gpu/coli_cuda.cu src/gpu/h3_cuda.cu)
     else()
         message(WARNING "MVLLM_GPU_CUDA=ON but no CUDA compiler was found")
         set(MVLLM_GPU_CUDA OFF)

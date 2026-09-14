@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <unordered_map>
@@ -563,6 +564,8 @@ Status H3VisionEncoder::load(const std::string &model_dir, std::string &err) {
     cfg_ = H3VisionConfig{};
     wmap().erase(this);
     err.clear();
+    if (const char *sk = std::getenv("MVLLM_H3_SKIP_TEXT"); sk && sk[0] && sk[0] != '0')
+        return Status::Ok;
 
     const char *tails[] = {"/FL2VA/text_encoder", "/Ref2VA/text_encoder", "/text_encoder", "/qwen", ""};
     std::vector<io::StFile> files;

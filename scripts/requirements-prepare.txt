@@ -1,0 +1,6 @@
+# Python deps for scripts/prepare (download + GLM int4 convert).
+huggingface_hub>=0.23
+safetensors>=0.4
+numpy>=1.24
+# convert_glm53.py dequants FP8 with torch
+torch>=2.2

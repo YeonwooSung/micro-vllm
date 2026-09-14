@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/config.hpp"
+#include "../io/safetensors.hpp"
 #include "../quant/weight.hpp"
 
 #include <cstdint>
@@ -33,6 +34,13 @@ struct H3VisionSpan {
 // Qwen3-VL language stack used as the H3 text encoder (first 50 layers official).
 class H3TextEncoder {
 public:
+    H3TextEncoder() = default;
+    ~H3TextEncoder();
+    H3TextEncoder(const H3TextEncoder &) = delete;
+    H3TextEncoder &operator=(const H3TextEncoder &) = delete;
+    H3TextEncoder(H3TextEncoder &&) = delete;
+    H3TextEncoder &operator=(H3TextEncoder &&) = delete;
+
     Status load(const std::string &model_dir, std::string &err);
     void encode(const std::vector<int> &ids, std::vector<float> &out) const;
     // Official multimodal path: splice vision rows, 3-axis mRoPE, add deepstack
@@ -46,15 +54,35 @@ public:
     const H3TextConfig &config() const { return cfg_; }
     bool from_checkpoint() const { return from_checkpoint_; }
     bool ready() const { return ready_; }
+    bool streamed() const { return streamed_; }
 
 private:
     void alloc_synth();
+    bool load_layer_mats(int l, quant::QuantMat &wq, quant::QuantMat &wk, quant::QuantMat &wv,
+                         quant::QuantMat &wo, quant::QuantMat &gate, quant::QuantMat &up,
+                         quant::QuantMat &down) const;
+    void apply_layer(int l, int T, const quant::QuantMat *wq, const quant::QuantMat *wk,
+                     const quant::QuantMat *wv, const quant::QuantMat *wo,
+                     const quant::QuantMat *gate, const quant::QuantMat *up,
+                     const quant::QuantMat *down, const uint32_t *positions,
+                     const H3VisionSpan *spans, int span_count, std::vector<float> &out,
+                     std::vector<float> &n, std::vector<float> &q, std::vector<float> &k,
+                     std::vector<float> &v, std::vector<float> &ctx, std::vector<float> &attn,
+                     std::vector<float> &g, std::vector<float> &u, std::vector<float> &d) const;
+
     H3TextConfig cfg_{};
     bool ready_ = false;
     bool from_checkpoint_ = false;
+    bool streamed_ = false;
     std::vector<float> embed_, norm_;
     std::vector<quant::QuantMat> wq_, wk_, wv_, wo_, gate_, up_, down_;
     std::vector<std::vector<float>> in_n_, post_n_, qn_, kn_;
+    // Keep fds open so encode() can stream one layer at a time.
+    std::vector<io::StFile> files_;
+    struct LayerHits {
+        io::StHit wq, wk, wv, wo, gate, up, down;
+    };
+    std::vector<LayerHits> hits_;
 };
 
 void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids);

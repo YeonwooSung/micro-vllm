@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# Prepare a model tree: download official (or pre-quantized) weights,
+# convert when this host requires it, write dump-env hints.
+#
+#   ./scripts/prepare --list
+#   ./scripts/prepare qwen36
+#   ./scripts/prepare glm --out ~/models/glm53-i4
+#   ./scripts/prepare h3 --full
+#   ./scripts/prepare inkling --quant
+#   ./scripts/prepare glm --from-dir /path/GLM-5.3-Flash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+# shellcheck source=catalog.sh
+source "${SCRIPT_DIR}/catalog.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/prepare FAMILY [options]
+       scripts/prepare --list
+       scripts/prepare --doctor
+
+Download official weights (or a public quantized container when one exists),
+run the host converter when required, and print dump-env exports.
+
+Families:
+  k3 / kimi          Kimi K3          official MXFP4 (no convert)
+  glm / glm53        GLM-5.3-Flash    official FP8 -> int4-g64
+  glm52              GLM-5.2          pre-converted int4 container
+  dsv4 / deepseek    DeepSeek V4      official MXFP4 (no convert)
+  h3 / minimax       MiniMax-H3       official FL2VA (add --full for Ref2VA)
+  qwen36 / qwen      Qwen3.6-35B-A3B  official BF16; --quant for ~20 GB i4
+  qwen38             Qwen3.8-Flash    official FP8 (no convert)
+  olmoe              OLMoE-1B-7B      official BF16
+  inkling            Inkling          official; --quant for public int4
+  llama              Llama 3.2 1B     official (gated)
+
+Options:
+  --out DIR          Destination (default: $MVLLM_MODELS_DIR/<name>)
+  --from-dir DIR     Convert/copy an already-downloaded snapshot
+  --repo ID          Override Hugging Face repo
+  --revision REV     Pin a commit / tag
+  --quant            Prefer a public pre-quantized container when listed
+  --official         Force the official (usually larger) repo
+  --full             H3: also fetch Ref2VA
+  --keep-source      GLM: keep each FP8 shard after convert
+  --limit-shards N   GLM: convert only the first N shards (trial)
+  --smoke            Run `micro-vllm smoke` after a successful prepare
+  --yes              Skip the disk-size confirmation
+  --dry-run          Print the plan and exit
+  -h, --help
+
+Env:
+  MVLLM_MODELS_DIR   Default root (default: ~/models/micro-vllm)
+  HF_TOKEN           Hugging Face token (or ~/.hf_token)
+  MVLLM_PYTHON       Python for converters (default: python3)
+EOF
+}
+
+FAMILY_ARG=""
+OUT=""
+FROM_DIR=""
+REPO_OVERRIDE=""
+REVISION=""
+WANT_QUANT=0
+WANT_OFFICIAL=0
+WANT_FULL=0
+KEEP_SOURCE=0
+LIMIT_SHARDS=0
+DO_SMOKE=0
+ASSUME_YES=0
+DRY_RUN=0
+DO_LIST=0
+DO_DOCTOR=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --list|-l) DO_LIST=1; shift ;;
+    --doctor) DO_DOCTOR=1; shift ;;
+    --out|--outdir|-o) OUT="${2:-}"; shift 2 ;;
+    --from-dir|--indir) FROM_DIR="${2:-}"; shift 2 ;;
+    --repo) REPO_OVERRIDE="${2:-}"; shift 2 ;;
+    --revision|--rev) REVISION="${2:-}"; shift 2 ;;
+    --quant|--quantized) WANT_QUANT=1; shift ;;
+    --official|--raw) WANT_OFFICIAL=1; shift ;;
+    --full) WANT_FULL=1; shift ;;
+    --keep-source) KEEP_SOURCE=1; shift ;;
+    --limit-shards) LIMIT_SHARDS="${2:-0}"; shift 2 ;;
+    --smoke) DO_SMOKE=1; shift ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      mvllm_die "unknown flag: $1 (see --help)"
+      ;;
+    *)
+      if [[ -z "$FAMILY_ARG" ]]; then
+        FAMILY_ARG="$1"
+        shift
+      else
+        mvllm_die "unexpected argument: $1"
+      fi
+      ;;
+  esac
+done
+
+if [[ "$DO_LIST" -eq 1 ]]; then
+  mvllm_catalog_print
+  exit 0
+fi
+
+if [[ "$DO_DOCTOR" -eq 1 ]]; then
+  echo "repo:    $MVLLM_ROOT"
+  echo "models:  $MVLLM_MODELS_DIR"
+  echo "python:  $MVLLM_PYTHON ($("$MVLLM_PYTHON" --version 2>&1))"
+  if bin="$(mvllm_find_bin)"; then
+    echo "binary:  $bin"
+  else
+    echo "binary:  missing (cmake -B build -DMVLLM_HOST_ONLY=ON && cmake --build build -j)"
+  fi
+  if "$MVLLM_PYTHON" -c "import huggingface_hub" 2>/dev/null; then
+    echo "hf hub:  ok"
+  else
+    echo "hf hub:  missing (pip install huggingface_hub)"
+  fi
+  if "$MVLLM_PYTHON" -c "import torch, safetensors" 2>/dev/null; then
+    echo "convert: torch+safetensors ok (needed for GLM int4)"
+  else
+    echo "convert: torch/safetensors missing (needed for GLM: pip install torch safetensors)"
+  fi
+  if tok="$(mvllm_hf_token)"; then
+    echo "token:   present (${#tok} chars)"
+  else
+    echo "token:   absent (public repos work; gated Llama / rate limits may fail)"
+  fi
+  echo "disk:    $(mvllm_free_gb "$MVLLM_MODELS_DIR") GB free at models dir (or parent)"
+  exit 0
+fi
+
+[[ -n "$FAMILY_ARG" ]] || { usage >&2; exit 1; }
+
+FAMILY="$(mvllm_normalize_family "$FAMILY_ARG")" || \
+  mvllm_die "unknown family: $FAMILY_ARG (try --list)"
+mvllm_catalog_load "$FAMILY"
+
+if [[ -n "$REPO_OVERRIDE" ]]; then
+  CAT_REPO="$REPO_OVERRIDE"
+fi
+if [[ -n "$REVISION" ]]; then
+  CAT_REVISION="$REVISION"
+fi
+
+USE_QUANT=0
+if [[ "$WANT_QUANT" -eq 1 && "$WANT_OFFICIAL" -eq 1 ]]; then
+  mvllm_die "use only one of --quant and --official"
+fi
+if [[ "$WANT_QUANT" -eq 1 ]]; then
+  [[ -n "$CAT_QUANT_REPO" ]] || mvllm_die "$FAMILY has no public quantized container; omit --quant"
+  CAT_REPO="$CAT_QUANT_REPO"
+  USE_QUANT=1
+  if [[ "$FAMILY" == qwen36 ]]; then
+    CAT_DIR="qwen36-i4"
+  elif [[ "$FAMILY" == inkling ]]; then
+    CAT_DIR="inkling-i4"
+  fi
+fi
+
+if [[ -z "$OUT" ]]; then
+  OUT="${MVLLM_MODELS_DIR}/${CAT_DIR}"
+fi
+# Expand to an absolute path without creating it yet (dry-run must be a no-op).
+if [[ -d "$OUT" ]]; then
+  OUT="$(cd "$OUT" && pwd)"
+else
+  case "$OUT" in
+    /*) ;;
+    *) OUT="$(pwd)/$OUT" ;;
+  esac
+fi
+
+REPO="$CAT_REPO"
+CONVERT="$CAT_CONVERT"
+# Pre-converted GLM-5.2 / --quant trees skip the local converter.
+if [[ "$USE_QUANT" -eq 1 ]]; then
+  CONVERT="none"
+fi
+
+INCLUDE=()
+if [[ "$FAMILY" == h3 ]]; then
+  INCLUDE+=(model_index.json "FL2VA/*")
+  if [[ "$WANT_FULL" -eq 1 ]]; then
+    INCLUDE+=("Ref2VA/*")
+  fi
+fi
+
+echo "family:    $FAMILY  (engine ${CAT_ENGINE})"
+echo "title:     $CAT_TITLE"
+echo "out:       $OUT"
+if [[ -n "$FROM_DIR" ]]; then
+  echo "from:      $FROM_DIR"
+else
+  echo "repo:      $REPO"
+  [[ -n "$CAT_REVISION" ]] && echo "revision:  $CAT_REVISION"
+fi
+echo "convert:   $CONVERT"
+echo "size:      $CAT_SIZE"
+echo "notes:     $CAT_NOTES"
+echo "disk free: $(mvllm_free_gb "$OUT") GB"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "dry-run: nothing written"
+  exit 0
+fi
+
+if [[ "$ASSUME_YES" -eq 0 && -z "$FROM_DIR" ]]; then
+  case "$FAMILY" in
+    k3|inkling|glm53|dsv4|qwen38|h3)
+      echo
+      echo "This download is large. Confirm the destination has enough disk."
+      read -r -p "Continue? [y/N] " ans
+      case "$ans" in
+        y|Y|yes|YES) ;;
+        *) echo "aborted"; exit 1 ;;
+      esac
+      ;;
+  esac
+fi
+
+fetch_repo() {
+  local dest="$1"
+  mkdir -p "$dest"
+  local args=(--repo "$REPO" --out "$dest")
+  [[ -n "$CAT_REVISION" ]] && args+=(--revision "$CAT_REVISION")
+  local pat
+  for pat in "${INCLUDE[@]+"${INCLUDE[@]}"}"; do
+    args+=(--include "$pat")
+  done
+  if ! "$MVLLM_PYTHON" -c "import huggingface_hub" 2>/dev/null; then
+    mvllm_die "huggingface_hub missing. pip install -r scripts/requirements-prepare.txt"
+  fi
+  "$MVLLM_PYTHON" "${MVLLM_ROOT}/python/hf_fetch.py" "${args[@]}"
+}
+
+if [[ -n "$FROM_DIR" ]]; then
+  [[ -d "$FROM_DIR" ]] || mvllm_die "not a directory: $FROM_DIR"
+fi
+
+mkdir -p "$OUT"
+
+case "$CONVERT" in
+  glm53)
+    if ! "$MVLLM_PYTHON" -c "import torch, safetensors, numpy" 2>/dev/null; then
+      mvllm_die "GLM convert needs: pip install torch safetensors numpy huggingface_hub"
+    fi
+    conv=("${MVLLM_PYTHON}" "${MVLLM_ROOT}/python/convert_glm53.py" --outdir "$OUT")
+    if [[ -n "$FROM_DIR" ]]; then
+      conv+=(--indir "$FROM_DIR")
+    else
+      conv+=(--repo "$REPO")
+    fi
+    [[ "$KEEP_SOURCE" -eq 1 ]] && conv+=(--keep-source)
+    [[ "$LIMIT_SHARDS" -gt 0 ]] && conv+=(--limit-shards "$LIMIT_SHARDS")
+    "${conv[@]}"
+    ;;
+  none)
+    if [[ -n "$FROM_DIR" ]]; then
+      if [[ "$FROM_DIR" != "$OUT" ]]; then
+        mvllm_info "copying $FROM_DIR -> $OUT"
+        mkdir -p "$OUT"
+        if command -v rsync >/dev/null 2>&1; then
+          rsync -a --info=stats1 "$FROM_DIR"/ "$OUT"/
+        else
+          cp -R "$FROM_DIR"/. "$OUT"/
+        fi
+      fi
+    else
+      fetch_repo "$OUT"
+    fi
+    ;;
+  *)
+    mvllm_die "internal: unknown convert=$CONVERT"
+    ;;
+esac
+
+mvllm_write_marker "$OUT" "$CAT_ENGINE" "$REPO"
+echo
+echo "prepared: $OUT"
+if mvllm_has_shards "$OUT"; then
+  echo "shards:   yes"
+else
+  mvllm_warn "no *.safetensors under $OUT — download may be incomplete"
+fi
+mvllm_print_env_hint "$FAMILY" "$OUT"
+
+if [[ "$DO_SMOKE" -eq 1 ]]; then
+  bin="$(mvllm_find_bin)" || mvllm_die "micro-vllm not built; see ./build.sh"
+  echo
+  echo "smoke: $bin smoke --model $OUT"
+  "$bin" smoke --model "$OUT"
+fi

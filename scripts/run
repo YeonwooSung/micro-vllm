@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# Run a prepared model through the host engine.
+#
+#   ./scripts/run qwen36 "hello"
+#   ./scripts/run glm --chat --think --n 64
+#   ./scripts/run h3 --prompt "a red fox" -o out.mp4
+#   ./scripts/run k3 serve --port 8000
+#   ./scripts/run dsv4 info
+#   ./scripts/run qwen38 smoke
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+# shellcheck source=catalog.sh
+source "${SCRIPT_DIR}/catalog.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/run FAMILY [COMMAND] [engine flags...]
+       scripts/run FAMILY "prompt text" [engine flags...]
+       scripts/run --list
+
+FAMILY is sniffed by the engine from config.json; the name here only picks
+the default model directory and a sensible command.
+
+Commands (default depends on the family):
+  generate   text completion  (LLM default)
+  video      MiniMax-H3       (H3 default)
+  serve      OpenAI-compatible HTTP
+  info       print loaded config
+  smoke      shard headers + one expert/DiT pread
+  mux        stdin framed protocol
+
+If the second argument is not a command, it is treated as --prompt.
+
+Model directory, first match:
+  1. --model DIR / -m DIR
+  2. $MVLLM_MODEL
+  3. family dump env (MVLLM_DUMP_* / COLI_DUMP_*)
+  4. $MVLLM_MODELS_DIR/<default-name>
+  5. fixtures/<tiny>  (synth / tests only)
+
+Options handled here (the rest go to micro-vllm):
+  --model DIR, -m DIR
+  --device cpu|metal|cuda     default: metal on macOS, else cuda if present, else cpu
+  --bin PATH                  path to micro-vllm
+  --prepare                   run scripts/prepare FAMILY first
+  --dry-run                   print the command and exit
+  -h, --help
+
+Examples:
+  ./scripts/run olmoe "What is 2+2?" --n 32 --chat
+  ./scripts/run glm --chat --no-think --n 64 --temp 0.7
+  ./scripts/run h3 --prompt "a red fox" -o fox.mp4 --width 864 --height 480
+  ./scripts/run qwen36 serve --port 8000 --device metal
+  ./scripts/run llama --model ~/models/micro-vllm/llama-3.2-1b
+EOF
+}
+
+FAMILY_ARG=""
+CMD=""
+PROMPT=""
+MODEL=""
+DEVICE=""
+BIN=""
+DO_PREPARE=0
+DRY_RUN=0
+DO_LIST=0
+FORWARD=()
+
+# Engine flags that do not take a value. Anything else starting with -
+# consumes the next token when it does not look like a flag.
+is_bool_flag() {
+  case "$1" in
+    --chat|--think|--no-think|--raw|--no-chat|--json|--no-json|--eos-only|--no-eos-only|--no-tools|--no-grammar|--no-logprobs|--help|-h)
+      return 0 ;;
+    *)
+      return 1 ;;
+  esac
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --list|-l) DO_LIST=1; shift ;;
+    --model|-m)
+      MODEL="${2:-}"
+      shift 2
+      ;;
+    --device)
+      DEVICE="${2:-}"
+      shift 2
+      ;;
+    --bin)
+      BIN="${2:-}"
+      shift 2
+      ;;
+    --prepare)
+      DO_PREPARE=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    --prompt|-p)
+      PROMPT="${2:-}"
+      shift 2
+      ;;
+    --)
+      shift
+      FORWARD+=("$@")
+      break
+      ;;
+    -*)
+      FORWARD+=("$1")
+      if ! is_bool_flag "$1" && [[ $# -ge 2 && "$2" != -* ]]; then
+        FORWARD+=("$2")
+        shift
+      fi
+      shift
+      ;;
+    *)
+      if [[ -z "$FAMILY_ARG" ]]; then
+        FAMILY_ARG="$1"
+        shift
+      elif [[ -z "$CMD" ]]; then
+        case "$1" in
+          generate|video|serve|info|smoke|mux|chat)
+            CMD="$1"
+            shift
+            ;;
+          *)
+            PROMPT="$1"
+            shift
+            ;;
+        esac
+      elif [[ -z "$PROMPT" ]]; then
+        PROMPT="$1"
+        shift
+      else
+        FORWARD+=("$1")
+        shift
+      fi
+      ;;
+  esac
+done
+
+if [[ "$DO_LIST" -eq 1 ]]; then
+  mvllm_catalog_print
+  echo
+  echo "Default model root: $MVLLM_MODELS_DIR"
+  exit 0
+fi
+
+[[ -n "$FAMILY_ARG" ]] || { usage >&2; exit 1; }
+
+FAMILY="$(mvllm_normalize_family "$FAMILY_ARG")" || \
+  mvllm_die "unknown family: $FAMILY_ARG (try --list)"
+mvllm_catalog_load "$FAMILY"
+
+if [[ "$CMD" == chat ]]; then
+  CMD="generate"
+  FORWARD+=(--chat)
+fi
+if [[ -z "$CMD" ]]; then
+  if [[ "$CAT_KIND" == video ]]; then
+    CMD="video"
+  else
+    CMD="generate"
+  fi
+fi
+
+if [[ "$DO_PREPARE" -eq 1 ]]; then
+  "${SCRIPT_DIR}/prepare" "$FAMILY" ${MODEL:+--out "$MODEL"}
+fi
+
+resolve_model() {
+  if [[ -n "$MODEL" ]]; then
+    printf '%s' "$MODEL"
+    return 0
+  fi
+  if [[ -n "${MVLLM_MODEL:-}" ]]; then
+    printf '%s' "$MVLLM_MODEL"
+    return 0
+  fi
+  local ev
+  ev="$(mvllm_dump_env_name "$FAMILY")"
+  if [[ -n "$ev" && -n "${!ev:-}" ]]; then
+    printf '%s' "${!ev}"
+    return 0
+  fi
+  local alias="COLI_DUMP_${ev#MVLLM_DUMP_}"
+  if [[ -n "$ev" && -n "${!alias:-}" ]]; then
+    printf '%s' "${!alias}"
+    return 0
+  fi
+  local d="${MVLLM_MODELS_DIR}/${CAT_DIR}"
+  if mvllm_dir_ready "$d"; then
+    printf '%s' "$d"
+    return 0
+  fi
+  # Quant-dir aliases prepared with --quant.
+  case "$FAMILY" in
+    qwen36)
+      if mvllm_dir_ready "${MVLLM_MODELS_DIR}/qwen36-i4"; then
+        printf '%s' "${MVLLM_MODELS_DIR}/qwen36-i4"
+        return 0
+      fi
+      ;;
+    inkling)
+      if mvllm_dir_ready "${MVLLM_MODELS_DIR}/inkling-i4"; then
+        printf '%s' "${MVLLM_MODELS_DIR}/inkling-i4"
+        return 0
+      fi
+      ;;
+  esac
+  local tiny=""
+  case "$FAMILY" in
+    k3) tiny="${MVLLM_ROOT}/fixtures/kimi_k3_tiny" ;;
+    glm53|glm52) tiny="${MVLLM_ROOT}/fixtures/glm53_tiny" ;;
+    h3) tiny="${MVLLM_ROOT}/fixtures/h3_tiny" ;;
+  esac
+  if [[ -n "$tiny" && -d "$tiny" ]]; then
+    mvllm_warn "no prepared weights; using fixture $tiny (synthetic)"
+    printf '%s' "$tiny"
+    return 0
+  fi
+  return 1
+}
+
+if ! MODEL="$(resolve_model)"; then
+  MODEL="${MVLLM_MODELS_DIR}/${CAT_DIR}"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    mvllm_warn "no prepared weights yet; dry-run using $MODEL"
+  else
+    mvllm_die "no model dir for $FAMILY. Run: ./scripts/prepare $FAMILY"
+  fi
+fi
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  [[ -d "$MODEL" || -f "$MODEL" ]] || mvllm_die "model path missing: $MODEL"
+fi
+
+if [[ -n "$BIN" ]]; then
+  MVLLM_BIN="$BIN"
+fi
+HOST="$(mvllm_find_bin)" || \
+  mvllm_die "micro-vllm not built. ./build.sh   or   cmake -B build -DMVLLM_HOST_ONLY=ON && cmake --build build -j"
+
+if [[ -z "$DEVICE" ]]; then
+  DEVICE="$(mvllm_default_device)"
+fi
+
+# Llama CUDA demo: only when the user points at a single .safetensors and the demo exists.
+if [[ "$FAMILY" == llama && -f "$MODEL" && "${MODEL##*.}" == safetensors ]]; then
+  if cuda_bin="$(mvllm_find_cuda_demo)"; then
+    echo "llama CUDA demo: $cuda_bin --model $MODEL ${FORWARD[*]+${FORWARD[*]}}"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      exit 0
+    fi
+    exec "$cuda_bin" --model "$MODEL" ${FORWARD[@]+"${FORWARD[@]}"}
+  fi
+fi
+
+ARGS=("$CMD" --model "$MODEL" --device "$DEVICE")
+
+case "$CMD" in
+  generate)
+    if [[ -n "$PROMPT" ]]; then
+      ARGS+=(--prompt "$PROMPT")
+    fi
+    # Sensible chat default for instruct families unless the user already chose.
+    has_chat=0
+    has_raw=0
+    has_think=0
+    for a in "${FORWARD[@]+"${FORWARD[@]}"}"; do
+      case "$a" in
+        --chat) has_chat=1 ;;
+        --raw|--no-chat) has_raw=1 ;;
+        --think|--no-think) has_think=1 ;;
+      esac
+    done
+    if [[ "$has_raw" -eq 0 && "$has_chat" -eq 0 ]]; then
+      case "$FAMILY" in
+        k3|glm53|glm52|qwen36|qwen38|olmoe) ARGS+=(--chat) ;;
+      esac
+    fi
+    if [[ "$has_raw" -eq 0 && "$has_think" -eq 0 ]]; then
+      case "$FAMILY" in
+        glm53|glm52) ARGS+=(--think) ;;
+      esac
+    fi
+    ;;
+  video)
+    if [[ -n "$PROMPT" ]]; then
+      ARGS+=(--prompt "$PROMPT")
+    fi
+    ;;
+esac
+
+ARGS+=(${FORWARD[@]+"${FORWARD[@]}"})
+
+echo "family:  $FAMILY  (engine ${CAT_ENGINE})"
+echo "model:   $MODEL"
+echo "device:  $DEVICE"
+echo "bin:     $HOST"
+printf 'exec:    %q' "$HOST"
+printf ' %q' "${ARGS[@]}"
+printf '\n'
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  exit 0
+fi
+
+exec "$HOST" "${ARGS[@]}"

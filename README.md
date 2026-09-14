@@ -6,9 +6,11 @@ H3 DiT blocks stream from disk. The original Llama 3.2 1B CUDA loop is still
 `micro-vllm-cuda`.
 
 Families: **Kimi K3**, **GLM-5.3** (HF / GLM-5.2-style names also probe),
-**DeepSeek V4 Flash**, **MiniMax-H3**, **Llama** (CPU stand-in).
+**DeepSeek V4 Flash**, **MiniMax-H3**, **Qwen3.6 / 3.8**, **OLMoE**,
+**Inkling**, **Llama** (CPU stand-in).
 
 Internals: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Prepare / run every family: [docs/MODELS.md](docs/MODELS.md).
 
 ## Build
 
@@ -34,6 +36,37 @@ cmake --build build -j
 ```
 
 HIP: `-DUSE_HIP=ON -DMVLLM_HOST_ONLY=OFF`.
+
+## Prepare and run
+
+Download official weights (or a public quantized tree when one exists),
+convert GLM-5.3 FP8 → int4-g64, then chat / serve / video:
+
+```bash
+pip install -r scripts/requirements-prepare.txt   # huggingface_hub; torch for GLM
+./scripts/prepare --list
+./scripts/prepare --doctor
+
+./scripts/prepare olmoe --yes                     # ~13 GB, smallest LLM
+./scripts/run olmoe "What is 2+2?" --n 32
+
+./scripts/prepare qwen36                          # Qwen3.6; add --quant for ~20 GB
+./scripts/run qwen36 "hi" --n 32
+
+./scripts/prepare glm --out ~/models/glm53-i4     # required int4 convert
+./scripts/run-glm.sh --chat --think --n 32
+
+./scripts/prepare h3                              # MiniMax-H3 FL2VA
+./scripts/run-h3.sh --prompt "a red fox" -o fox.mp4
+```
+
+Aliases: `prepare-k3.sh`, `prepare-qwen38.sh`, `prepare-dsv4.sh`,
+`prepare-inkling.sh`, `prepare-llama.sh`, and matching `run-*.sh`.
+`--quant` prefers a public already-quantized repo (Qwen3.6, Inkling).
+K3 / DSV4 / Qwen3.8 official dumps load without a converter.
+
+Model root: `$MVLLM_MODELS_DIR` (default `~/models/micro-vllm`).
+Full table, flags, and dump-env names: [docs/MODELS.md](docs/MODELS.md).
 
 ## Commands
 
