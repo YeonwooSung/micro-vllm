@@ -336,7 +336,16 @@ public:
             std::string terr;
             trace_.open(tpath, terr);
         }
-        dsv4_cuda::init(nullptr, 0);
+        want_tp2_ = rt_.tp_size == 2;
+        {
+            const int ndev = dsv4_cuda::available_device_count();
+            if (want_tp2_ && ndev >= 2) {
+                const int devs[2] = {0, 1};
+                dsv4_cuda::init(devs, 2);
+            } else {
+                dsv4_cuda::init(nullptr, 0);
+            }
+        }
         vk_ops::init();
         return Status::Ok;
     }
@@ -531,6 +540,10 @@ public:
            << " mtp=" << mtp_mode()
            << " tier=" << (dsv4_cuda::available() ? dsv4_cuda::backend_name() : "off")
            << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off");
+        const int tp = want_tp2_ ? 2 : 1;
+        const int ndev = dsv4_cuda::available_device_count();
+        const int tpdev = want_tp2_ ? std::min(std::max(ndev, 0), 2) : 0;
+        os << " tp=" << tp << " tpdev=" << tpdev;
         return os.str();
     }
 
@@ -1027,6 +1040,139 @@ private:
         }
     }
 
+    static bool upload_qmat_f32(dsv4_cuda::Tensor **t, const quant::QuantMat &m, int device) {
+        if (!t || m.empty() || m.fmt != 0 || m.f.empty())
+            return false;
+        return dsv4_cuda::upload_f32(t, m.f.data(), m.O, m.I, device);
+    }
+
+    bool try_attn_window_tp2(const float *x, int l, int pos, float *y, const float *kv_rows,
+                             int kv_tokens) {
+        if (!want_tp2_ || !dsv4_cuda::available() || !x || !y)
+            return false;
+        const int H = cfg_.hidden;
+        const int hd = kv_width();
+        const int nh = n_heads();
+        if (H <= 0 || hd <= 0 || nh <= 0 || pos < 0)
+            return false;
+        if (l < 0 || l >= static_cast<int>(in_n_.size()))
+            return false;
+        const int past = pos + 1;
+        if (kv_tokens < past || (past > 0 && !kv_rows))
+            return false;
+        const bool have_lora = !wq_a_[l].empty() && wq_a_[l].fmt == 0 && !wq_a_[l].f.empty() &&
+                               !wq_b_[l].empty() && wq_b_[l].fmt == 0 && !wq_b_[l].f.empty();
+        const bool have_dense = !wq_[l].empty() && wq_[l].fmt == 0 && !wq_[l].f.empty();
+        if (!have_lora && !have_dense)
+            return false;
+        if (wkv_[l].empty() || wkv_[l].fmt != 0 || wkv_[l].f.empty())
+            return false;
+        if ((wo_a_[l].empty() || wo_a_[l].fmt != 0 || wo_a_[l].f.empty()) &&
+            (wo_[l].empty() || wo_[l].fmt != 0 || wo_[l].f.empty()))
+            return false;
+        const int d0 = dsv4_cuda::rank_device(0);
+        const int d1 = dsv4_cuda::rank_device(1);
+        const bool phys = dsv4_cuda::physical_tp2();
+        struct CuAttn {
+            dsv4_cuda::AttentionWeights primary{};
+            dsv4_cuda::AttentionWeights peer{};
+            bool own_peer = false;
+            dsv4_cuda::KvCache *cache = nullptr;
+            dsv4_cuda::KvCache *peer_cache = nullptr;
+            dsv4_cuda::Activation *in0 = nullptr;
+            dsv4_cuda::Activation *in1 = nullptr;
+            dsv4_cuda::Activation *out0 = nullptr;
+            dsv4_cuda::Activation *out1 = nullptr;
+            static void free_w(dsv4_cuda::AttentionWeights &w) {
+                dsv4_cuda::tensor_free(w.attn_norm);
+                dsv4_cuda::tensor_free(w.q_a);
+                dsv4_cuda::tensor_free(w.qkv);
+                dsv4_cuda::tensor_free(w.q_norm);
+                dsv4_cuda::tensor_free(w.q_b);
+                dsv4_cuda::tensor_free(w.wkv);
+                dsv4_cuda::tensor_free(w.kv_norm);
+                dsv4_cuda::tensor_free(w.sink);
+                dsv4_cuda::tensor_free(w.wo_a);
+                dsv4_cuda::tensor_free(w.wo_b);
+            }
+            ~CuAttn() {
+                dsv4_cuda::kv_free(cache);
+                dsv4_cuda::kv_free(peer_cache);
+                dsv4_cuda::activation_free(in0);
+                dsv4_cuda::activation_free(in1);
+                dsv4_cuda::activation_free(out0);
+                dsv4_cuda::activation_free(out1);
+                free_w(primary);
+                if (own_peer)
+                    free_w(peer);
+            }
+        } cu;
+        auto upload_attn = [&](dsv4_cuda::AttentionWeights *w, int dev) -> bool {
+            if (!in_n_[l].empty() && !dsv4_cuda::upload_f32(&w->attn_norm, in_n_[l].data(), 1, H, dev))
+                return false;
+            if (!q_ln_[l].empty() &&
+                !dsv4_cuda::upload_f32(&w->q_norm, q_ln_[l].data(), 1,
+                                       static_cast<int>(q_ln_[l].size()), dev))
+                return false;
+            if (!kv_ln_[l].empty() &&
+                !dsv4_cuda::upload_f32(&w->kv_norm, kv_ln_[l].data(), 1,
+                                       static_cast<int>(kv_ln_[l].size()), dev))
+                return false;
+            if (!sink_[l].empty() &&
+                !dsv4_cuda::upload_f32(&w->sink, sink_[l].data(), static_cast<int>(sink_[l].size()),
+                                       1, dev))
+                return false;
+            if (have_lora &&
+                (!upload_qmat_f32(&w->q_a, wq_a_[l], dev) || !upload_qmat_f32(&w->q_b, wq_b_[l], dev)))
+                return false;
+            if (have_dense && !upload_qmat_f32(&w->qkv, wq_[l], dev))
+                return false;
+            if (!upload_qmat_f32(&w->wkv, wkv_[l], dev))
+                return false;
+            if (!upload_qmat_f32(&w->wo_a, wo_a_[l], dev) && !upload_qmat_f32(&w->wo_a, wo_[l], dev))
+                return false;
+            upload_qmat_f32(&w->wo_b, wo_b_[l], dev);
+            return true;
+        };
+        if (!upload_attn(&cu.primary, d0))
+            return false;
+        if (phys) {
+            if (!upload_attn(&cu.peer, d1))
+                return false;
+            cu.own_peer = true;
+        }
+        const int win = std::max(cfg_.sliding_window, 1);
+        cu.cache = dsv4_cuda::kv_create(d0, win, hd, std::max(pos + 2, 2), 0, nullptr, nullptr,
+                                        nullptr, nullptr);
+        cu.peer_cache = dsv4_cuda::kv_create(d1, win, hd, std::max(pos + 2, 2), 0, nullptr, nullptr,
+                                             nullptr, nullptr);
+        cu.in0 = dsv4_cuda::activation_create(d0, H);
+        cu.in1 = dsv4_cuda::activation_create(d1, H);
+        cu.out0 = dsv4_cuda::activation_create(d0, H);
+        cu.out1 = dsv4_cuda::activation_create(d1, H);
+        if (!cu.cache || !cu.peer_cache || !cu.in0 || !cu.in1 || !cu.out0 || !cu.out1)
+            return false;
+        const float theta = cfg_.mla.rope_theta > 0.f ? cfg_.mla.rope_theta : cfg_.rope_theta;
+        dsv4_cuda::kv_set_rope_theta(cu.cache, theta);
+        dsv4_cuda::kv_set_rope_theta(cu.peer_cache, theta);
+        const int lo = cfg_.sliding_window > 0 ? std::max(0, past - win) : 0;
+        const int nseed = past - lo;
+        if (!dsv4_cuda::kv_seed(cu.cache, kv_rows + static_cast<size_t>(lo) * hd, nseed) ||
+            !dsv4_cuda::kv_seed(cu.peer_cache, kv_rows + static_cast<size_t>(lo) * hd, nseed))
+            return false;
+        if (!dsv4_cuda::activation_upload(cu.in0, x, H) ||
+            !dsv4_cuda::activation_copy(cu.in1, cu.in0, H))
+            return false;
+        const int groups = std::max(cfg_.o_groups, 1);
+        const int qr = std::max(cfg_.mla.qk_rope, 0);
+        const dsv4_cuda::AttentionWeights *peer_w = cu.own_peer ? &cu.peer : &cu.primary;
+        if (!dsv4_cuda::attention_window_tp2(cu.in0, cu.in1, &cu.primary, peer_w, 0, nh, hd, qr,
+                                             groups, pos, cfg_.rms_eps, cu.cache, cu.peer_cache,
+                                             cu.out0, cu.out1))
+            return false;
+        return dsv4_cuda::activation_download(y, cu.out0, H);
+    }
+
     void attn_one(Slot &s, float *hh, int at, int l, float *branch) {
         AccTimer t(t_attn_);
         const int H = cfg_.hidden;
@@ -1035,7 +1181,7 @@ private:
         const int qw = nh * hd;
         const int qr = std::max(cfg_.mla.qk_rope, 0);
         const float theta = cfg_.mla.rope_theta > 0.f ? cfg_.mla.rope_theta : cfg_.rope_theta;
-        std::vector<float> n(static_cast<size_t>(H)), y(static_cast<size_t>(H), 0.f);
+        std::vector<float> n(static_cast<size_t>(H));
         quant::rmsnorm(hh, in_n_[l].data(), n.data(), H, cfg_.rms_eps);
 
         // Low-rank Q: wq_a → q_norm → wq_b, else dense wq.
@@ -1070,6 +1216,18 @@ private:
             const size_t off = static_cast<size_t>(at) * static_cast<size_t>(hd);
             if (off + static_cast<size_t>(hd) <= s.kv[l].size())
                 std::memcpy(s.kv[l].data() + off, kv.data(), static_cast<size_t>(hd) * sizeof(float));
+        }
+
+        std::vector<float> y(static_cast<size_t>(H), 0.f);
+        if (want_tp2_ && at >= 0 && l < static_cast<int>(s.kv.size()) && !s.kv[l].empty() &&
+            try_attn_window_tp2(hh, l, at, y.data(), s.kv[l].data(), at + 1)) {
+            if (branch)
+                std::memcpy(branch, y.data(), static_cast<size_t>(H) * sizeof(float));
+            else {
+                for (int i = 0; i < H; ++i)
+                    hh[i] += y[i];
+            }
+            return;
         }
 
         std::vector<int> sel;
@@ -2702,6 +2860,157 @@ private:
             h[i] += d[i];
     }
 
+    bool moe_layer_ep2(int layer, const float *xs, float *hs, int C, const int *idx, int K,
+                      std::string &err) {
+        const int H = cfg_.hidden;
+        const int O = cfg_.moe.intermediate;
+        const int E = cfg_.moe.n_experts;
+        if (!xs || !hs || C <= 0 || H <= 0 || O <= 0 || E <= 0 || K != 6)
+            return false;
+        if (static_cast<int>(router_[layer].size()) < E * H)
+            return false;
+        const int d0 = dsv4_cuda::rank_device(0);
+        const int d1 = dsv4_cuda::rank_device(1);
+        const bool phys = dsv4_cuda::physical_tp2();
+        struct CuEp {
+            dsv4_cuda::Tensor *gate0 = nullptr;
+            dsv4_cuda::Tensor *gate1 = nullptr;
+            dsv4_cuda::Tensor *bias0 = nullptr;
+            dsv4_cuda::Tensor *bias1 = nullptr;
+            dsv4_cuda::ExpertSet *local = nullptr;
+            dsv4_cuda::ExpertSet *peer = nullptr;
+            bool own_gate1 = false;
+            bool own_bias1 = false;
+            bool own_peer = false;
+            ~CuEp() {
+                dsv4_cuda::expert_set_free(local);
+                if (own_peer)
+                    dsv4_cuda::expert_set_free(peer);
+                dsv4_cuda::tensor_free(gate0);
+                if (own_gate1)
+                    dsv4_cuda::tensor_free(gate1);
+                dsv4_cuda::tensor_free(bias0);
+                if (own_bias1)
+                    dsv4_cuda::tensor_free(bias1);
+            }
+        } cu;
+        if (!dsv4_cuda::upload_f32(&cu.gate0, router_[layer].data(), E, H, d0))
+            return false;
+        if (phys) {
+            cu.own_gate1 = dsv4_cuda::upload_f32(&cu.gate1, router_[layer].data(), E, H, d1);
+            if (!cu.own_gate1)
+                return false;
+        } else {
+            cu.gate1 = cu.gate0;
+        }
+        if (!router_bias_[layer].empty()) {
+            if (static_cast<int>(router_bias_[layer].size()) >= E) {
+                if (!dsv4_cuda::upload_f32(&cu.bias0, router_bias_[layer].data(), E, 1, d0))
+                    return false;
+            } else {
+                std::vector<float> bpad(static_cast<size_t>(E), 0.f);
+                std::memcpy(bpad.data(), router_bias_[layer].data(),
+                            router_bias_[layer].size() * sizeof(float));
+                if (!dsv4_cuda::upload_f32(&cu.bias0, bpad.data(), E, 1, d0))
+                    return false;
+            }
+            if (phys) {
+                if (static_cast<int>(router_bias_[layer].size()) >= E) {
+                    cu.own_bias1 =
+                        dsv4_cuda::upload_f32(&cu.bias1, router_bias_[layer].data(), E, 1, d1);
+                } else {
+                    std::vector<float> bpad(static_cast<size_t>(E), 0.f);
+                    std::memcpy(bpad.data(), router_bias_[layer].data(),
+                                router_bias_[layer].size() * sizeof(float));
+                    cu.own_bias1 = dsv4_cuda::upload_f32(&cu.bias1, bpad.data(), E, 1, d1);
+                }
+                if (!cu.own_bias1)
+                    return false;
+            } else {
+                cu.bias1 = cu.bias0;
+            }
+        }
+        cu.local = dsv4_cuda::expert_bank_create(E, H, O, d0, nullptr, nullptr, nullptr);
+        if (!cu.local)
+            return false;
+        if (phys) {
+            cu.peer = dsv4_cuda::expert_bank_create(E, H, O, d1, nullptr, nullptr, nullptr);
+            if (!cu.peer)
+                return false;
+            cu.own_peer = true;
+        } else {
+            cu.peer = cu.local;
+        }
+        std::vector<int> uniq(static_cast<size_t>(std::max(E, 1)));
+        const int nu = moe_union_ids(idx, C, K, uniq.data(), static_cast<int>(uniq.size()));
+        std::vector<ExpertView> views;
+        views.reserve(static_cast<size_t>(std::max(nu, 0)));
+        bool ok = true;
+        for (int ui = 0; ui < nu && ok; ++ui) {
+            const int eid = uniq[ui];
+            if (eid < 0 || eid >= E)
+                continue;
+            ExpertView v{};
+            if (store_.lookup({layer, eid}, v, err) != Status::Ok || !v.data) {
+                ok = false;
+                break;
+            }
+            views.push_back(v);
+            const MxGeom g = make_mx_geom(H, O);
+            const uint8_t *w1p = v.data;
+            const uint8_t *w1s = w1p + g.w1p;
+            const uint8_t *w2p = w1s + g.w1s;
+            const uint8_t *w2s = w2p + g.w2p;
+            const uint8_t *w3p = w2s + g.w2s;
+            const uint8_t *w3s = w3p + g.w1p;
+            ok = dsv4_cuda::expert_bank_upload(cu.local, eid, w1p, w1s, w3p, w3s, w2p, w2s, nullptr,
+                                               nullptr, nullptr);
+            if (ok && cu.own_peer)
+                ok = dsv4_cuda::expert_bank_upload(cu.peer, eid, w1p, w1s, w3p, w3s, w2p, w2s,
+                                                   nullptr, nullptr, nullptr);
+        }
+        std::vector<float> acc(static_cast<size_t>(C) * static_cast<size_t>(H), 0.f);
+        for (int c = 0; c < C && ok; ++c) {
+            dsv4_cuda::Activation *ain = dsv4_cuda::activation_create(d0, H);
+            dsv4_cuda::Activation *aout = dsv4_cuda::activation_create(d0, H);
+            dsv4_cuda::Activation *pin = dsv4_cuda::activation_create(d1, H);
+            dsv4_cuda::Activation *pout = dsv4_cuda::activation_create(d1, H);
+            ok = ain && aout && pin && pout &&
+                 dsv4_cuda::activation_upload(ain, xs + static_cast<size_t>(c) * H, H) &&
+                 dsv4_cuda::activation_copy(pin, ain, H) &&
+                 dsv4_cuda::route_moe_ep2(ain, cu.gate0, cu.bias0, pin, cu.gate1, cu.bias1, 0, 1.f,
+                                          cu.local, cu.peer, cfg_.moe.swiglu_limit, aout, pout) &&
+                 dsv4_cuda::activation_download(acc.data() + static_cast<size_t>(c) * H, aout, H);
+            dsv4_cuda::activation_free(ain);
+            dsv4_cuda::activation_free(aout);
+            dsv4_cuda::activation_free(pin);
+            dsv4_cuda::activation_free(pout);
+        }
+        for (ExpertView &v : views)
+            store_.release(v);
+        if (!ok)
+            return false;
+        for (int c = 0; c < C; ++c) {
+            const float *x = xs + static_cast<size_t>(c) * H;
+            const float *ac = acc.data() + static_cast<size_t>(c) * H;
+            float *h = hs + static_cast<size_t>(c) * H;
+            for (int i = 0; i < H; ++i)
+                h[i] += ac[i] * cfg_.moe.routed_scale;
+            if (!shared_gate_[layer].empty()) {
+                std::vector<float> sg(static_cast<size_t>(O)), su(static_cast<size_t>(O)),
+                    sd(static_cast<size_t>(H));
+                shared_gate_[layer].gemm(sg.data(), x, 1);
+                shared_up_[layer].gemm(su.data(), x, 1);
+                for (int i = 0; i < O; ++i)
+                    sg[i] = quant::clamped_swiglu(sg[i], su[i], cfg_.moe.swiglu_limit);
+                shared_down_[layer].gemm(sd.data(), sg.data(), 1);
+                for (int i = 0; i < H; ++i)
+                    h[i] += sd[i];
+            }
+        }
+        return true;
+    }
+
     Status moe_layer(int layer, const float *x, float *h, std::string &err) {
         return moe_layer_n(layer, x, h, 1, err);
     }
@@ -2785,6 +3094,9 @@ private:
             trace_.emit(c, layer, ids, wt.data() + static_cast<size_t>(c) * K, K, terr);
         }
         trace_.end();
+        if (want_tp2_ && K == 6 && dsv4_cuda::available() &&
+            moe_layer_ep2(layer, xs, hs, C, idx.data(), K, err))
+            return Status::Ok;
         std::vector<int> uniq(static_cast<size_t>(std::max(cfg_.moe.n_experts, 1)));
         int nu = moe_union_ids(idx.data(), C, K, uniq.data(), static_cast<int>(uniq.size()));
         std::vector<ExpertKey> keys(static_cast<size_t>(nu));
@@ -2987,6 +3299,7 @@ private:
     std::vector<uint32_t> turn_c_;
     RouteTrace trace_;
     bool loaded_ = false;
+    bool want_tp2_ = false;
     bool from_checkpoint_ = false;
     std::string prefix_;
     std::vector<float> embed_, norm_;

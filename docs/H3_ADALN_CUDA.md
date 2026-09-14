@@ -6,7 +6,7 @@
 | Date | 2026-09-14 |
 | Status | Landed (stream + tiled GEMM); 3-mod AdaLN + CUDA SDPA follow-up in tree |
 | Scope | `H3Engine` AdaLN host load + `h3_cuda::dit_residual` device path |
-| Out of scope | official_metal generate, physical TP2, Vulkan kernels, `MVLLM_H3_SKIP_TEXT=0` 32B encode |
+| Out of scope | residual-gate GEMM epilogue, `set_rope` (optional) |
 | Baseline | `f1cef47` (H3 CUDA DiT, streamed Qwen text encoder, prepare/run scripts) |
 
 ## Overview
@@ -128,7 +128,7 @@ DiT **block blobs** already stream via `BlockStore::acquire` / `release` / `pref
 
 ### Non-Goals
 
-- official_metal generate, physical TP2, Vulkan DiT kernels.
+- residual-gate GEMM epilogue and `set_rope` (optional).
 - Turning `SKIP_TEXT` off and encoding the 32B Qwen stack as part of this work.
 - 3-modality AdaLN `row_map` (official `3*6*H` consumed per segment kind). Generate keeps `mrows = 6*H` (first modality). Full 3-mod `mod` is a later generate-layout change.
 - Switching generate onto two-SiLU `h3_time_embed`.
@@ -833,7 +833,7 @@ Two incremental local commits. Either is independently reviewable; commit 2 does
 - `H3DitSchedule` supplies time features + `row_map` (`time_row * 3 + tag`).
 - `dit_residual` / `h3_dit_block_cpu` take optional `row_map` + `adaln_groups`; null map is the old `[6,H]` contract.
 - CUDA SDPA: batched-head `scores[heads,T,T]` when `heads*T*T*4 ≤ 64 MiB`; else online softmax. `MVLLM_H3_CUDA_SDPA=online|batched` overrides.
-- Metal GPU path falls back to CPU when `groups > 1`.
+- Metal GPU path runs `row_map` / `adaln_groups` on device (no T≤256 cap).
 - `describe()` appends `,3mod` when any usable layer has `3*6*H` rows. Generate note adds `adaln_groups=N`.
 
 No further PRs in this design. Residual-gate GEMM epilogue and `set_rope` remain optional.

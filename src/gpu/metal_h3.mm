@@ -25,12 +25,12 @@ static const char *kMetalSrc = R"MSL(
 using namespace metal;
 
 struct GemmArgs { int S; int I; int O; };
-struct AdalnArgs { int T; int H; float eps; int has_mod; int scale_slot; int shift_slot; };
+struct AdalnArgs { int T; int H; float eps; int has_mod; int scale_slot; int shift_slot; int groups; };
 struct AttnArgs { int T; int I; int hd; int heads; };
 struct ElemArgs { int n; };
 struct QkNormArgs { int T; int I; int hd; int heads; int do_q; int do_k; float eps; };
 struct RopeArgs { int T; int I; int hd; int heads; };
-struct GateArgs { int T; int H; int has_mod; int slot; };
+struct GateArgs { int T; int H; int has_mod; int slot; int groups; };
 
 kernel void gemm_f32(device const float *x [[buffer(0)]],
                      device const float *w [[buffer(1)]],
@@ -57,10 +57,12 @@ kernel void bf16_to_f32(device const ushort *src [[buffer(0)]],
 }
 
 // RMSNorm then y = y * (1 + scale) + shift. Slots match h3_dit_block_cpu.
+// row_map[t] selects AdaLN group when groups>1; null / groups<=1 → group 0.
 kernel void adaln(device const float *x [[buffer(0)]],
                   device const float *mod [[buffer(1)]],
                   device float *y [[buffer(2)]],
-                  constant AdalnArgs &a [[buffer(3)]],
+                  device const uint *row_map [[buffer(3)]],
+                  constant AdalnArgs &a [[buffer(4)]],
                   uint gid [[thread_position_in_grid]]) {
     if (gid >= (uint)a.T) return;
     const int H = a.H;
@@ -71,8 +73,12 @@ kernel void adaln(device const float *x [[buffer(0)]],
         ss += xs[i] * xs[i];
     float inv = rsqrt(ss / (float)H + a.eps);
     if (a.has_mod != 0) {
-        const device float *s = mod + (ulong)a.scale_slot * (uint)H;
-        const device float *b = mod + (ulong)a.shift_slot * (uint)H;
+        int g = 0;
+        if (a.groups > 1 && row_map)
+            g = (int)row_map[gid];
+        if (g < 0 || g >= a.groups) g = 0;
+        const device float *s = mod + (ulong)(g * 6 + a.scale_slot) * (uint)H;
+        const device float *b = mod + (ulong)(g * 6 + a.shift_slot) * (uint)H;
         for (int i = 0; i < H; ++i)
             ys[i] = xs[i] * inv * (1.0f + s[i]) + b[i];
     } else {
@@ -137,6 +143,7 @@ kernel void rope_qk(device float *qkv [[buffer(0)]],
     }
 }
 
+// Online softmax SDPA — no T<=256 thread-array cap (matches h3_cuda k_sdpa_online).
 kernel void dit_attn(device const float *qkv [[buffer(0)]],
                      device float *ctx [[buffer(1)]],
                      constant AttnArgs &a [[buffer(2)]],
@@ -148,46 +155,52 @@ kernel void dit_attn(device const float *qkv [[buffer(0)]],
     const int I = a.I;
     const int hd = a.hd;
     const float scale = rsqrt((float)hd);
-    thread float scores[256];
-    if (T > 256) return;
     const device float *q = qkv + (ulong)qi * (uint)(3 * I) + h * (uint)hd;
-    float m = -1e30f;
-    for (int ki = 0; ki < T; ++ki) {
-        const device float *k = qkv + (ulong)ki * (uint)(3 * I) + I + h * (uint)hd;
-        float acc = 0.0f;
-        for (int d = 0; d < hd; ++d)
-            acc += q[d] * k[d];
-        scores[ki] = acc * scale;
-        if (scores[ki] > m) m = scores[ki];
-    }
-    float sum = 0.0f;
-    for (int ki = 0; ki < T; ++ki) {
-        scores[ki] = exp(scores[ki] - m);
-        sum += scores[ki];
-    }
-    float inv = (sum == 0.0f) ? 0.0f : 1.0f / sum;
     device float *o = ctx + (ulong)qi * (uint)I + h * (uint)hd;
     for (int d = 0; d < hd; ++d)
         o[d] = 0.0f;
-    for (int vi = 0; vi < T; ++vi) {
-        const device float *v = qkv + (ulong)vi * (uint)(3 * I) + 2 * I + h * (uint)hd;
-        float w = scores[vi] * inv;
+    float m = -1e30f;
+    float l = 0.0f;
+    for (int ki = 0; ki < T; ++ki) {
+        const device float *k = qkv + (ulong)ki * (uint)(3 * I) + I + h * (uint)hd;
+        const device float *v = qkv + (ulong)ki * (uint)(3 * I) + 2 * I + h * (uint)hd;
+        float s = 0.0f;
         for (int d = 0; d < hd; ++d)
-            o[d] += w * v[d];
+            s += q[d] * k[d];
+        s *= scale;
+        float m2 = s > m ? s : m;
+        float alpha = exp(m - m2);
+        float e = exp(s - m2);
+        l = l * alpha + e;
+        for (int d = 0; d < hd; ++d)
+            o[d] = o[d] * alpha + e * v[d];
+        m = m2;
     }
+    float inv = (l == 0.0f) ? 0.0f : 1.0f / l;
+    for (int d = 0; d < hd; ++d)
+        o[d] *= inv;
 }
 
-// x += (has_mod ? mod[slot] : 1) * y. Attn gate is slot 2, MLP gate is slot 5.
+// x += (has_mod ? mod[group, slot] : 1) * y. Attn gate is slot 2, MLP gate is slot 5.
 kernel void residual_gate(device float *x [[buffer(0)]],
                           device const float *y [[buffer(1)]],
                           device const float *mod [[buffer(2)]],
-                          constant GateArgs &a [[buffer(3)]],
+                          device const uint *row_map [[buffer(3)]],
+                          constant GateArgs &a [[buffer(4)]],
                           uint gid [[thread_position_in_grid]]) {
     const int n = a.T * a.H;
     if (gid >= (uint)n) return;
-    int i = (int)gid % a.H;
-    float g = (a.has_mod != 0) ? mod[(ulong)a.slot * (uint)a.H + (uint)i] : 1.0f;
-    x[gid] += g * y[gid];
+    const int H = a.H;
+    int t = (int)gid / H;
+    int i = (int)gid % H;
+    int g = 0;
+    if (a.groups > 1 && row_map)
+        g = (int)row_map[t];
+    if (g < 0 || g >= a.groups) g = 0;
+    float gval = 1.0f;
+    if (a.has_mod != 0)
+        gval = mod[(ulong)(g * 6 + a.slot) * (uint)H + (uint)i];
+    x[gid] += gval * y[gid];
 }
 
 kernel void swiglu_pack(device const float *h1 [[buffer(0)]],
@@ -483,7 +496,7 @@ struct GemmArgs {
 struct AdalnArgs {
     int T, H;
     float eps;
-    int has_mod, scale_slot, shift_slot;
+    int has_mod, scale_slot, shift_slot, groups;
 };
 struct AttnArgs {
     int T, I, hd, heads;
@@ -499,7 +512,7 @@ struct RopeArgs {
     int T, I, hd, heads;
 };
 struct GateArgs {
-    int T, H, has_mod, slot;
+    int T, H, has_mod, slot, groups;
 };
 struct RmsArgs {
     int n;
@@ -1128,7 +1141,7 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
                   const uint32_t *row_map, int adaln_groups) {
     init();
-    if (!g.ready || tokens > 256 || (row_map && adaln_groups > 1))
+    if (!g.ready)
         return cpu_dit(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn,
                        head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin,
                        row_map, adaln_groups);
@@ -1152,6 +1165,7 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         const int64_t fc1_n = fc1_bytes / 2;
         const int64_t fc2_n = fc2_bytes / 2;
         const int has_mod = adaln_mod ? 1 : 0;
+        const int groups = adaln_groups > 0 ? adaln_groups : 1;
         const int do_q = q_norm ? 1 : 0;
         const int do_k = k_norm ? 1 : 0;
         const bool do_rope = rope_cos && rope_sin && hd >= 96;
@@ -1174,22 +1188,31 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         id<MTLBuffer> bh1 = buf_empty(g.device, sizeof(float) * (size_t)T * 2 * ffn);
         id<MTLBuffer> bgated = buf_empty(g.device, sizeof(float) * (size_t)T * ffn);
         id<MTLBuffer> bdown = buf_empty(g.device, sizeof(float) * (size_t)T * H);
-        id<MTLBuffer> bmod = buf_bytes(g.device, adaln_mod, sizeof(float) * (size_t)6 * H);
+        const size_t mod_bytes = (adaln_mod && groups > 0)
+                                     ? sizeof(float) * (size_t)groups * 6 * (size_t)H
+                                     : sizeof(float) * (size_t)6 * (size_t)H;
+        id<MTLBuffer> bmod = buf_bytes(g.device, adaln_mod, mod_bytes);
+        // Dummy is T zeros when groups>1 so row_map[t] is in-range (g=0).
+        id<MTLBuffer> bmap =
+            row_map ? buf_bytes(g.device, row_map, sizeof(uint32_t) * (size_t)T)
+                    : buf_empty(g.device, sizeof(uint32_t) * (size_t)(groups > 1 ? T : 1));
         id<MTLBuffer> bqn = buf_bytes(g.device, q_norm, sizeof(float) * (size_t)hd);
         id<MTLBuffer> bkn = buf_bytes(g.device, k_norm, sizeof(float) * (size_t)hd);
         id<MTLBuffer> bcos = buf_bytes(g.device, rope_cos, sizeof(float) * (size_t)T * 48);
         id<MTLBuffer> bsin = buf_bytes(g.device, rope_sin, sizeof(float) * (size_t)T * 48);
 
         id<MTLCommandBuffer> cb = [g.queue commandBuffer];
-        if (!cb || !bqkv_bf || !bout_bf || !bfc1_bf || !bfc2_bf || !bx)
+        if (!cb || !bqkv_bf || !bout_bf || !bfc1_bf || !bfc2_bf || !bx || !bxn || !wqkv || !wout ||
+            !wfc1 || !wfc2 || !bqkv || !bctx || !battn || !bh1 || !bgated || !bdown || !bmod ||
+            !bmap)
             return cpu_dit(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn,
-                           head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos,
-                           rope_sin);
+                           head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin,
+                           row_map, adaln_groups);
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         if (!enc)
             return cpu_dit(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn,
-                           head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos,
-                           rope_sin);
+                           head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin,
+                           row_map, adaln_groups);
 
         auto enc1 = [&](id<MTLComputePipelineState> p, uint n, NSArray *bufs, const void *uni,
                         size_t uni_n) {
@@ -1223,8 +1246,8 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         launch_bf16(bfc1_bf, wfc1, (int)fc1_n);
         launch_bf16(bfc2_bf, wfc2, (int)fc2_n);
 
-        AdalnArgs a0{T, H, eps, has_mod, 0, 1};
-        enc1(g.p_adaln, (uint)T, @[ bx, bmod, bxn ], &a0, sizeof(a0));
+        AdalnArgs a0{T, H, eps, has_mod, 0, 1, groups};
+        enc1(g.p_adaln, (uint)T, @[ bx, bmod, bxn, bmap ], &a0, sizeof(a0));
         GemmArgs gq{T, H, 3 * I};
         enc2(g.p_gemm, (uint)(3 * I), (uint)T, @[ bxn, wqkv, bqkv ], &gq, sizeof(gq));
         if (do_q || do_k) {
@@ -1239,27 +1262,27 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         enc2(g.p_attn, (uint)heads, (uint)T, @[ bqkv, bctx ], &aa, sizeof(aa));
         GemmArgs go{T, I, H};
         enc2(g.p_gemm, (uint)H, (uint)T, @[ bctx, wout, battn ], &go, sizeof(go));
-        GateArgs ga{T, H, has_mod, 2};
-        enc1(g.p_gate, (uint)(T * H), @[ bx, battn, bmod ], &ga, sizeof(ga));
+        GateArgs ga{T, H, has_mod, 2, groups};
+        enc1(g.p_gate, (uint)(T * H), @[ bx, battn, bmod, bmap ], &ga, sizeof(ga));
 
-        AdalnArgs a1{T, H, eps, has_mod, 3, 4};
-        enc1(g.p_adaln, (uint)T, @[ bx, bmod, bxn ], &a1, sizeof(a1));
+        AdalnArgs a1{T, H, eps, has_mod, 3, 4, groups};
+        enc1(g.p_adaln, (uint)T, @[ bx, bmod, bxn, bmap ], &a1, sizeof(a1));
         GemmArgs g1{T, H, 2 * ffn};
         enc2(g.p_gemm, (uint)(2 * ffn), (uint)T, @[ bxn, wfc1, bh1 ], &g1, sizeof(g1));
         GemmArgs gs{T, 0, ffn};
         enc2(g.p_swiglu, (uint)ffn, (uint)T, @[ bh1, bgated ], &gs, sizeof(gs));
         GemmArgs g2{T, ffn, H};
         enc2(g.p_gemm, (uint)H, (uint)T, @[ bgated, wfc2, bdown ], &g2, sizeof(g2));
-        GateArgs gm{T, H, has_mod, 5};
-        enc1(g.p_gate, (uint)(T * H), @[ bx, bdown, bmod ], &gm, sizeof(gm));
+        GateArgs gm{T, H, has_mod, 5, groups};
+        enc1(g.p_gate, (uint)(T * H), @[ bx, bdown, bmod, bmap ], &gm, sizeof(gm));
 
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.error)
             return cpu_dit(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn,
-                           head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos,
-                           rope_sin);
+                           head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin,
+                           row_map, adaln_groups);
         std::memcpy(x, [bx contents], sizeof(float) * (size_t)T * H);
         return true;
     }
@@ -1412,6 +1435,7 @@ bool vae_transformer_block(float *x, int tokens, int hidden, int heads, int hd,
             scale1 ? buf_bytes(g.device, scale1, sizeof(float) * (size_t)H) : buf_empty(g.device, 4);
         id<MTLBuffer> bs2 =
             scale2 ? buf_bytes(g.device, scale2, sizeof(float) * (size_t)H) : buf_empty(g.device, 4);
+        id<MTLBuffer> bmap0 = buf_empty(g.device, sizeof(uint32_t));
         id<MTLBuffer> bw1 = nil, bb1 = nil, bh1 = nil, bgated = nil, bw2 = nil, bb2 = nil,
                       bdown = nil;
         if (do_ffn) {
@@ -1428,7 +1452,7 @@ bool vae_transformer_block(float *x, int tokens, int hidden, int heads, int hd,
             }
         }
         if (!bx || !bnrm || !bn1 || !bn2 || !bwqkv || !bqkv || !bctx || !bao || !bs1 || !bs2 ||
-            (out_w && !bwout) || (qkv_b && !bqkvb) || (out_b && !boutb) ||
+            !bmap0 || (out_w && !bwout) || (qkv_b && !bqkvb) || (out_b && !boutb) ||
             (do_ffn && (!bw1 || !bh1 || !bgated)) || (do_ffn && b1 && !bb1) ||
             (do_ffn && w2 && (!bw2 || !bdown)) || (do_ffn && w2 && b2 && !bb2))
             return cpu_vae_transformer_block(x, tokens, hidden, heads, hd, norm1, qkv_w, qkv_b,
@@ -1461,8 +1485,8 @@ bool vae_transformer_block(float *x, int tokens, int hidden, int heads, int hd,
             }
             ao = bao;
         }
-        GateArgs ga{T, H, scale1 ? 1 : 0, 0};
-        enc1(enc, g.p_gate, (uint)(T * H), @[ bx, ao, bs1 ], &ga, sizeof(ga));
+        GateArgs ga{T, H, scale1 ? 1 : 0, 0, 1};
+        enc1(enc, g.p_gate, (uint)(T * H), @[ bx, ao, bs1, bmap0 ], &ga, sizeof(ga));
         RmsRowArgs r1{T, H, eps, norm2 ? 1 : 0};
         enc1(enc, g.p_rms_rows, (uint)T, @[ bx, bn2, bnrm ], &r1, sizeof(r1));
         if (do_ffn) {
@@ -1481,8 +1505,8 @@ bool vae_transformer_block(float *x, int tokens, int hidden, int heads, int hd,
                     GemmArgs gb{T, 0, H};
                     enc2(enc, g.p_bias, (uint)H, (uint)T, @[ bdown, bb2 ], &gb, sizeof(gb));
                 }
-                GateArgs gm{T, H, scale2 ? 1 : 0, 0};
-                enc1(enc, g.p_gate, (uint)(T * H), @[ bx, bdown, bs2 ], &gm, sizeof(gm));
+                GateArgs gm{T, H, scale2 ? 1 : 0, 0, 1};
+                enc1(enc, g.p_gate, (uint)(T * H), @[ bx, bdown, bs2, bmap0 ], &gm, sizeof(gm));
             }
         }
 

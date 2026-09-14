@@ -5,13 +5,14 @@
 namespace mvllm {
 namespace vk_ops {
 
-// Host Vulkan surface. Always compiled: ops run on CPU until a device
-// backend is linked. available() is true after init. False return = bad args.
+// Host Vulkan surface. Always compiled. With MVLLM_WITH_VULKAN and live
+// compute pipelines, the five elementwise/GEMM ops dispatch embedded SPIR-V;
+// otherwise CPU. available() is true after init. False return = bad args.
 
 bool init();
 void shutdown();
 bool available();
-const char *backend_name(); // "vulkan" after a live instance, else "cpu"
+const char *backend_name(); // "vulkan" when compute pipelines are live, else "cpu"
 
 bool rmsnorm(float *y, const float *x, const float *w, int nrows, int D, float eps);
 bool add(float *y, const float *a, size_t n);

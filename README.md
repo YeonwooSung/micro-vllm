@@ -90,20 +90,25 @@ no `--family` flag.
 `--device cpu|metal|cuda` (or `MVLLM_DEVICE`) selects the compute backend.
 Default is `cpu` so tests stay deterministic.
 
-- K3 / GLM: Metal residual + post-LN (`layer_decode`) when the Metal
-  backend is live; otherwise `vk_ops::layer_residual`. S=1 decode may fuse
-  KDA (`layer_decode_kda`) or absorbed MLA (`layer_decode_mla`) into that
-  tail. GLM routed int4 uses `moe_block` with clamped-SwiGLU. K3 F32
+- K3 / GLM: official Metal residual (`official=`) when
+  `-DMVLLM_OFFICIAL_METAL_HOST=ON` and coli is live; else Metal residual +
+  post-LN (`layer_decode`); else `vk_ops::layer_residual`. S=1 decode may
+  fuse KDA (`layer_decode_kda`) or absorbed MLA (`layer_decode_mla`) into
+  that tail. GLM routed int4 uses `moe_block` with clamped-SwiGLU. K3 F32
   dense/shared uses SiTU; routed MXFP4 uses `moe_block` fmt 7 (SiTU)
   before `coli_cuda` / host.
-- H3: Metal AdaLN residual (`h3gpu=`), plus VAE / vision / audio blocks
-  when the op matches (`int8=` / `nax=`).
+- H3: CUDA DiT first, then official `h3_gpu` (`official=`), then Metal
+  AdaLN residual (`h3gpu=`), plus VAE / vision / audio blocks when the op
+  matches (`int8=` / `nax=`). Metal AdaLN uses per-token `row_map` groups.
 - CUDA (`-DMVLLM_GPU_CUDA=ON`): K3/GLM expert GEMM via `coli_cuda`; DSV4
-  route / mHC / sparse attn via `dsv4_cuda` when shapes match.
+  route / mHC / sparse attn via `dsv4_cuda` when shapes match. `MVLLM_TP=2`
+  runs DSV4 through TP2/EP2 (`tp=` / `tpdev=`).
+- Vulkan (`-DMVLLM_GPU_VULKAN=ON`): `vk_ops` GEMM / residual / rmsnorm
+  dispatch embedded SPIR-V when a device is present (`vk=vulkan`).
 
-`info` tags: `coli=cpu|cuda|off`, `metal=cpu|metal|off`, `vk=cpu|vulkan|off`,
-`tier=cpu|cuda|off` (DSV4), `h3gpu=…`, `mtp=off|loaded|markov|fwd`,
-`ckpt=N hits=M`.
+`info` tags: `coli=cpu|cuda|off`, `metal=cpu|metal|off`, `official=…`,
+`vk=cpu|vulkan|off`, `tier=cpu|cuda|off` (DSV4), `tp=1|2`, `tpdev=0|1|2`,
+`h3gpu=…`, `mtp=off|loaded|markov|fwd`, `ckpt=N hits=M`.
 
 Also: `--expert-gb N`, `--kv-slots N` (serve/mux, 1–16).
 

@@ -42,6 +42,10 @@ bool available();
 const char *backend_name();
 bool backend_arch_ok(int device);
 long long mem_free_mb(int device);
+int available_device_count();
+// True when tp_size==2 AND at least 2 CUDA devices.
+bool physical_tp2();
+int rank_device(int rank); // 0 or 1 → cuda device id, or 0 if logical
 
 // Weight uploads. scale is e8m0 tiles: FP8 [ceil(O/128), ceil(I/128)],
 // FP4 [O, ceil(I/32)]. FP4 weights are packed e2m1 nibbles [O, ceil(I/2)].
@@ -167,6 +171,10 @@ KvCache *kv_create(int device, int window, int head_dim, int max_tokens, int rop
                    const float *rope_cos, const float *rope_sin, const float *compress_cos,
                    const float *compress_sin);
 void kv_free(KvCache *cache);
+// Replace cache keys with [tokens, head_dim] rows and mark the cache seeded so
+// the next attention_window* call attends them without appending another key.
+bool kv_seed(KvCache *cache, const float *keys, int tokens);
+void kv_set_rope_theta(KvCache *cache, float theta);
 
 bool attention_window(const Activation *input, Tensor *attn_norm, Tensor *q_a, Tensor *q_norm,
                       Tensor *q_b, Tensor *wkv, Tensor *kv_norm, Tensor *sink, Tensor *wo_a,

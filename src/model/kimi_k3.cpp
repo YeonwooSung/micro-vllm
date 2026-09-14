@@ -2,6 +2,7 @@
 #include "../gpu/backend.hpp"
 #include "../gpu/coli_cuda.hpp"
 #include "../gpu/metal_ops.hpp"
+#include "../gpu/official_metal.hpp"
 #include "../gpu/vk_ops.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
@@ -160,6 +161,9 @@ bool k3_expert_try_metal(float *y, const float *x, int S, const uint8_t *blob, i
 // x += attn; nrm = rmsnorm(x, post_ln). Shared expert stays on the host (SiTU).
 void k3_resid_post_ln(float *x, const float *attn, const float *post_ln, float *nrm, int H,
                       float eps) {
+    if (official_metal::coli_available() &&
+        official_metal::layer_residual(x, attn, post_ln, nrm, H, eps))
+        return;
     if (metal_ops::available() && std::strcmp(metal_ops::backend_name(), "metal") == 0 &&
         metal_ops::layer_decode(x, attn, post_ln, nullptr, nullptr, nullptr, H, 0, eps, nrm,
                                 nullptr))
@@ -322,6 +326,7 @@ public:
         loaded_ = true;
         coli_cuda::init(nullptr, 0);
         metal_ops::init();
+        official_metal::init();
         vk_ops::init();
         return Status::Ok;
     }
@@ -740,6 +745,7 @@ public:
         else
             os << "off";
         os << " metal=" << (metal_ops::available() ? metal_ops::backend_name() : "off")
+           << " official=" << official_metal::status()
            << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off");
         return os.str();
     }

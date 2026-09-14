@@ -1211,6 +1211,7 @@ static void test_dsv4_tiny() {
     CHECK(dsv4_mtp_info.find("draft=3") != std::string::npos);
     CHECK(dsv4_mtp_info.find("mtp=") != std::string::npos);
     CHECK(dsv4_mtp_info.find("vk=") != std::string::npos);
+    CHECK(dsv4_mtp_info.find("tp=") != std::string::npos);
     if (!dsv4_mtp_prev.empty())
         setenv("V4_MTP", dsv4_mtp_prev.c_str(), 1);
     else
@@ -1276,6 +1277,27 @@ static void test_dsv4_tiny() {
     CHECK(chat.find("<｜Assistant｜>") != std::string::npos);
     std::string think = tk.apply_chat(Family::Dsv4, {{"user", "hi"}}, true);
     CHECK(think.find("<think>") != std::string::npos);
+
+    {
+        const char *tp_old = std::getenv("MVLLM_TP");
+        const std::string tp_prev = tp_old ? tp_old : "";
+        setenv("MVLLM_TP", "2", 1);
+        Engine etp;
+        RuntimeConfig rttp;
+        rttp.expert_gb = 0.01;
+        rttp.tp_size = 2;
+        CHECK(etp.load(tiny, rttp, err) == Status::Ok);
+        const std::string tpinfo = etp.info();
+        CHECK(tpinfo.find("tp=2") != std::string::npos);
+        CHECK(tpinfo.find("tpdev=") != std::string::npos);
+        GenResult grtp;
+        CHECK(etp.generate("hi", gp, grtp, err) == Status::Ok);
+        CHECK(grtp.completion_tokens > 0);
+        if (!tp_prev.empty())
+            setenv("MVLLM_TP", tp_prev.c_str(), 1);
+        else
+            unsetenv("MVLLM_TP");
+    }
 }
 
 static std::string env_copy(const char *k) {
@@ -1459,6 +1481,10 @@ static void test_dsv4_cuda_tier() {
     CHECK(dsv4_cu_arch);
     const bool dsv4_cu_init_again = init(nullptr, 0);
     CHECK(dsv4_cu_init_again);
+    CHECK(available_device_count() >= 0);
+    CHECK(rank_device(0) == 0);
+    if (!physical_tp2())
+        CHECK(rank_device(1) == 0);
 
     {
         const float W[16] = {1.f, 0.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f,
@@ -2008,6 +2034,77 @@ static void test_dsv4_cuda_tier() {
         tensor_free(wo_b);
     }
 
+    {
+        const int H = 8, heads = 2, dim = 4;
+        std::vector<float> ones8(H, 1.f), ones4(dim, 1.f), ones2(heads, 0.f);
+        std::vector<float> ident(static_cast<size_t>(H) * H, 0.f);
+        for (int i = 0; i < H; ++i)
+            ident[static_cast<size_t>(i) * H + i] = 1.f;
+        std::vector<float> wkv(static_cast<size_t>(dim) * H, 0.f);
+        for (int i = 0; i < dim; ++i)
+            wkv[static_cast<size_t>(i) * H + i] = 1.f;
+        std::vector<float> xin(H);
+        for (int i = 0; i < H; ++i)
+            xin[static_cast<size_t>(i)] = 0.1f * static_cast<float>(i + 1);
+        std::vector<float> past(static_cast<size_t>(2) * dim, 0.f);
+        for (int t = 0; t < 2; ++t)
+            for (int d = 0; d < dim; ++d)
+                past[static_cast<size_t>(t) * dim + d] = 0.05f * static_cast<float>(t * dim + d + 1);
+        AttentionWeights w{};
+        CHECK(upload_f32(&w.attn_norm, ones8.data(), 1, H, 0));
+        CHECK(upload_f32(&w.q_a, ident.data(), H, H, 0));
+        CHECK(upload_f32(&w.q_norm, ones8.data(), 1, H, 0));
+        CHECK(upload_f32(&w.q_b, ident.data(), heads * dim, H, 0));
+        CHECK(upload_f32(&w.wkv, wkv.data(), dim, H, 0));
+        CHECK(upload_f32(&w.kv_norm, ones4.data(), 1, dim, 0));
+        CHECK(upload_f32(&w.sink, ones2.data(), heads, 1, 0));
+        CHECK(upload_f32(&w.wo_a, ident.data(), H, heads * dim, 0));
+        CHECK(upload_f32(&w.wo_b, ident.data(), H, H, 0));
+        KvCache *c0 = kv_create(0, 4, dim, 4, 0, nullptr, nullptr, nullptr, nullptr);
+        KvCache *c1 = kv_create(0, 4, dim, 4, 0, nullptr, nullptr, nullptr, nullptr);
+        CHECK(c0 && c1);
+        kv_set_rope_theta(c0, 10000.f);
+        kv_set_rope_theta(c1, 10000.f);
+        CHECK(kv_seed(c0, past.data(), 2));
+        CHECK(kv_seed(c1, past.data(), 2));
+        Activation *in0 = activation_create(0, H);
+        Activation *in1 = activation_create(0, H);
+        Activation *out0 = activation_create(0, H);
+        Activation *out1 = activation_create(0, H);
+        CHECK(in0 && in1 && out0 && out1);
+        CHECK(activation_upload(in0, xin.data(), H));
+        CHECK(activation_copy(in1, in0, H));
+        CHECK(attention_window_tp2(in0, in1, &w, &w, 0, heads, dim, 2, 1, 1, 1e-6f, c0, c1, out0,
+                                   out1));
+        std::vector<float> y0(H, 0.f), y1(H, 0.f);
+        CHECK(activation_download(y0.data(), out0, H));
+        CHECK(activation_download(y1.data(), out1, H));
+        CHECK(all_finite(y0.data(), H));
+        CHECK(all_finite(y1.data(), H));
+        bool any = false;
+        for (int i = 0; i < H; ++i) {
+            CHECK_NEAR(y0[static_cast<size_t>(i)], y1[static_cast<size_t>(i)], 1e-5);
+            if (y0[static_cast<size_t>(i)] != 0.f)
+                any = true;
+        }
+        CHECK(any);
+        activation_free(in0);
+        activation_free(in1);
+        activation_free(out0);
+        activation_free(out1);
+        kv_free(c0);
+        kv_free(c1);
+        tensor_free(w.attn_norm);
+        tensor_free(w.q_a);
+        tensor_free(w.q_norm);
+        tensor_free(w.q_b);
+        tensor_free(w.wkv);
+        tensor_free(w.kv_norm);
+        tensor_free(w.sink);
+        tensor_free(w.wo_a);
+        tensor_free(w.wo_b);
+    }
+
     tensor_free(nullptr);
     shutdown();
     (void)available();
@@ -2053,8 +2150,11 @@ static void test_coli_cuda_tier() {
     CHECK(coli_cu_init);
     const bool coli_cu_avail = available();
     CHECK(coli_cu_avail);
-    const bool coli_cu_ndev = available_device_count() == 0;
-    CHECK(coli_cu_ndev);
+    const int coli_cu_ndev = available_device_count();
+    CHECK(coli_cu_ndev >= 0);
+#if !defined(MVLLM_WITH_CUDA_GEMM)
+    CHECK(coli_cu_ndev == 0);
+#endif
     const bool coli_cu_init2 = init(nullptr, 0);
     CHECK(coli_cu_init2);
 
@@ -2313,6 +2413,13 @@ static void test_vk_ops_tier() {
     shutdown();
     const bool vk_ops_off = !available();
     CHECK(vk_ops_off);
+
+    CHECK(mvllm::dsv4_cuda::available_device_count() >= 0);
+#if !defined(MVLLM_WITH_CUDA_GEMM)
+    CHECK(!mvllm::dsv4_cuda::physical_tp2());
+    CHECK(mvllm::dsv4_cuda::rank_device(0) == 0);
+    CHECK(mvllm::dsv4_cuda::rank_device(1) == 0);
+#endif
 }
 
 static void test_metal_ops_tier() {
@@ -2336,8 +2443,34 @@ static void test_metal_ops_tier() {
 #if defined(MVLLM_OFFICIAL_METAL_HOST)
         CHECK(mvllm::official_metal::coli_available() || mvllm::official_metal::h3_available() ||
               std::strncmp(mvllm::official_metal::status(), "err:", 4) == 0);
+        if (mvllm::official_metal::coli_available()) {
+            float y[4] = {};
+            const float x[4] = {1.f, 0.f, 0.f, 0.f};
+            const float w[4] = {1.f, 1.f, 1.f, 1.f};
+            CHECK(mvllm::official_metal::rmsnorm(y, x, w, 1, 4, 1e-6f));
+            CHECK(std::isfinite(y[0]) && std::isfinite(y[1]));
+            float acc[2] = {1.f, 2.f};
+            const float addend[2] = {3.f, 4.f};
+            CHECK(mvllm::official_metal::add(acc, addend, 2));
+            CHECK_NEAR(acc[0], 4.f, 1e-5);
+            CHECK_NEAR(acc[1], 6.f, 1e-5);
+            float xr[2] = {1.f, 0.f};
+            const float attn[2] = {0.f, 1.f};
+            const float ln[2] = {1.f, 1.f};
+            float nrm[2] = {};
+            CHECK(mvllm::official_metal::layer_residual(xr, attn, ln, nrm, 2, 1e-6f));
+            CHECK(std::isfinite(xr[0]) && std::isfinite(nrm[0]));
+        }
 #else
         CHECK(std::strcmp(mvllm::official_metal::status(), "off") == 0);
+        float y[2] = {};
+        const float x[2] = {1.f, 0.f};
+        const float w[2] = {1.f, 1.f};
+        CHECK(!mvllm::official_metal::rmsnorm(y, x, w, 1, 2, 1e-6f));
+        CHECK(!mvllm::official_metal::layer_residual(y, x, w, y, 2, 1e-6f));
+        CHECK(!mvllm::official_metal::dit_residual(nullptr, 0, 0, 0, 0, 1, 1, 1, 1, y, 1, 1e-6f,
+                                                   nullptr, nullptr, nullptr, nullptr, nullptr,
+                                                   nullptr, 1));
 #endif
         mvllm::official_metal::shutdown();
     }
@@ -2695,6 +2828,53 @@ static void test_metal_h3_tier() {
         metal_h3_x_ok = metal_h3_x_ok && std::isfinite(v);
     const bool metal_h3_dit_fin = metal_h3_x_ok;
     CHECK(metal_h3_dit_fin);
+
+    {
+        const int H = metal_h3_hidden, Inn = metal_h3_inner, Ffn = metal_h3_ffn, hd = metal_h3_hd;
+        const int T = metal_h3_tokens;
+        std::vector<float> mod3(static_cast<size_t>(3) * 6 * H, 0.f);
+        for (int g = 0; g < 3; ++g)
+            for (int sl = 0; sl < 6; ++sl)
+                for (int i = 0; i < H; ++i)
+                    mod3[static_cast<size_t>((g * 6 + sl) * H + i)] =
+                        static_cast<float>(g + 1) * 0.04f + static_cast<float>(sl - 2) * 0.015f;
+        std::vector<uint32_t> mmap(static_cast<size_t>(T), 0u);
+        mmap[0] = 0;
+        if (T > 1)
+            mmap[1] = 2;
+        std::vector<float> xc(static_cast<size_t>(T) * H), xg(static_cast<size_t>(T) * H);
+        for (int i = 0; i < T * H; ++i)
+            xc[static_cast<size_t>(i)] = xg[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+        h3_dit_block_cpu(metal_h3_blob.data(), metal_h3_qkv_n * 2, metal_h3_out_n * 2,
+                         metal_h3_fc1_n * 2, metal_h3_fc2_n * 2, H, Inn, Ffn, hd, xc.data(), T,
+                         1e-6f, mod3.data(), nullptr, nullptr, nullptr, nullptr, mmap.data(), 3);
+        CHECK(dit_residual(metal_h3_blob.data(), metal_h3_qkv_n * 2, metal_h3_out_n * 2,
+                           metal_h3_fc1_n * 2, metal_h3_fc2_n * 2, H, Inn, Ffn, hd, xg.data(), T,
+                           1e-6f, mod3.data(), nullptr, nullptr, nullptr, nullptr, mmap.data(), 3));
+        bool mix_ok = true;
+        for (int i = 0; i < T * H; ++i)
+            mix_ok = mix_ok && std::fabs(xc[static_cast<size_t>(i)] - xg[static_cast<size_t>(i)]) <
+                                   2e-4f;
+        CHECK(mix_ok);
+
+        const int Twide = 260;
+        std::vector<uint8_t> wide_blob = metal_h3_blob;
+        std::vector<float> xcw(static_cast<size_t>(Twide) * H), xgw(static_cast<size_t>(Twide) * H);
+        for (int i = 0; i < Twide * H; ++i)
+            xcw[static_cast<size_t>(i)] = xgw[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.05f;
+        h3_dit_block_cpu(wide_blob.data(), metal_h3_qkv_n * 2, metal_h3_out_n * 2,
+                         metal_h3_fc1_n * 2, metal_h3_fc2_n * 2, H, Inn, Ffn, hd, xcw.data(), Twide,
+                         1e-6f, nullptr, nullptr, nullptr, nullptr, nullptr);
+        CHECK(dit_residual(wide_blob.data(), metal_h3_qkv_n * 2, metal_h3_out_n * 2,
+                           metal_h3_fc1_n * 2, metal_h3_fc2_n * 2, H, Inn, Ffn, hd, xgw.data(),
+                           Twide, 1e-6f, nullptr, nullptr, nullptr, nullptr, nullptr));
+        bool wide_ok = true;
+        for (int i = 0; i < Twide * H; ++i)
+            wide_ok =
+                wide_ok && std::fabs(xcw[static_cast<size_t>(i)] - xgw[static_cast<size_t>(i)]) <
+                               2e-4f;
+        CHECK(wide_ok);
+    }
 
     {
         const int8_t metal_h3_iw[4] = {1, -1, 2, 0};
@@ -3417,12 +3597,15 @@ static void test_glm53_container() {
     std::string info = eg.info();
     CHECK(info.find("checkpoint=yes") != std::string::npos);
     CHECK(info.find("bits=4") != std::string::npos);
-    const bool glm_coli_tier_cpu = info.find("coli=cpu") != std::string::npos;
-    CHECK(glm_coli_tier_cpu);
+    const bool glm_coli_tier = info.find("coli=cpu") != std::string::npos ||
+                              info.find("coli=cuda") != std::string::npos;
+    CHECK(glm_coli_tier);
     const bool glm_coli_avail = mvllm::coli_cuda::available();
     CHECK(glm_coli_avail);
     const bool glm_metal_tier = info.find("metal=") != std::string::npos;
     CHECK(glm_metal_tier);
+    const bool glm_official_tier = info.find("official=") != std::string::npos;
+    CHECK(glm_official_tier);
     const bool glm_vk_tier = info.find("vk=") != std::string::npos;
     CHECK(glm_vk_tier);
     const bool glm_vk_cpu = info.find("vk=cpu") != std::string::npos ||
@@ -3506,14 +3689,20 @@ static void test_k3_mxfp4_container() {
     std::string info = ek.info();
     CHECK(info.find("checkpoint=yes") != std::string::npos);
     CHECK(info.find("bits=4") != std::string::npos);
-    const bool k3_coli_tier_cpu = info.find("coli=cpu") != std::string::npos;
-    CHECK(k3_coli_tier_cpu);
+    const bool k3_coli_tier = info.find("coli=cpu") != std::string::npos ||
+                             info.find("coli=cuda") != std::string::npos;
+    CHECK(k3_coli_tier);
     const bool k3_coli_avail = mvllm::coli_cuda::available();
     CHECK(k3_coli_avail);
-    const bool k3_coli_ndev = mvllm::coli_cuda::available_device_count() == 0;
-    CHECK(k3_coli_ndev);
+    const int k3_coli_ndev = mvllm::coli_cuda::available_device_count();
+    CHECK(k3_coli_ndev >= 0);
+#if !defined(MVLLM_WITH_CUDA_GEMM)
+    CHECK(k3_coli_ndev == 0);
+#endif
     const bool k3_metal_tier = info.find("metal=") != std::string::npos;
     CHECK(k3_metal_tier);
+    const bool k3_official_tier = info.find("official=") != std::string::npos;
+    CHECK(k3_official_tier);
     const bool k3_vk_tier = info.find("vk=") != std::string::npos;
     CHECK(k3_vk_tier);
     const bool k3_vk_cpu = info.find("vk=cpu") != std::string::npos ||
@@ -3905,6 +4094,7 @@ static void test_h3_adaln_stream() {
         std::string info = eh.info();
         CHECK(info.find("adaln=stream") != std::string::npos);
         CHECK(info.find("3mod") != std::string::npos);
+        CHECK(info.find("official=") != std::string::npos);
         CHECK(info.find("adaln=off") == std::string::npos);
         H3GenResult hr;
         run_gen(eh, edir + "/out_s.txt", hr);

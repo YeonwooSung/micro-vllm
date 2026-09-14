@@ -233,3 +233,10 @@ bool try_f32_matvec(float *y, const float *x, const float *w, int O, int I) {
 } // namespace device
 } // namespace dsv4_cuda
 } // namespace mvllm
+
+extern "C" int dsv4_cuda_available_device_count(void) {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess)
+        return 0;
+    return n > 0 ? n : 0;
+}

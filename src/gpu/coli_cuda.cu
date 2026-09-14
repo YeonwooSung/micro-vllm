@@ -32,3 +32,10 @@ extern "C" int coli_cuda_gemm_f32_dev(float *y, const float *x, const float *w, 
     gemm_f32_kernel<<<grid, block>>>(y, x, w, S, I, O);
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
 }
+
+extern "C" int coli_cuda_available_device_count(void) {
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess)
+        return 0;
+    return n > 0 ? n : 0;
+}

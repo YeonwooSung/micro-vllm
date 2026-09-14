@@ -11,6 +11,10 @@
 #include <map>
 #include <vector>
 
+#if defined(MVLLM_WITH_CUDA_GEMM)
+extern "C" int coli_cuda_available_device_count(void);
+#endif
+
 namespace mvllm {
 namespace coli_cuda {
 namespace {
@@ -172,7 +176,14 @@ void shutdown() {
 
 bool available() { return g.inited; }
 
-int available_device_count() { return 0; }
+int available_device_count() {
+#if defined(MVLLM_WITH_CUDA_GEMM)
+    const int n = coli_cuda_available_device_count();
+    return n > 0 ? n : 0;
+#else
+    return 0;
+#endif
+}
 
 int device_count() { return g.inited ? static_cast<int>(g.devices.size()) : 0; }
 

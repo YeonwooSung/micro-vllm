@@ -7,6 +7,7 @@
 
 #if defined(MVLLM_WITH_CUDA_GEMM)
 #include "dsv4_cuda_device.hpp"
+extern "C" int dsv4_cuda_available_device_count(void);
 #endif
 
 #include <algorithm>
@@ -83,6 +84,8 @@ struct KvCache {
     int head_dim = 0;
     int max_tokens = 0;
     int rope_pairs = 0;
+    float rope_theta = 0.f;
+    bool seeded = false;
     std::vector<float> rope_cos, rope_sin, compress_cos, compress_sin;
     std::vector<float> keys;
     int filled = 0;
@@ -449,6 +452,23 @@ void shutdown() {
 }
 
 bool available() { return g.inited; }
+
+int available_device_count() {
+#if defined(MVLLM_WITH_CUDA_GEMM)
+    const int n = dsv4_cuda_available_device_count();
+    return n > 0 ? n : 0;
+#else
+    return 0;
+#endif
+}
+
+bool physical_tp2() { return available_device_count() >= 2; }
+
+int rank_device(int rank) {
+    if (!physical_tp2())
+        return 0;
+    return rank == 1 ? 1 : 0;
+}
 
 const char *backend_name() {
 #if defined(MVLLM_WITH_CUDA_GEMM)
@@ -1150,6 +1170,26 @@ KvCache *kv_create(int device, int window, int head_dim, int max_tokens, int rop
 
 void kv_free(KvCache *cache) { delete cache; }
 
+bool kv_seed(KvCache *cache, const float *keys, int tokens) {
+    if (!cache || tokens < 0 || cache->head_dim <= 0)
+        return false;
+    if (tokens > 0 && !keys)
+        return false;
+    const size_t n = static_cast<size_t>(tokens) * static_cast<size_t>(cache->head_dim);
+    if (tokens == 0)
+        cache->keys.clear();
+    else
+        cache->keys.assign(keys, keys + n);
+    cache->filled = tokens;
+    cache->seeded = true;
+    return true;
+}
+
+void kv_set_rope_theta(KvCache *cache, float theta) {
+    if (cache)
+        cache->rope_theta = theta;
+}
+
 namespace {
 
 void allreduce_pair(Activation *a, Activation *b) {
@@ -1161,6 +1201,58 @@ void allreduce_pair(Activation *a, Activation *b) {
         a->v[i] = s;
         b->v[i] = s;
     }
+}
+
+bool peer_copy(Activation *dst, const Activation *src) {
+    if (!dst || !src)
+        return false;
+    const long long n = std::min(activation_elements(dst), activation_elements(src));
+    if (n <= 0)
+        return activation_elements(src) == 0 && activation_elements(dst) == 0;
+    return activation_copy(dst, src, n);
+}
+
+void place_activation(Activation *a, int device) {
+    if (a)
+        a->device = device;
+}
+
+void place_tensor(Tensor *t, int device) {
+    if (t)
+        t->device = device;
+}
+
+void place_attn_weights(const AttentionWeights *w, int device) {
+    if (!w)
+        return;
+    place_tensor(w->attn_norm, device);
+    place_tensor(w->q_a, device);
+    place_tensor(w->qkv, device);
+    place_tensor(w->q_norm, device);
+    place_tensor(w->q_b, device);
+    place_tensor(w->wkv, device);
+    place_tensor(w->kv_norm, device);
+    place_tensor(w->sink, device);
+    place_tensor(w->wo_a, device);
+    place_tensor(w->wo_b, device);
+    place_tensor(w->compress_wkv, device);
+    place_tensor(w->compress_wgate, device);
+    place_tensor(w->compress_ape, device);
+    place_tensor(w->compress_norm, device);
+}
+
+const Activation *activation_on_device(const Activation *src, int device, Activation *scratch) {
+    if (!src)
+        return nullptr;
+    if (!physical_tp2() || src->device == device)
+        return src;
+    if (!scratch)
+        return src;
+    scratch->device = device;
+    scratch->v.assign(src->v.size(), 0.f);
+    if (!src->v.empty() && !peer_copy(scratch, src))
+        scratch->v = src->v;
+    return scratch;
 }
 
 bool attention_window_heads(const Activation *input, Tensor *attn_norm, Tensor *q_a, Tensor *q_norm,
@@ -1189,18 +1281,34 @@ bool attention_window_heads(const Activation *input, Tensor *attn_norm, Tensor *
         return false;
     const float *rcos = cache->rope_cos.empty() ? nullptr : cache->rope_cos.data();
     const float *rsin = cache->rope_sin.empty() ? nullptr : cache->rope_sin.data();
-    apply_rope_pairs(kn.data(), head_dim, qk_rope, pos, rcos, rsin, cache->rope_pairs);
+    const bool use_tables = rcos && rsin && cache->rope_pairs > 0;
+    const bool use_theta = !use_tables && cache->rope_theta > 0.f && qk_rope > 0;
+    const int rope_n = use_theta ? std::min(qk_rope, head_dim) : 0;
+    const bool seeded = cache->seeded && cache->filled > 0;
+    if (!seeded) {
+        if (use_tables)
+            apply_rope_pairs(kn.data(), head_dim, qk_rope, pos, rcos, rsin, cache->rope_pairs);
+        else if (use_theta)
+            mvllm::apply_rope(kn.data() + (head_dim - rope_n), rope_n, pos, cache->rope_theta);
+    }
     const int q_avail = head_dim > 0 ? static_cast<int>(q.size() / static_cast<size_t>(head_dim)) : 0;
     const bool q_sharded = q_avail < heads;
     for (int hi = 0; hi < n_heads; ++hi) {
         const int qh_i = q_sharded ? hi : head_begin + hi;
         if (qh_i < 0 || qh_i >= q_avail)
             continue;
-        apply_rope_pairs(q.data() + static_cast<size_t>(qh_i) * head_dim, head_dim, qk_rope, pos, rcos,
-                         rsin, cache->rope_pairs);
+        float *qh = q.data() + static_cast<size_t>(qh_i) * head_dim;
+        if (use_tables)
+            apply_rope_pairs(qh, head_dim, qk_rope, pos, rcos, rsin, cache->rope_pairs);
+        else if (use_theta)
+            mvllm::apply_rope(qh + (head_dim - rope_n), rope_n, pos, cache->rope_theta);
     }
-    cache->keys.insert(cache->keys.end(), kn.begin(), kn.end());
-    cache->filled += 1;
+    if (seeded)
+        cache->seeded = false;
+    else {
+        cache->keys.insert(cache->keys.end(), kn.begin(), kn.end());
+        cache->filled += 1;
+    }
     const int T = cache->filled;
     const float att_scale = 1.f / std::sqrt(static_cast<float>(head_dim));
     const float *sk = sink && vec_data(sink) ? vec_data(sink) : nullptr;
@@ -1403,9 +1511,27 @@ bool attention_window_tp2(const Activation *input, Activation *peer_input,
                                       w->kv_norm, w->sink, w->wo_a, w->wo_b, use_heads, head_dim,
                                       qk_rope, g, pos, eps, kv, out, head_begin, n_heads);
     };
-    if (!run_rank(input, primary, cache, output, 0))
+    const int d0 = rank_device(0);
+    const int d1 = rank_device(1);
+    Activation in0, in1;
+    const Activation *use_in = input;
+    const Activation *use_pin = peer_input;
+    if (physical_tp2()) {
+        use_in = activation_on_device(input, d0, &in0);
+        use_pin = activation_on_device(peer_input, d1, &in1);
+        place_attn_weights(primary, d0);
+        if (peer != primary)
+            place_attn_weights(peer, d1);
+        if (cache)
+            cache->device = d0;
+        if (peer_cache)
+            peer_cache->device = d1;
+        place_activation(output, d0);
+        place_activation(peer_output, d1);
+    }
+    if (!run_rank(use_in, primary, cache, output, 0))
         return false;
-    if (!run_rank(peer_input, peer, peer_cache, peer_output, 1))
+    if (!run_rank(use_pin, peer, peer_cache, peer_output, 1))
         return false;
     if (heads >= 2)
         allreduce_pair(output, peer_output);
@@ -1563,9 +1689,15 @@ bool expert_bank_upload_tp2(ExpertSet *set, int expert, int rank, const uint8_t 
         return false;
     const int H = set->hidden;
     const int J = set->intermediate;
-    if (H <= 0 || J <= 0 || (J & 1))
-        return expert_bank_upload(set, expert, gate_weight, gate_scale, up_weight, up_scale,
-                                  down_weight, down_scale, nullptr, nullptr, nullptr);
+    const int dev = physical_tp2() ? rank_device(rank) : set->device;
+    if (H <= 0 || J <= 0 || (J & 1)) {
+        const int saved = set->device;
+        set->device = dev;
+        const bool ok = expert_bank_upload(set, expert, gate_weight, gate_scale, up_weight, up_scale,
+                                           down_weight, down_scale, nullptr, nullptr, nullptr);
+        set->device = saved;
+        return ok;
+    }
     const int packed_h = ceil_div(H, 2);
     const int scale_h = std::max(ceil_div(H, 32), 1);
     const uint8_t *gw = gate_weight + static_cast<size_t>(rank) * static_cast<size_t>(J) * packed_h;
@@ -1592,10 +1724,9 @@ bool expert_bank_upload_tp2(ExpertSet *set, int expert, int rank, const uint8_t 
                             static_cast<size_t>(rank) * scale_half,
                         static_cast<size_t>(scale_half));
     }
-    if (!upload_fp4(&set->gate[static_cast<size_t>(expert)], gw, gs, J, H, set->device) ||
-        !upload_fp4(&set->up[static_cast<size_t>(expert)], uw, us, J, H, set->device) ||
-        !upload_fp4(&set->down[static_cast<size_t>(expert)], dw.data(), ds.data(), H, J,
-                    set->device))
+    if (!upload_fp4(&set->gate[static_cast<size_t>(expert)], gw, gs, J, H, dev) ||
+        !upload_fp4(&set->up[static_cast<size_t>(expert)], uw, us, J, H, dev) ||
+        !upload_fp4(&set->down[static_cast<size_t>(expert)], dw.data(), ds.data(), H, J, dev))
         return false;
     return true;
 }
@@ -1713,7 +1844,27 @@ bool route_moe_ep2(const Activation *input, Tensor *gate, Tensor *bias,
                    Activation *output, Activation *peer_output) {
     if (!input || !output || !peer_output || (!local && !peer))
         return false;
+    const int d0 = rank_device(0);
+    const int d1 = rank_device(1);
+    Activation in0, in1;
+    const Activation *use_in = input;
     const Activation *pin = peer_input ? peer_input : input;
+    if (physical_tp2()) {
+        use_in = activation_on_device(input, d0, &in0);
+        pin = activation_on_device(pin, d1, &in1);
+        place_tensor(gate, d0);
+        place_tensor(bias, d0);
+        if (peer_gate && peer_gate != gate)
+            place_tensor(peer_gate, d1);
+        if (peer_bias && peer_bias != bias)
+            place_tensor(peer_bias, d1);
+        place_activation(output, d0);
+        place_activation(peer_output, d1);
+        if (local)
+            local->device = d0;
+        if (peer && peer != local)
+            peer->device = d1;
+    }
     Tensor *pgate = peer_gate ? peer_gate : gate;
     Tensor *pbias = peer_bias ? peer_bias : bias;
     int ids[6] = {-1, -1, -1, -1, -1, -1};
@@ -1721,7 +1872,7 @@ bool route_moe_ep2(const Activation *input, Tensor *gate, Tensor *bias,
     int ids_p[6] = {-1, -1, -1, -1, -1, -1};
     float w_p[6] = {};
     bool routed = false;
-    if (gate && route(input, gate, bias, nullptr, routed_scale, ids, w))
+    if (gate && route(use_in, gate, bias, nullptr, routed_scale, ids, w))
         routed = true;
     if (pgate && route(pin, pgate, pbias, nullptr, routed_scale, ids_p, w_p))
         routed = true;
@@ -1730,7 +1881,7 @@ bool route_moe_ep2(const Activation *input, Tensor *gate, Tensor *bias,
         std::memcpy(w_p, w, sizeof(w));
     }
     if (!routed) {
-        const bool a = local && route_moe(input, gate, bias, token, routed_scale, local, limit, output);
+        const bool a = local && route_moe(use_in, gate, bias, token, routed_scale, local, limit, output);
         const bool b =
             peer && route_moe(pin, pgate, pbias, token, routed_scale, peer, limit, peer_output);
         if (!a && !b)
@@ -1743,7 +1894,7 @@ bool route_moe_ep2(const Activation *input, Tensor *gate, Tensor *bias,
         return true;
     }
     const bool have_local_shared = local && local->sg && local->su && local->sd;
-    if (!moe_routed_parity(input, local, ids, w, 0, limit, output, have_local_shared))
+    if (!moe_routed_parity(use_in, local, ids, w, 0, limit, output, have_local_shared))
         return false;
     if (!moe_routed_parity(pin, peer, ids_p, w_p, 1, limit, peer_output, !have_local_shared))
         return false;

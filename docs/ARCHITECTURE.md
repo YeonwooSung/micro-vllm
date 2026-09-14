@@ -204,7 +204,14 @@ DSV4 GPU tier (`mvllm::dsv4_cuda`):
 - Prefix checkpoints stay on the host.
 - Optional device kernels in `src/gpu/dsv4_cuda.cu` + `dsv4_cuda_device.hpp`
   compile only with `MVLLM_GPU_CUDA` (not verified on this Mac; no nvcc).
-- `backend_name()` is `"cpu"` on this Mac path. Multi-GPU TP2/EP2 return false.
+- `backend_name()` is `"cpu"` on this Mac path. `available_device_count()` is
+  `cudaGetDeviceCount` when CUDA is linked. `MVLLM_TP=2` / `COLI_TP=2` runs
+  DSV4 generate through `attention_window_tp2` / `route_moe_ep2`. Attention
+  seeds the rank KV windows from the host cache and writes the allreduced
+  output back into the residual (or mHC branch). Two or more CUDA devices
+  put rank 0/1 on devices 0/1 (`physical_tp2()`, `tpdev=2`) and upload a
+  distinct peer weight copy so device tags are not aliased; otherwise the
+  same-process stand-in stays (`tp=2 tpdev=1`).
 - Prefix checkpoints stay on the host (`V4_PREFIX_CKPT`).
 
 Vendored official Metal kernels (`src/gpu/vendor/`):
@@ -214,7 +221,9 @@ Vendored official Metal kernels (`src/gpu/vendor/`):
   the default host binary. `-DMVLLM_VENDOR_METAL=ON` compile-tests both
   files at Metal `init()` (`vendor_loaded()` / `vendor_status()`).
   `-DMVLLM_OFFICIAL_METAL_HOST=ON` compiles vendored `backend_metal.mm`
-  and `h3_gpu.m` (`official_metal::status()`).
+  and `h3_gpu.m`. Generate calls `official_metal::layer_residual` (K3/GLM)
+  and `official_metal::dit_residual` (H3, after CUDA) when
+  `coli_available()` / `h3_available()`. `describe()` has `official=`.
 
 Metal ops (`mvllm::metal_ops`):
 
@@ -235,28 +244,26 @@ Metal ops (`mvllm::metal_ops`):
   ClampSwiGLU. K3 F32 dense/shared uses SiTU. K3 routed MXFP4 uses
   `moe_block` fmt 7 (`op_gemm_mxfp4` + SiTU) before `coli_cuda` / host.
 
-Vendored official Metal kernels (`src/gpu/vendor/`):
-
-- `coli_metal_kernels.metal` from colibri `backend_metal.mm` (Apache-2.0).
-- `h3_shaders.metal` from h3.c (MIT). See `NOTICE`. Not in the default host link.
-
 Vulkan ops (`mvllm::vk_ops`):
 
-- Host API: `src/gpu/vk_ops.hpp` + `vk_ops.cpp`. Always CPU (`backend_name`
-  is `"cpu"`). No Vulkan SDK. Surface: `init` / `rmsnorm` / `add` /
-  `silu_mul` / `gemm_f32` / `layer_residual`. K3 / GLM / H3 / DSV4
-  `describe()` show `vk=`. K3/GLM residual uses Metal `layer_decode` only
-  when `backend_name()` is `"metal"`; otherwise `vk_ops::layer_residual`.
-  `-DMVLLM_GPU_VULKAN=ON` plus `find_package(Vulkan)` creates an instance
-  and `backend_name()` becomes `"vulkan"`; GEMM/residual stay CPU until
-  kernels land. Without the SDK, CMake warns and the stub stays `"cpu"`.
+- Host API: `src/gpu/vk_ops.hpp` + `vk_ops.cpp`. Surface: `init` / `rmsnorm`
+  / `add` / `silu_mul` / `gemm_f32` / `layer_residual` / `moe_block_f32` /
+  `gdn_delta`. K3 / GLM / H3 / DSV4 `describe()` show `vk=`. K3/GLM residual
+  uses Metal `layer_decode` only when `backend_name()` is `"metal"`; otherwise
+  `vk_ops::layer_residual`. `-DMVLLM_GPU_VULKAN=ON` plus `find_package(Vulkan)`
+  builds compute pipelines from embedded SPIR-V (`src/gpu/vk_shaders.hpp`)
+  and `backend_name()` becomes `"vulkan"`; add / silu / rmsnorm / GEMM run
+  on the device. Pipeline or submit failure falls back to CPU. Without the
+  SDK, CMake warns and the stub stays `"cpu"`.
 
 H3 Metal residual (`mvllm::metal_h3::dit_residual`):
 
 - Host API: `src/gpu/metal_h3.hpp`. CPU fallback TU (`metal_h3.cpp`) or
   Metal `metal_h3.mm` when `APPLE AND MVLLM_METAL`.
-- AdaLN + SDPA + SwiGLU. H3 engine prefers this over `gpu::dit_block`
-  when AdaLN / RoPE is present. `gemm_int8` / `nax_mlp` / `vae_rms_add`
+- AdaLN + SDPA + SwiGLU, including 3-mod `row_map` / `adaln_groups` and
+  T>256 (online softmax). H3 engine prefers this over `gpu::dit_block`
+  when AdaLN / RoPE is present. CUDA first, then `official_metal`, then
+  Metal, then CPU. `gemm_int8` / `nax_mlp` / `vae_rms_add`
   have Metal kernels (CPU fallback). VAE `apply_block` tries
   `vae_transformer_block`; vision `run_block` tries `vision_block`;
   audio pre tries `audio_pre_block`. Residual-only sites still use

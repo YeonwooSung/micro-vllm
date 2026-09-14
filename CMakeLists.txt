@@ -206,6 +206,7 @@ if(MVLLM_GPU_VULKAN)
     if(Vulkan_FOUND)
         target_compile_definitions(mvllm_host PUBLIC MVLLM_WITH_VULKAN=1)
         target_link_libraries(mvllm_host PUBLIC Vulkan::Vulkan)
+        # Compute kernels are embedded SPIR-V in src/gpu/vk_shaders.hpp (no glslang).
     else()
         message(WARNING "MVLLM_GPU_VULKAN=ON but Vulkan was not found; vk_ops stays CPU")
         set(MVLLM_GPU_VULKAN OFF)

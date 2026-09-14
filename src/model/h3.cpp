@@ -12,6 +12,7 @@
 #include "../gpu/backend.hpp"
 #include "../gpu/h3_cuda.hpp"
 #include "../gpu/metal_h3.hpp"
+#include "../gpu/official_metal.hpp"
 #include "../gpu/vk_ops.hpp"
 #include "../io/av_mux.hpp"
 #include "../io/image.hpp"
@@ -197,6 +198,7 @@ public:
         loaded_ = true;
         metal_h3::init();
         h3_cuda::init();
+        official_metal::init();
         vk_ops::init();
         return Status::Ok;
     }
@@ -753,6 +755,10 @@ public:
                             ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                         inner, ffn, hd, latent.data(), seq, 1e-6f,
                                                         mp, qn, kn, r_cos, r_sin, rp, groups);
+                        if (!ran && official_metal::h3_available())
+                            ran = official_metal::dit_residual(
+                                data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
+                                latent.data(), seq, 1e-6f, mp, qn, kn, r_cos, r_sin, rp, groups);
                         if (!ran)
                             ran = metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
                                                          inner, ffn, hd, latent.data(), seq, 1e-6f,
@@ -1001,6 +1007,7 @@ public:
            << " adaln=" << adaln_.tag()
            << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
+           << " official=" << official_metal::status()
            << " vk=" << (vk_ops::available() ? vk_ops::backend_name() : "off")
            << " ffmpeg=" << (h3_ffmpeg_available() ? "yes" : "no");
         return os.str();
