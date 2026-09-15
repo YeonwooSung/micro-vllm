@@ -3972,7 +3972,7 @@ static void test_h3_checkpoint() {
         np.steps = 8;
         np.output_path = ndir + "/s8.txt";
         CHECK(en.generate_video(np, b, err) == Status::Ok);
-        CHECK(a.note.find("sampler=res") != std::string::npos);
+        CHECK(a.note.find("sampler=euler") != std::string::npos);
         CHECK(a.note.find("head=vel") != std::string::npos);
         CHECK(a.note.find("text_tokens=") != std::string::npos);
         auto l2_of = [](const std::string &path) {

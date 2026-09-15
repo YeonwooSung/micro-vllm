@@ -339,16 +339,16 @@ or `MVLLM_H3_CUDA_SDPA=online`), and official RES multistep
 (`h3_res_step`; Euler when `next==0` or no previous denoised).
 Official DiT emits **velocity** in 96-d patch space (`video_patch_proj`
 96→H, 50 residual blocks, `final_layer` AdaLN + `video_out` H→96).
-Generate packs z through that head each step, forms
-`x0 = z + σ·v`, then applies RES only to the video/audio latent (text/cond
-stay frozen). Missing heads keep the synth tile fallback (`head=tile`).
-Generate applies RES only to audio/video tokens and freezes text/cond.
+Time embeddings apply SiLU after both `proj_in` and `proj_out` before
+AdaLN. Generate packs z through the patch head each step and updates
+`z += (σ-σ_next)·v` (serving Euler). Missing heads keep the synth tile
+fallback (`head=tile`, RES on hidden). Text/cond tokens stay frozen.
 Default video-patch cap is 512 (`MVLLM_H3_LATENT_CAP`, `0` = none); a
 smaller cap keeps a spatial prefix of the 2×2 patch grid so unpatchify
 still writes a contiguous latent block. Text tokens default to 128
 (`MVLLM_H3_TEXT_CAP`). `--frames N` still runs the VAE on an aligned
 length (`h3_align_frames`) and then uniformly subsamples the RGB to N.
-`describe`/note report `sampler=res`, `text_tokens=`, `latent_slimmed=`,
+`describe`/note report `sampler=euler|res`, `head=vel|tile`, `text_tokens=`, `latent_slimmed=`,
 and `dit` is `CUDA` only when every residual used the device kernels.
 
 K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R

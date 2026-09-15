@@ -775,10 +775,18 @@ public:
         int computed = 0;
         std::vector<float> sigmas(static_cast<size_t>(evals) + 1, 0.f);
         std::vector<float> asigmas(static_cast<size_t>(evals) + 1, 0.f);
-        h3_sigma_video(evals, sigmas.data(), cfg_.h3.video_sigma_shift);
-        h3_sigma_video(evals, asigmas.data(),
-                       cfg_.h3.audio_sigma_shift > 0.f ? cfg_.h3.audio_sigma_shift
-                                                       : kH3AudioSigmaShift);
+        const float vshift =
+            cfg_.h3.video_sigma_shift > 0.f ? cfg_.h3.video_sigma_shift : kH3VideoSigmaShift;
+        const float ashift = cfg_.h3.audio_sigma_shift > 0.f ? cfg_.h3.audio_sigma_shift
+                                                             : kH3AudioSigmaShift;
+        H3SigmaSchedule sch;
+        if (vel_path && evals >= 2 && h3_serving_schedule_build(evals, sch, vshift, ashift)) {
+            sigmas = sch.video;
+            asigmas = sch.audio;
+        } else {
+            h3_sigma_video(evals, sigmas.data(), vshift);
+            h3_sigma_video(evals, asigmas.data(), ashift);
+        }
         const int tdim = cfg_.h3.time_input > 0 ? cfg_.h3.time_input : 256;
         const bool do_adaln = adaln_.mode() != H3AdalnMode::Off &&
                               adaln_.mode() != H3AdalnMode::Skip && !time_in_w_.empty() &&
@@ -786,15 +794,12 @@ public:
         const int th = static_cast<int>(time_in_w_.size()) / std::max(tdim, 1);
         const int td = th > 0 ? static_cast<int>(time_out_w_.size()) / th : 0;
         const bool hoist_adaln = do_adaln && th > 0 && td > 0;
-        H3SigmaSchedule sch;
         H3DitSchedule dit;
         bool have_sched = false;
         if (hoist_adaln && tdim == kH3TimeInput) {
-            const float vshift =
-                cfg_.h3.video_sigma_shift > 0.f ? cfg_.h3.video_sigma_shift : kH3VideoSigmaShift;
-            const float ashift = cfg_.h3.audio_sigma_shift > 0.f ? cfg_.h3.audio_sigma_shift
-                                                                 : kH3AudioSigmaShift;
-            if (h3_schedule_build(evals, sch, vshift, ashift) &&
+            if (sch.steps < 1)
+                h3_schedule_build(evals, sch, vshift, ashift);
+            if (sch.steps > 0 &&
                 dit.prepare(sch, layout.img_cond_rows > 0, layout.audio_cond_rows > 0))
                 have_sched = true;
         }
@@ -870,6 +875,9 @@ public:
                     float *tr = temb.data() + static_cast<size_t>(r) * td;
                     for (int i = 0; i < td && i < static_cast<int>(time_out_b_.size()); ++i)
                         tr[i] += time_out_b_[static_cast<size_t>(i)];
+                    // Official AdaLN / final_layer consume SiLU(proj_out).
+                    for (int i = 0; i < td; ++i)
+                        tr[i] = tr[i] * quant::sigmoid(tr[i]);
                 }
             }
             std::vector<float> prev = latent;
@@ -1009,17 +1017,8 @@ public:
                                     }
                     }
                 }
-                const float sigma = sigmas[static_cast<size_t>(s)];
-                std::vector<float> z0(z.size());
-                for (size_t i = 0; i < z.size(); ++i)
-                    z0[i] = z[i] + sigma * z_vel[i];
-                std::vector<float> zn(z.size());
-                const float *oldp = old_vid.size() == z.size() ? old_vid.data() : nullptr;
-                if (h3_res_step(zn.data(), z.data(), z0.data(), oldp, static_cast<int>(z.size()),
-                                sigmas.data(), s, evals) == 1) {
-                    old_vid = z0;
-                    z.swap(zn);
-                }
+                h3_euler_step(z.data(), z_vel.data(), static_cast<int>(z.size()),
+                              sigmas[static_cast<size_t>(s)], sigmas[static_cast<size_t>(s) + 1]);
                 if (vel_aud && audio_rows > 0) {
                     std::vector<float> anorm(static_cast<size_t>(audio_rows) * hidden);
                     const float *ain = latent.data() + static_cast<size_t>(audio_off) * hidden;
@@ -1031,18 +1030,9 @@ public:
                                 audio_rows, hidden, AC);
                     std::vector<float> az_vel(az.size(), 0.f);
                     h3_dit_unpack_audio(a32.data(), AC, audio_t, az_vel.data());
-                    const float aslope = static_cast<float>(
-                        h3_time_shift_slope(sigma, kH3VideoSigmaShift, kH3AudioSigmaShift));
-                    std::vector<float> a0(az.size());
-                    for (size_t i = 0; i < az.size(); ++i)
-                        a0[i] = az[i] + sigma * az_vel[i] * aslope;
-                    std::vector<float> an(az.size());
-                    const float *olda = old_aud.size() == az.size() ? old_aud.data() : nullptr;
-                    if (h3_res_step(an.data(), az.data(), a0.data(), olda, static_cast<int>(az.size()),
-                                    sigmas.data(), s, evals) == 1) {
-                        old_aud = a0;
-                        az.swap(an);
-                    }
+                    h3_euler_step(az.data(), az_vel.data(), static_cast<int>(az.size()),
+                                  asigmas[static_cast<size_t>(s)],
+                                  asigmas[static_cast<size_t>(s) + 1]);
                 }
             } else if (computed) {
                 // Synth fallback: no official patch/final heads. Treat DiT hidden
@@ -1220,7 +1210,7 @@ public:
             if (sdpa[0])
                 out.note += std::string(" sdpa=") + sdpa;
         }
-        out.note += " sampler=res";
+        out.note += vel_path ? " sampler=euler" : " sampler=res";
         out.note += vel_path ? " head=vel" : " head=tile";
         out.note += " text_tokens=" + std::to_string(text_tokens);
         if (text_tokens > 0)
