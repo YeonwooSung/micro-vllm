@@ -32,6 +32,11 @@ struct QkNormArgs { int T; int I; int hd; int heads; int do_q; int do_k; float e
 struct RopeArgs { int T; int I; int hd; int heads; };
 struct GateArgs { int T; int H; int has_mod; int slot; int groups; };
 
+// Official DiT QKV: [seq, heads, 3, hd]. stream 0=Q, 1=K, 2=V.
+inline ulong h3_dit_qkv(uint t, uint h, uint stream, int I, int hd) {
+    return (ulong)t * (uint)(3 * I) + (ulong)h * (uint)(3 * hd) + (ulong)stream * (uint)hd;
+}
+
 kernel void gemm_f32(device const float *x [[buffer(0)]],
                      device const float *w [[buffer(1)]],
                      device float *y [[buffer(2)]],
@@ -104,7 +109,7 @@ kernel void qk_rmsnorm(device float *qkv [[buffer(0)]],
     const int I = a.I;
     const int hd = a.hd;
     if (a.do_q != 0) {
-        device float *q = qkv + (ulong)t * (uint)(3 * I) + h * (uint)hd;
+        device float *q = qkv + h3_dit_qkv(t, h, 0, I, hd);
         float ss = 0.0f;
         for (int i = 0; i < hd; ++i)
             ss += q[i] * q[i];
@@ -113,7 +118,7 @@ kernel void qk_rmsnorm(device float *qkv [[buffer(0)]],
             q[i] = q[i] * inv * q_norm[i];
     }
     if (a.do_k != 0) {
-        device float *k = qkv + (ulong)t * (uint)(3 * I) + I + h * (uint)hd;
+        device float *k = qkv + h3_dit_qkv(t, h, 1, I, hd);
         float ss = 0.0f;
         for (int i = 0; i < hd; ++i)
             ss += k[i] * k[i];
@@ -137,8 +142,8 @@ kernel void rope_qk(device float *qkv [[buffer(0)]],
     const int hd = a.hd;
     const device float *c = cos + (ulong)t * (uint)nhalf;
     const device float *s = sin + (ulong)t * (uint)nhalf;
-    device float *q = qkv + (ulong)t * (uint)(3 * I) + h * (uint)hd;
-    device float *k = qkv + (ulong)t * (uint)(3 * I) + I + h * (uint)hd;
+    device float *q = qkv + h3_dit_qkv(t, h, 0, I, hd);
+    device float *k = qkv + h3_dit_qkv(t, h, 1, I, hd);
     for (int d = 0; d < nhalf; ++d) {
         float qa = q[d], qb = q[d + nhalf];
         q[d] = qa * c[d] - qb * s[d];
@@ -161,15 +166,15 @@ kernel void dit_attn(device const float *qkv [[buffer(0)]],
     const int I = a.I;
     const int hd = a.hd;
     const float scale = rsqrt((float)hd);
-    const device float *q = qkv + (ulong)qi * (uint)(3 * I) + h * (uint)hd;
+    const device float *q = qkv + h3_dit_qkv(qi, h, 0, I, hd);
     device float *o = ctx + (ulong)qi * (uint)I + h * (uint)hd;
     for (int d = 0; d < hd; ++d)
         o[d] = 0.0f;
     float m = -1e30f;
     float l = 0.0f;
     for (int ki = 0; ki < T; ++ki) {
-        const device float *k = qkv + (ulong)ki * (uint)(3 * I) + I + h * (uint)hd;
-        const device float *v = qkv + (ulong)ki * (uint)(3 * I) + 2 * I + h * (uint)hd;
+        const device float *k = qkv + h3_dit_qkv(ki, h, 1, I, hd);
+        const device float *v = qkv + h3_dit_qkv(ki, h, 2, I, hd);
         float s = 0.0f;
         for (int d = 0; d < hd; ++d)
             s += q[d] * k[d];
@@ -401,12 +406,12 @@ kernel void vision_rope(device const float *qkv_in [[buffer(0)]],
     const int I = a.I;
     const int hd = a.hd;
     const int nhalf = a.rope_half;
-    const device float *qs = qkv_in + (ulong)t * (uint)(3 * I) + h * (uint)hd;
-    const device float *ks = qkv_in + (ulong)t * (uint)(3 * I) + I + h * (uint)hd;
-    const device float *vs = qkv_in + (ulong)t * (uint)(3 * I) + 2 * I + h * (uint)hd;
-    device float *qd = qkv_out + (ulong)t * (uint)(3 * I) + h * (uint)hd;
-    device float *kd = qkv_out + (ulong)t * (uint)(3 * I) + I + h * (uint)hd;
-    device float *vd = qkv_out + (ulong)t * (uint)(3 * I) + 2 * I + h * (uint)hd;
+    const device float *qs = qkv_in + h3_dit_qkv(t, h, 0, I, hd);
+    const device float *ks = qkv_in + h3_dit_qkv(t, h, 1, I, hd);
+    const device float *vs = qkv_in + h3_dit_qkv(t, h, 2, I, hd);
+    device float *qd = qkv_out + h3_dit_qkv(t, h, 0, I, hd);
+    device float *kd = qkv_out + h3_dit_qkv(t, h, 1, I, hd);
+    device float *vd = qkv_out + h3_dit_qkv(t, h, 2, I, hd);
     const device float *crow = (nhalf > 0) ? cos + (ulong)t * (uint)nhalf : cos;
     const device float *srow = (nhalf > 0) ? sin + (ulong)t * (uint)nhalf : sin;
     for (int dim = 0; dim < hd; ++dim)

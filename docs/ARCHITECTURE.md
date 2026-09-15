@@ -337,6 +337,10 @@ the layer tensor is tall enough; `dit_residual` takes `[groups,6,H]` +
 per-token map), CUDA SDPA is batched-head (online when `heads*T*T*4>64MiB`
 or `MVLLM_H3_CUDA_SDPA=online`), and official RES multistep
 (`h3_res_step`; Euler when `next==0` or no previous denoised).
+Official DiT / token_refiner QKV after the `[3*inner, hidden]` linear is
+`[seq, heads, 3, hd]` (`h3_dit_qkv_offset`; CUDA/Metal DiT match). The
+ungrouped `[seq, 3, heads, hd]` split was reading each head's K/V as the
+next head's Q.
 Official DiT emits **velocity** in 96-d patch space (`video_patch_proj`
 96→H, 50 residual blocks, `final_layer` AdaLN + `video_out` H→96).
 Time embeddings apply SiLU after both `proj_in` and `proj_out` before
@@ -349,7 +353,8 @@ contiguous latent block. Official 864×480 is 6885 tokens. Text tokens
 are uncapped by default (`MVLLM_H3_TEXT_CAP` unset or `0`); a positive
 cap keeps a prefix. FL2VA/Ref2VA vision-span tags (0) plus language
 tags (1) feed AdaLN `row_map`. `MVLLM_H3_SKIP_TEXT` still swaps in the
-synth encoder for smoke hosts. `--frames N` still runs the VAE on an aligned
+synth encoder for smoke hosts. Official VAE unpack writes RGB at `(f,y,x)` (`h3_vae_unpack_3072`).
+`--frames N` still runs the VAE on an aligned
 length (`h3_align_frames`) and then uniformly subsamples the RGB to N.
 `describe`/note report `sampler=euler|res`, `head=vel|tile`, `text_tokens=`,
 `text_tags=vision|lang`, `text=skip`, `latent_slimmed=`,

@@ -86,15 +86,21 @@ void apply_rope_host(float *q, float *k, const float *cos, const float *sin, int
 }
 
 bool split_qkv(h3_gpu *gpu, h3_gpu_tensor *q, h3_gpu_tensor *k, h3_gpu_tensor *v,
-               const h3_gpu_tensor *qkv, int T, int I) {
-    const size_t Iu = static_cast<size_t>(I);
+               const h3_gpu_tensor *qkv, int T, int I, int heads, int hd) {
+    if (heads < 1 || hd < 1 || heads * hd != I)
+        return false;
     for (int t = 0; t < T; ++t) {
-        const size_t dst = static_cast<size_t>(t) * Iu;
-        const size_t src = static_cast<size_t>(t) * 3u * Iu;
-        if (!h3_gpu_copy_f32(gpu, q, dst, qkv, src, Iu) ||
-            !h3_gpu_copy_f32(gpu, k, dst, qkv, src + Iu, Iu) ||
-            !h3_gpu_copy_f32(gpu, v, dst, qkv, src + 2u * Iu, Iu))
-            return false;
+        for (int h = 0; h < heads; ++h) {
+            const size_t dst = static_cast<size_t>(t) * static_cast<size_t>(I) +
+                               static_cast<size_t>(h) * static_cast<size_t>(hd);
+            const size_t src = static_cast<size_t>(t) * 3u * static_cast<size_t>(I) +
+                               static_cast<size_t>(h) * 3u * static_cast<size_t>(hd);
+            const size_t n = static_cast<size_t>(hd);
+            if (!h3_gpu_copy_f32(gpu, q, dst, qkv, src, n) ||
+                !h3_gpu_copy_f32(gpu, k, dst, qkv, src + n, n) ||
+                !h3_gpu_copy_f32(gpu, v, dst, qkv, src + 2u * n, n))
+                return false;
+        }
     }
     return true;
 }
@@ -366,8 +372,6 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         return false;
     const int groups = adaln_groups > 0 ? adaln_groups : 1;
     const bool do_rope = rope_cos && rope_sin && hd >= 96;
-    const uint32_t rope_half = do_rope ? 48u : 0u;
-    const bool use_qkv_rope = q_norm && k_norm;
 
     H3Bag bag;
     auto *tx = bag.add(h3_gpu_tensor_from_f32(g_h3g, x, static_cast<size_t>(T) * H));
@@ -456,34 +460,27 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                            static_cast<uint32_t>(H), static_cast<uint32_t>(3 * I)))
         return false;
 
-    if (use_qkv_rope) {
-        if (!h3_gpu_qkv_rope_f32(g_h3g, q, k, v, qkv, qn, kn, rc, rs, static_cast<uint32_t>(T),
-                                 static_cast<uint32_t>(heads), static_cast<uint32_t>(hd), rope_half,
-                                 eps))
+    if (!split_qkv(g_h3g, q, k, v, qkv, T, I, heads, hd))
+        return false;
+    const uint32_t qk_rows = static_cast<uint32_t>(T) * static_cast<uint32_t>(heads);
+    if (qn && !h3_gpu_rms_norm_f32(g_h3g, q, q, qn, qk_rows, static_cast<uint32_t>(hd), eps))
+        return false;
+    if (kn && !h3_gpu_rms_norm_f32(g_h3g, k, k, kn, qk_rows, static_cast<uint32_t>(hd), eps))
+        return false;
+    if (do_rope) {
+        if (!cmd.submit())
             return false;
-    } else {
-        if (!split_qkv(g_h3g, q, k, v, qkv, T, I))
+        std::vector<float> qh(static_cast<size_t>(T) * I), kh(static_cast<size_t>(T) * I);
+        if (!h3_gpu_tensor_read_f32(q, qh.data(), qh.size()) ||
+            !h3_gpu_tensor_read_f32(k, kh.data(), kh.size()))
             return false;
-        const uint32_t qk_rows = static_cast<uint32_t>(T) * static_cast<uint32_t>(heads);
-        if (qn && !h3_gpu_rms_norm_f32(g_h3g, q, q, qn, qk_rows, static_cast<uint32_t>(hd), eps))
+        apply_rope_host(qh.data(), kh.data(), rope_cos, rope_sin, T, I, heads, hd);
+        if (!h3_gpu_tensor_write_f32(q, qh.data(), qh.size()) ||
+            !h3_gpu_tensor_write_f32(k, kh.data(), kh.size()))
             return false;
-        if (kn && !h3_gpu_rms_norm_f32(g_h3g, k, k, kn, qk_rows, static_cast<uint32_t>(hd), eps))
+        if (!g_h3g || h3_gpu_begin(g_h3g) == 0)
             return false;
-        if (do_rope) {
-            if (!cmd.submit())
-                return false;
-            std::vector<float> qh(static_cast<size_t>(T) * I), kh(static_cast<size_t>(T) * I);
-            if (!h3_gpu_tensor_read_f32(q, qh.data(), qh.size()) ||
-                !h3_gpu_tensor_read_f32(k, kh.data(), kh.size()))
-                return false;
-            apply_rope_host(qh.data(), kh.data(), rope_cos, rope_sin, T, I, heads, hd);
-            if (!h3_gpu_tensor_write_f32(q, qh.data(), qh.size()) ||
-                !h3_gpu_tensor_write_f32(k, kh.data(), kh.size()))
-                return false;
-            if (!g_h3g || h3_gpu_begin(g_h3g) == 0)
-                return false;
-            cmd.open = true;
-        }
+        cmd.open = true;
     }
 
     const float scale = 1.f / std::sqrt(static_cast<float>(hd));

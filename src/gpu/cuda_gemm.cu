@@ -107,10 +107,10 @@ __global__ void k_dit_attn(const float *qkv, float *ctx, int T, int I, int hd, i
     float scores[256];
     if (T > 256)
         return;
-    const float *q = qkv + (size_t)qi * (3 * I) + h * hd;
+    const float *q = qkv + (size_t)qi * (3 * I) + (size_t)h * 3 * hd;
     float m = -1e30f;
     for (int ki = 0; ki < T; ++ki) {
-        const float *k = qkv + (size_t)ki * (3 * I) + I + h * hd;
+        const float *k = qkv + (size_t)ki * (3 * I) + (size_t)h * 3 * hd + hd;
         float acc = 0.f;
         for (int d = 0; d < hd; ++d)
             acc += q[d] * k[d];
@@ -128,7 +128,7 @@ __global__ void k_dit_attn(const float *qkv, float *ctx, int T, int I, int hd, i
     for (int d = 0; d < hd; ++d)
         o[d] = 0.f;
     for (int vi = 0; vi < T; ++vi) {
-        const float *v = qkv + (size_t)vi * (3 * I) + 2 * I + h * hd;
+        const float *v = qkv + (size_t)vi * (3 * I) + (size_t)h * 3 * hd + 2 * hd;
         float w = scores[vi] * inv;
         for (int d = 0; d < hd; ++d)
             o[d] += w * v[d];

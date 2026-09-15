@@ -35,6 +35,13 @@ dim3 grid2(int gx, int gy) {
     return dim3(static_cast<unsigned>((gx + 15) / 16), static_cast<unsigned>((gy + 15) / 16), 1);
 }
 
+// Official DiT QKV: [seq, heads, 3, hd]. stream 0=Q, 1=K, 2=V.
+__device__ __forceinline__ size_t d_qkv(int t, int h, int stream, int I, int hd) {
+    return static_cast<size_t>(t) * 3u * static_cast<size_t>(I) +
+           static_cast<size_t>(h) * 3u * static_cast<size_t>(hd) +
+           static_cast<size_t>(stream) * static_cast<size_t>(hd);
+}
+
 struct DitWs {
     uint8_t *blob;
     float *x, *xn, *qkv, *ctx, *attn, *h1, *gated, *down, *scores, *mod, *qn, *kn, *cos, *sin;
@@ -265,7 +272,7 @@ __global__ void k_qk_rmsnorm(float *qkv, const float *q_norm, const float *k_nor
     if (h >= heads || t >= T)
         return;
     if (do_q) {
-        float *q = qkv + static_cast<size_t>(t) * (3 * I) + h * hd;
+        float *q = qkv + d_qkv(t, h, 0, I, hd);
         float ss = 0.f;
         for (int i = 0; i < hd; ++i)
             ss += q[i] * q[i];
@@ -274,7 +281,7 @@ __global__ void k_qk_rmsnorm(float *qkv, const float *q_norm, const float *k_nor
             q[i] = q[i] * inv * q_norm[i];
     }
     if (do_k) {
-        float *k = qkv + static_cast<size_t>(t) * (3 * I) + I + h * hd;
+        float *k = qkv + d_qkv(t, h, 1, I, hd);
         float ss = 0.f;
         for (int i = 0; i < hd; ++i)
             ss += k[i] * k[i];
@@ -296,8 +303,8 @@ __global__ void k_rope_qk(float *qkv, const float *cos, const float *sin, int T,
     const int half = 48;
     const float *c = cos + static_cast<size_t>(t) * half;
     const float *s = sin + static_cast<size_t>(t) * half;
-    float *q = qkv + static_cast<size_t>(t) * (3 * I) + h * hd;
-    float *k = qkv + static_cast<size_t>(t) * (3 * I) + I + h * hd;
+    float *q = qkv + d_qkv(t, h, 0, I, hd);
+    float *k = qkv + d_qkv(t, h, 1, I, hd);
     for (int d = 0; d < half; ++d) {
         float qa = q[d], qb = q[d + half];
         q[d] = qa * c[d] - qb * s[d];
@@ -316,8 +323,8 @@ __global__ void k_attn_scores_bh(const float *qkv, float *scores, int T, int I, 
     if (qi >= T || ki >= T || h >= heads)
         return;
     const float scale = rsqrtf(static_cast<float>(hd));
-    const float *q = qkv + static_cast<size_t>(qi) * (3 * I) + h * hd;
-    const float *k = qkv + static_cast<size_t>(ki) * (3 * I) + I + h * hd;
+    const float *q = qkv + d_qkv(qi, h, 0, I, hd);
+    const float *k = qkv + d_qkv(ki, h, 1, I, hd);
     float acc = 0.f;
     for (int d = 0; d < hd; ++d)
         acc += q[d] * k[d];
@@ -355,7 +362,7 @@ __global__ void k_attn_av_bh(const float *qkv, const float *scores, float *ctx, 
     const float *srow = scores + (static_cast<size_t>(h) * T + qi) * T;
     float acc = 0.f;
     for (int vi = 0; vi < T; ++vi) {
-        const float *v = qkv + static_cast<size_t>(vi) * (3 * I) + 2 * I + h * hd;
+        const float *v = qkv + d_qkv(vi, h, 2, I, hd);
         acc += srow[vi] * v[d];
     }
     ctx[static_cast<size_t>(qi) * I + h * hd + d] = acc;
@@ -368,15 +375,15 @@ __global__ void k_sdpa_online(const float *qkv, float *ctx, int T, int I, int hd
     if (h >= heads || qi >= T)
         return;
     const float scale = rsqrtf(static_cast<float>(hd));
-    const float *q = qkv + static_cast<size_t>(qi) * (3 * I) + h * hd;
+    const float *q = qkv + d_qkv(qi, h, 0, I, hd);
     float *o = ctx + static_cast<size_t>(qi) * I + h * hd;
     for (int d = 0; d < hd; ++d)
         o[d] = 0.f;
     float m = -1e30f;
     float l = 0.f;
     for (int ki = 0; ki < T; ++ki) {
-        const float *k = qkv + static_cast<size_t>(ki) * (3 * I) + I + h * hd;
-        const float *v = qkv + static_cast<size_t>(ki) * (3 * I) + 2 * I + h * hd;
+        const float *k = qkv + d_qkv(ki, h, 1, I, hd);
+        const float *v = qkv + d_qkv(ki, h, 2, I, hd);
         float s = 0.f;
         for (int d = 0; d < hd; ++d)
             s += q[d] * k[d];

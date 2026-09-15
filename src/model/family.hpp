@@ -359,6 +359,14 @@ void mla_absorb_kvb(const float *kv_b, int n_heads, int qk_nope, int v_head, int
 
 void bf16_to_f32(const uint16_t *src, float *dst, int64_t n);
 
+// Official DiT / token_refiner QKV after the [3*inner, hidden] linear:
+// [seq, heads, 3, hd], not [seq, 3, heads, hd]. stream 0=Q, 1=K, 2=V.
+inline size_t h3_dit_qkv_offset(int token, int head, int stream, int inner, int head_dim) {
+    return static_cast<size_t>(token) * 3u * static_cast<size_t>(inner) +
+           static_cast<size_t>(head) * 3u * static_cast<size_t>(head_dim) +
+           static_cast<size_t>(stream) * static_cast<size_t>(head_dim);
+}
+
 // One DiT residual block on streamed BF16 qkv/out/fc1/fc2 (row-major [O,I]).
 void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t fc1_bytes,
                       int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,

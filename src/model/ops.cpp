@@ -1165,8 +1165,8 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     if (q_norm || k_norm) {
         for (int t = 0; t < T; ++t) {
             for (int h = 0; h < heads; ++h) {
-                float *q = qkv.data() + t * 3 * I + h * hd;
-                float *k = qkv.data() + t * 3 * I + I + h * hd;
+                float *q = qkv.data() + h3_dit_qkv_offset(t, h, 0, I, hd);
+                float *k = qkv.data() + h3_dit_qkv_offset(t, h, 1, I, hd);
                 if (q_norm)
                     quant::rmsnorm(q, q_norm, q, hd, eps);
                 if (k_norm)
@@ -1180,8 +1180,8 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
             const float *c = rope_cos + static_cast<size_t>(t) * half;
             const float *s = rope_sin + static_cast<size_t>(t) * half;
             for (int h = 0; h < heads; ++h) {
-                float *q = qkv.data() + t * 3 * I + h * hd;
-                float *k = qkv.data() + t * 3 * I + I + h * hd;
+                float *q = qkv.data() + h3_dit_qkv_offset(t, h, 0, I, hd);
+                float *k = qkv.data() + h3_dit_qkv_offset(t, h, 1, I, hd);
                 for (int d = 0; d < half; ++d) {
                     float qa = q[d], qb = q[d + half];
                     q[d] = qa * c[d] - qb * s[d];
@@ -1198,9 +1198,9 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     for (int h = 0; h < heads; ++h) {
         std::vector<float> scores(static_cast<size_t>(T) * T, 0.f);
         for (int qi = 0; qi < T; ++qi) {
-            const float *q = qkv.data() + qi * 3 * I + h * hd;
+            const float *q = qkv.data() + h3_dit_qkv_offset(qi, h, 0, I, hd);
             for (int ki = 0; ki < T; ++ki) {
-                const float *k = qkv.data() + ki * 3 * I + I + h * hd;
+                const float *k = qkv.data() + h3_dit_qkv_offset(ki, h, 1, I, hd);
                 float acc = 0.f;
                 for (int d = 0; d < hd; ++d)
                     acc += q[d] * k[d];
@@ -1213,7 +1213,7 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
             for (int d = 0; d < hd; ++d)
                 o[d] = 0.f;
             for (int vi = 0; vi < T; ++vi) {
-                const float *v = qkv.data() + vi * 3 * I + 2 * I + h * hd;
+                const float *v = qkv.data() + h3_dit_qkv_offset(vi, h, 2, I, hd);
                 float a = scores[qi * T + vi];
                 for (int d = 0; d < hd; ++d)
                     o[d] += a * v[d];
@@ -1285,8 +1285,8 @@ void h3_token_refiner_block(float *x, int tokens, int hidden, int inner, int ffn
     if (q_norm || k_norm) {
         for (int t = 0; t < T; ++t) {
             for (int h = 0; h < heads; ++h) {
-                float *q = qkv.data() + t * 3 * I + h * hd;
-                float *k = qkv.data() + t * 3 * I + I + h * hd;
+                float *q = qkv.data() + h3_dit_qkv_offset(t, h, 0, I, hd);
+                float *k = qkv.data() + h3_dit_qkv_offset(t, h, 1, I, hd);
                 if (q_norm)
                     quant::rmsnorm(q, q_norm, q, hd, eps);
                 if (k_norm)
@@ -1299,9 +1299,9 @@ void h3_token_refiner_block(float *x, int tokens, int hidden, int inner, int ffn
     for (int h = 0; h < heads; ++h) {
         std::vector<float> scores(static_cast<size_t>(T) * T, 0.f);
         for (int qi = 0; qi < T; ++qi) {
-            const float *q = qkv.data() + qi * 3 * I + h * hd;
+            const float *q = qkv.data() + h3_dit_qkv_offset(qi, h, 0, I, hd);
             for (int ki = 0; ki < T; ++ki) {
-                const float *k = qkv.data() + ki * 3 * I + I + h * hd;
+                const float *k = qkv.data() + h3_dit_qkv_offset(ki, h, 1, I, hd);
                 float acc = 0.f;
                 for (int d = 0; d < hd; ++d)
                     acc += q[d] * k[d];
@@ -1314,7 +1314,7 @@ void h3_token_refiner_block(float *x, int tokens, int hidden, int inner, int ffn
             for (int d = 0; d < hd; ++d)
                 o[d] = 0.f;
             for (int vi = 0; vi < T; ++vi) {
-                const float *v = qkv.data() + vi * 3 * I + 2 * I + h * hd;
+                const float *v = qkv.data() + h3_dit_qkv_offset(vi, h, 2, I, hd);
                 float a = scores[qi * T + vi];
                 for (int d = 0; d < hd; ++d)
                     o[d] += a * v[d];

@@ -134,10 +134,10 @@ kernel void dit_attn(device const float *qkv [[buffer(0)]],
     const float scale = rsqrt((float)hd);
     thread float scores[256];
     if (T > 256) return;
-    const device float *q = qkv + (ulong)qi * (uint)(3 * I) + h * (uint)hd;
+    const device float *q = qkv + (ulong)qi * (uint)(3 * I) + (ulong)h * (uint)(3 * hd);
     float m = -1e30f;
     for (int ki = 0; ki < T; ++ki) {
-        const device float *k = qkv + (ulong)ki * (uint)(3 * I) + I + h * (uint)hd;
+        const device float *k = qkv + (ulong)ki * (uint)(3 * I) + (ulong)h * (uint)(3 * hd) + hd;
         float acc = 0.0f;
         for (int d = 0; d < hd; ++d)
             acc += q[d] * k[d];
@@ -154,7 +154,7 @@ kernel void dit_attn(device const float *qkv [[buffer(0)]],
     for (int d = 0; d < hd; ++d)
         o[d] = 0.0f;
     for (int vi = 0; vi < T; ++vi) {
-        const device float *v = qkv + (ulong)vi * (uint)(3 * I) + 2 * I + h * (uint)hd;
+        const device float *v = qkv + (ulong)vi * (uint)(3 * I) + (ulong)h * (uint)(3 * hd) + 2 * hd;
         float w = scores[vi] * inv;
         for (int d = 0; d < hd; ++d)
             o[d] += w * v[d];

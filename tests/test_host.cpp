@@ -2983,6 +2983,19 @@ static void test_metal_h3_tier() {
     }
 }
 
+static void test_h3_dit_qkv_pack() {
+    using namespace mvllm;
+    // Official [seq, heads, 3, hd]: head 0 is Q,K,V then head 1.
+    const int I = 4, hd = 2;
+    CHECK(h3_dit_qkv_offset(0, 0, 0, I, hd) == 0u);
+    CHECK(h3_dit_qkv_offset(0, 0, 1, I, hd) == 2u);
+    CHECK(h3_dit_qkv_offset(0, 0, 2, I, hd) == 4u);
+    CHECK(h3_dit_qkv_offset(0, 1, 0, I, hd) == 6u);
+    CHECK(h3_dit_qkv_offset(0, 1, 1, I, hd) == 8u);
+    CHECK(h3_dit_qkv_offset(0, 1, 2, I, hd) == 10u);
+    CHECK(h3_dit_qkv_offset(1, 0, 0, I, hd) == 12u);
+}
+
 static void test_h3_cuda_dit() {
     using namespace mvllm;
     const bool h3cuda_init = h3_cuda::init();
@@ -5365,6 +5378,18 @@ static void test_h3_vae() {
     }
     CHECK(ufin);
     CHECK(ud > 1e-6f);
+    // Destination is (f,y,x), not the first pixel of each row.
+    auto at = [](const std::vector<float> &u, int f, int y, int x, int c) {
+        return u[(((static_cast<size_t>(f) * 32 + y) * 32 + x) * 3) + static_cast<size_t>(c)];
+    };
+    CHECK(at(u3, 0, 0, 0, 0) != at(u3, 0, 0, 15, 0));
+    CHECK(at(u3, 0, 0, 16, 0) != 0.f || at(u3, 0, 0, 16, 1) != 0.f || at(u3, 0, 0, 16, 2) != 0.f);
+    CHECK(at(u3, 0, 0, 31, 0) != 0.f || at(u3, 0, 0, 31, 1) != 0.f || at(u3, 0, 0, 31, 2) != 0.f);
+    int interior = 0;
+    for (int x = 1; x < 32; ++x)
+        if (at(u3, 0, 0, x, 0) + at(u3, 0, 0, x, 1) + at(u3, 0, 0, x, 2) > 0.f)
+            ++interior;
+    CHECK(interior == 31);
 
     std::string odir = tmpdir();
     const int hid = 64;
@@ -5851,6 +5876,7 @@ int main() {
     test_vk_ops_tier();
     test_metal_ops_tier();
     test_metal_h3_tier();
+    test_h3_dit_qkv_pack();
     test_h3_cuda_dit();
     test_h3_official_contracts();
     test_llama_dims_helpers();

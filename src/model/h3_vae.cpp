@@ -936,7 +936,7 @@ void official_unpack_3072(const float *rows, int pad_t, int lh, int lw, int fram
                 const int ti = patch_t * lh * lw + ly * lw + lx;
                 if (ti < 0 || ti >= patches)
                     continue;
-                float *pix = rgb + (static_cast<size_t>(f) * height + y) * width * 3;
+                float *pix = rgb + ((static_cast<size_t>(f) * height + y) * width + x) * 3;
                 for (int c = 0; c < 3; ++c) {
                     const int comp = ((c * 4 + within_t) * 16 + y0) * 16 + x0;
                     float v = rows[static_cast<size_t>(ti) * P + comp];
