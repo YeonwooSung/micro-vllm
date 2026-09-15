@@ -670,10 +670,10 @@ bool cpu_dit(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int64_t 
              int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x, int tokens,
              float eps, const float *adaln_mod, const float *q_norm, const float *k_norm,
              const float *rope_cos, const float *rope_sin, const uint32_t *row_map = nullptr,
-             int adaln_groups = 1) {
+             int adaln_groups = 1, const float *norm1 = nullptr, const float *norm2 = nullptr) {
     h3_dit_block_cpu(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn, head_dim,
                      x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin, row_map,
-                     adaln_groups);
+                     adaln_groups, norm1, norm2);
     return true;
 }
 
@@ -1139,16 +1139,17 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
-                  const uint32_t *row_map, int adaln_groups) {
+                  const uint32_t *row_map, int adaln_groups, const float *norm1,
+                  const float *norm2) {
     init();
-    if (!g.ready)
+    if (!g.ready || norm1 || norm2)
         return cpu_dit(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn,
                        head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin,
-                       row_map, adaln_groups);
+                       row_map, adaln_groups, norm1, norm2);
     if (!blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
         return cpu_dit(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn,
                        head_dim, x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin,
-                       row_map, adaln_groups);
+                       row_map, adaln_groups, norm1, norm2);
 
     @autoreleasepool {
         const int T = tokens;
@@ -1246,7 +1247,7 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         launch_bf16(bfc1_bf, wfc1, (int)fc1_n);
         launch_bf16(bfc2_bf, wfc2, (int)fc2_n);
 
-        AdalnArgs a0{T, H, eps, has_mod, 0, 1, groups};
+        AdalnArgs a0{T, H, eps, has_mod, 1, 0, groups};
         enc1(g.p_adaln, (uint)T, @[ bx, bmod, bxn, bmap ], &a0, sizeof(a0));
         GemmArgs gq{T, H, 3 * I};
         enc2(g.p_gemm, (uint)(3 * I), (uint)T, @[ bxn, wqkv, bqkv ], &gq, sizeof(gq));
@@ -1265,7 +1266,7 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         GateArgs ga{T, H, has_mod, 2, groups};
         enc1(g.p_gate, (uint)(T * H), @[ bx, battn, bmod, bmap ], &ga, sizeof(ga));
 
-        AdalnArgs a1{T, H, eps, has_mod, 3, 4, groups};
+        AdalnArgs a1{T, H, eps, has_mod, 4, 3, groups};
         enc1(g.p_adaln, (uint)T, @[ bx, bmod, bxn, bmap ], &a1, sizeof(a1));
         GemmArgs g1{T, H, 2 * ffn};
         enc2(g.p_gemm, (uint)(2 * ffn), (uint)T, @[ bxn, wfc1, bh1 ], &g1, sizeof(g1));
@@ -1828,10 +1829,11 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
-                  const uint32_t *row_map, int adaln_groups) {
+                  const uint32_t *row_map, int adaln_groups, const float *norm1,
+                  const float *norm2) {
     h3_dit_block_cpu(blob, qkv_bytes, out_bytes, fc1_bytes, fc2_bytes, hidden, inner, ffn, head_dim,
                      x, tokens, eps, adaln_mod, q_norm, k_norm, rope_cos, rope_sin, row_map,
-                     adaln_groups);
+                     adaln_groups, norm1, norm2);
     return true;
 }
 

@@ -27,7 +27,8 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
-                  const uint32_t *row_map = nullptr, int adaln_groups = 1);
+                  const uint32_t *row_map = nullptr, int adaln_groups = 1,
+                  const float *norm1 = nullptr, const float *norm2 = nullptr);
 
 // Host port of the h3.c int8 GEMM. y[S,O] = x[S,I] @ W[O,I]^T with
 // int8-row weights and per-row scales. False on bad args.

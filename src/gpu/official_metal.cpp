@@ -313,7 +313,8 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
-                  const uint32_t *row_map, int adaln_groups) {
+                  const uint32_t *row_map, int adaln_groups, const float *norm1,
+                  const float *norm2) {
 #if !defined(MVLLM_OFFICIAL_METAL_HOST)
     (void)blob;
     (void)qkv_bytes;
@@ -334,6 +335,8 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
     (void)rope_sin;
     (void)row_map;
     (void)adaln_groups;
+    (void)norm1;
+    (void)norm2;
     return false;
 #else
     if (!g_h3 || !g_h3g || !blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
@@ -371,6 +374,12 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
     auto *xn = bag.add(h3_gpu_tensor_new_f32(g_h3g, static_cast<size_t>(T) * H));
     std::vector<float> one_host(static_cast<size_t>(H > hd ? H : hd), 1.f);
     auto *ones = bag.add(h3_gpu_tensor_from_f32(g_h3g, one_host.data(), one_host.size()));
+    h3_gpu_tensor *n1t = ones;
+    h3_gpu_tensor *n2t = ones;
+    if (norm1)
+        n1t = bag.add(h3_gpu_tensor_from_f32(g_h3g, norm1, static_cast<size_t>(H)));
+    if (norm2)
+        n2t = bag.add(h3_gpu_tensor_from_f32(g_h3g, norm2, static_cast<size_t>(H)));
     std::vector<uint32_t> map(static_cast<size_t>(T), 0u);
     if (row_map) {
         for (int t = 0; t < T; ++t) {
@@ -421,9 +430,9 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         rc = bag.add(h3_gpu_tensor_new_f32(g_h3g, 1));
         rs = bag.add(h3_gpu_tensor_new_f32(g_h3g, 1));
     }
-    if (!tx || !xn || !ones || !rm || !qkv_b || !out_b || !fc1_b || !fc2_b || !wqkv || !wout ||
-        !wfc1 || !wfc2 || !qkv || !q || !k || !v || !ctx || !attn || !h1 || !gated || !down ||
-        !rc || !rs || (adaln_mod && !mod) || (q_norm && !qn) || (k_norm && !kn))
+    if (!tx || !xn || !ones || !n1t || !n2t || !rm || !qkv_b || !out_b || !fc1_b || !fc2_b ||
+        !wqkv || !wout || !wfc1 || !wfc2 || !qkv || !q || !k || !v || !ctx || !attn || !h1 ||
+        !gated || !down || !rc || !rs || (adaln_mod && !mod) || (q_norm && !qn) || (k_norm && !kn))
         return false;
 
     H3Cmd cmd;
@@ -436,10 +445,10 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         return false;
 
     if (adaln_mod) {
-        if (!h3_gpu_adaln_f32(g_h3g, xn, tx, ones, mod, rm, static_cast<uint32_t>(T),
-                              static_cast<uint32_t>(H), 6u, 1u, 0u, eps))
+        if (!h3_gpu_adaln_f32(g_h3g, xn, tx, n1t, mod, rm, static_cast<uint32_t>(T),
+                              static_cast<uint32_t>(H), 6u, 0u, 1u, eps))
             return false;
-    } else if (!h3_gpu_rms_norm_f32(g_h3g, xn, tx, ones, static_cast<uint32_t>(T),
+    } else if (!h3_gpu_rms_norm_f32(g_h3g, xn, tx, n1t, static_cast<uint32_t>(T),
                                     static_cast<uint32_t>(H), eps)) {
         return false;
     }
@@ -487,13 +496,13 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
         if (!h3_gpu_gate_f32(g_h3g, tx, tx, attn, mod, rm, static_cast<uint32_t>(T),
                              static_cast<uint32_t>(H), 6u, 2u))
             return false;
-        if (!h3_gpu_adaln_f32(g_h3g, xn, tx, ones, mod, rm, static_cast<uint32_t>(T),
-                              static_cast<uint32_t>(H), 6u, 4u, 3u, eps))
+        if (!h3_gpu_adaln_f32(g_h3g, xn, tx, n2t, mod, rm, static_cast<uint32_t>(T),
+                              static_cast<uint32_t>(H), 6u, 3u, 4u, eps))
             return false;
     } else {
         if (!h3_gpu_add_scaled_f32(g_h3g, tx, tx, attn, 1.f, 1.f,
                                    static_cast<uint32_t>(T) * static_cast<uint32_t>(H)) ||
-            !h3_gpu_rms_norm_f32(g_h3g, xn, tx, ones, static_cast<uint32_t>(T),
+            !h3_gpu_rms_norm_f32(g_h3g, xn, tx, n2t, static_cast<uint32_t>(T),
                                  static_cast<uint32_t>(H), eps))
             return false;
     }

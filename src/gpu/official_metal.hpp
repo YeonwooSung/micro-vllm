@@ -34,7 +34,8 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
-                  const uint32_t *row_map, int adaln_groups);
+                  const uint32_t *row_map, int adaln_groups, const float *norm1 = nullptr,
+                  const float *norm2 = nullptr);
 
 } // namespace official_metal
 } // namespace mvllm

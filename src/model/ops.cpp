@@ -1109,7 +1109,7 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                       int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                       int tokens, float eps, const float *adaln_mod, const float *q_norm,
                       const float *k_norm, const float *rope_cos, const float *rope_sin,
-                      const uint32_t *row_map, int adaln_groups) {
+                      const uint32_t *row_map, int adaln_groups, const float *n1, const float *n2) {
     if (!blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
         return;
     const int64_t qkv_n = qkv_bytes / 2;
@@ -1136,9 +1136,12 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
     std::vector<float> xn(static_cast<size_t>(T) * H);
     std::vector<float> ones(H, 1.f);
     const int groups = adaln_groups > 0 ? adaln_groups : 1;
-    auto apply_adaln = [&](const float *src, float *dst, int scale_slot, int shift_slot) {
+    // Official h3_gpu_adaln(..., shift_slot, scale_slot): attn (0,1), MLP (3,4).
+    auto apply_adaln = [&](const float *src, float *dst, int scale_slot, int shift_slot,
+                           const float *nw) {
+        const float *w = nw ? nw : ones.data();
         for (int t = 0; t < T; ++t) {
-            quant::rmsnorm(src + t * H, ones.data(), dst + t * H, H, eps);
+            quant::rmsnorm(src + t * H, w, dst + t * H, H, eps);
             if (!adaln_mod)
                 continue;
             const int g = h3_adaln_group_index(row_map, t, groups);
@@ -1148,7 +1151,7 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                 dst[t * H + i] = dst[t * H + i] * (1.f + s[i]) + b[i];
         }
     };
-    apply_adaln(x, xn.data(), 0, 1);
+    apply_adaln(x, xn.data(), 1, 0, n1);
 
     std::vector<float> qkv(static_cast<size_t>(T) * 3 * I);
     quant::matmul_f32(qkv.data(), xn.data(), Wqkv.data(), T, H, 3 * I);
@@ -1229,7 +1232,7 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
             x[t * H + i] += gate * attn[t * H + i];
         }
 
-    apply_adaln(x, xn.data(), 3, 4);
+    apply_adaln(x, xn.data(), 4, 3, n2);
     std::vector<float> h1(static_cast<size_t>(T) * (2 * ffn));
     quant::matmul_f32(h1.data(), xn.data(), Wfc1.data(), T, H, 2 * ffn);
     for (int t = 0; t < T; ++t) {
@@ -1253,6 +1256,93 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                              : 1.f;
             x[t * H + i] += gate * down[t * H + i];
         }
+}
+
+void h3_token_refiner_block(float *x, int tokens, int hidden, int inner, int ffn, int head_dim,
+                            const float *norm1, const float *qkv_w, const float *q_norm,
+                            const float *k_norm, const float *out_w, const float *norm2,
+                            const float *fc1_w, const float *fc2_w, float eps) {
+    if (!x || !qkv_w || !out_w || !fc1_w || !fc2_w || hidden <= 0 || inner <= 0 || ffn <= 0 ||
+        tokens <= 0)
+        return;
+    const int T = tokens;
+    const int I = inner;
+    const int H = hidden;
+    int hd = head_dim > 0 ? head_dim : I;
+    int heads = I / hd;
+    if (heads < 1) {
+        heads = 1;
+        hd = I;
+    }
+    std::vector<float> ones(static_cast<size_t>(H), 1.f);
+    std::vector<float> xn(static_cast<size_t>(T) * H);
+    const float *w1 = norm1 ? norm1 : ones.data();
+    for (int t = 0; t < T; ++t)
+        quant::rmsnorm(x + t * H, w1, xn.data() + t * H, H, eps);
+
+    std::vector<float> qkv(static_cast<size_t>(T) * 3 * I);
+    quant::matmul_f32(qkv.data(), xn.data(), qkv_w, T, H, 3 * I);
+    if (q_norm || k_norm) {
+        for (int t = 0; t < T; ++t) {
+            for (int h = 0; h < heads; ++h) {
+                float *q = qkv.data() + t * 3 * I + h * hd;
+                float *k = qkv.data() + t * 3 * I + I + h * hd;
+                if (q_norm)
+                    quant::rmsnorm(q, q_norm, q, hd, eps);
+                if (k_norm)
+                    quant::rmsnorm(k, k_norm, k, hd, eps);
+            }
+        }
+    }
+    std::vector<float> ctx(static_cast<size_t>(T) * I, 0.f);
+    const float scale = 1.f / std::sqrt(static_cast<float>(hd));
+    for (int h = 0; h < heads; ++h) {
+        std::vector<float> scores(static_cast<size_t>(T) * T, 0.f);
+        for (int qi = 0; qi < T; ++qi) {
+            const float *q = qkv.data() + qi * 3 * I + h * hd;
+            for (int ki = 0; ki < T; ++ki) {
+                const float *k = qkv.data() + ki * 3 * I + I + h * hd;
+                float acc = 0.f;
+                for (int d = 0; d < hd; ++d)
+                    acc += q[d] * k[d];
+                scores[qi * T + ki] = acc * scale;
+            }
+            quant::softmax_inplace(scores.data() + qi * T, T);
+        }
+        for (int qi = 0; qi < T; ++qi) {
+            float *o = ctx.data() + qi * I + h * hd;
+            for (int d = 0; d < hd; ++d)
+                o[d] = 0.f;
+            for (int vi = 0; vi < T; ++vi) {
+                const float *v = qkv.data() + vi * 3 * I + 2 * I + h * hd;
+                float a = scores[qi * T + vi];
+                for (int d = 0; d < hd; ++d)
+                    o[d] += a * v[d];
+            }
+        }
+    }
+    std::vector<float> attn(static_cast<size_t>(T) * H);
+    quant::matmul_f32(attn.data(), ctx.data(), out_w, T, I, H);
+    for (int i = 0; i < T * H; ++i)
+        x[i] += attn[static_cast<size_t>(i)];
+
+    const float *w2 = norm2 ? norm2 : ones.data();
+    for (int t = 0; t < T; ++t)
+        quant::rmsnorm(x + t * H, w2, xn.data() + t * H, H, eps);
+    std::vector<float> h1(static_cast<size_t>(T) * (2 * ffn));
+    quant::matmul_f32(h1.data(), xn.data(), fc1_w, T, H, 2 * ffn);
+    std::vector<float> gated(static_cast<size_t>(T) * ffn);
+    for (int t = 0; t < T; ++t) {
+        float *g = h1.data() + t * (2 * ffn);
+        float *u = g + ffn;
+        float *o = gated.data() + t * ffn;
+        for (int i = 0; i < ffn; ++i)
+            o[i] = g[i] * quant::sigmoid(g[i]) * u[i];
+    }
+    std::vector<float> down(static_cast<size_t>(T) * H);
+    quant::matmul_f32(down.data(), gated.data(), fc2_w, T, ffn, H);
+    for (int i = 0; i < T * H; ++i)
+        x[i] += down[static_cast<size_t>(i)];
 }
 
 void mla_absorb_kvb(const float *kv_b, int n_heads, int qk_nope, int v_head, int kv_lora,

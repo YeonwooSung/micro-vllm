@@ -168,6 +168,17 @@ void rms_adaln_final(float *y, const float *x, const float *wn, const float *sca
     }
 }
 
+struct RefinerW {
+    std::vector<float> norm1, norm2, qkv, qn, kn, out, fc1, fc2;
+    bool ok(int H, int I, int F, int hd) const {
+        (void)hd;
+        return H > 0 && I > 0 && F > 0 && static_cast<int>(qkv.size()) >= 3 * I * H &&
+               static_cast<int>(out.size()) >= H * I &&
+               static_cast<int>(fc1.size()) >= 2 * F * H &&
+               static_cast<int>(fc2.size()) >= H * F;
+    }
+};
+
 struct AccTimer {
     double &acc;
     std::chrono::steady_clock::time_point t0;
@@ -537,6 +548,33 @@ public:
                             tproj[static_cast<size_t>(t) * hidden + d] =
                                 th[static_cast<size_t>(t) * thid + (d % thid)];
                 }
+                const int r_inner = cfg_.h3.inner > 0 ? cfg_.h3.inner : 7168;
+                const int r_ffn = cfg_.h3.ffn > 0 ? cfg_.h3.ffn : 14336;
+                const int r_hd = cfg_.h3.head_dim > 0 ? cfg_.h3.head_dim : 128;
+                bool refined = false;
+                for (int rb = 0; rb < 2; ++rb) {
+                    if (!refiner_[static_cast<size_t>(rb)].ok(hidden, r_inner, r_ffn, r_hd))
+                        break;
+                    const RefinerW &rw = refiner_[static_cast<size_t>(rb)];
+                    h3_token_refiner_block(
+                        tproj.data(), text_tokens, hidden, r_inner, r_ffn, r_hd,
+                        rw.norm1.size() >= static_cast<size_t>(hidden) ? rw.norm1.data() : nullptr,
+                        rw.qkv.data(),
+                        rw.qn.size() >= static_cast<size_t>(r_hd) ? rw.qn.data() : nullptr,
+                        rw.kn.size() >= static_cast<size_t>(r_hd) ? rw.kn.data() : nullptr,
+                        rw.out.data(),
+                        rw.norm2.size() >= static_cast<size_t>(hidden) ? rw.norm2.data() : nullptr,
+                        rw.fc1.data(), rw.fc2.data(), 1e-5f);
+                    refined = true;
+                }
+                if (refined && static_cast<int>(refiner_final_.size()) >= hidden) {
+                    std::vector<float> tmp(tproj.size());
+                    for (int t = 0; t < text_tokens; ++t)
+                        quant::rmsnorm(tproj.data() + static_cast<size_t>(t) * hidden,
+                                       refiner_final_.data(),
+                                       tmp.data() + static_cast<size_t>(t) * hidden, hidden, 1e-5f);
+                    tproj.swap(tmp);
+                }
             }
         }
 
@@ -726,6 +764,18 @@ public:
                             audio_rows, AC, hidden);
             }
         };
+        auto pack_condition = [&]() {
+            if (text_tokens > 0 &&
+                static_cast<int>(tproj.size()) >= text_tokens * hidden && seq >= text_tokens)
+                std::memcpy(latent.data(), tproj.data(),
+                            static_cast<size_t>(text_tokens) * hidden * sizeof(float));
+            if (cond_rows > 0 &&
+                static_cast<int>(clatent.size()) >= cond_rows * hidden &&
+                seq >= text_tokens + cond_rows)
+                std::memcpy(latent.data() + static_cast<size_t>(text_tokens) * hidden,
+                            clatent.data(),
+                            static_cast<size_t>(cond_rows) * hidden * sizeof(float));
+        };
         auto unpack_z = [&]() {
             const float *vid = latent.data() + static_cast<size_t>(video_off) * hidden;
             for (int i = 0; i < tokens; ++i)
@@ -814,9 +864,6 @@ public:
         int cuda_hits = 0;
         std::vector<float> old_vid;
         std::vector<float> old_aud;
-        uint32_t ph = 0;
-        for (unsigned char c : hp.prompt)
-            ph = ph * 131u + c;
         const int slot = 6 * hidden;
         auto layer_mrows = [&](int layer) {
             const int wr = adaln_.w_rows(layer);
@@ -827,6 +874,7 @@ public:
         for (int s = 0; s < evals; ++s) {
             if (hp.on_progress)
                 hp.on_progress(s, evals, "denoise");
+            pack_condition();
             if (vel_path)
                 pack_from_latents();
             int temb_rows = 1;
@@ -835,16 +883,11 @@ public:
                 temb_rows = static_cast<int>(dit.time_rows());
                 if (temb_rows < 1)
                     temb_rows = 1;
-                const uint32_t vr = dit.video_row(s);
-                if (vr < dit.time_rows() && !tfeat.empty())
-                    tfeat[static_cast<size_t>(vr) * static_cast<size_t>(tdim)] +=
-                        0.01f * static_cast<float>(ph % 100u);
                 if (!(layout_ok && dit.row_map(s, layout, nullptr, 0, rmap.data(), seq)))
                     std::fill(rmap.begin(), rmap.end(), 0u);
             } else {
                 tfeat.assign(static_cast<size_t>(tdim), 0.f);
                 h3_time_features(1.f - sigmas[static_cast<size_t>(s)], tfeat.data(), tdim);
-                tfeat[0] += 0.01f * static_cast<float>(ph % 100u);
                 std::fill(rmap.begin(), rmap.end(), 0u);
                 if (layout_ok) {
                     for (const H3Segment &seg : layout.segments) {
@@ -892,11 +935,17 @@ public:
                 if (data && bytes > 0)
                     streamed++;
                 if (from_checkpoint_ && data && bytes == expect) {
-                    const float *qn = nullptr, *kn = nullptr;
+                    const float *qn = nullptr, *kn = nullptr, *n1p = nullptr, *n2p = nullptr;
                     if (b < static_cast<int>(q_norm_.size()) && !q_norm_[static_cast<size_t>(b)].empty())
                         qn = q_norm_[static_cast<size_t>(b)].data();
                     if (b < static_cast<int>(k_norm_.size()) && !k_norm_[static_cast<size_t>(b)].empty())
                         kn = k_norm_[static_cast<size_t>(b)].data();
+                    if (b < static_cast<int>(n1_.size()) &&
+                        static_cast<int>(n1_[static_cast<size_t>(b)].size()) >= hidden)
+                        n1p = n1_[static_cast<size_t>(b)].data();
+                    if (b < static_cast<int>(n2_.size()) &&
+                        static_cast<int>(n2_[static_cast<size_t>(b)].size()) >= hidden)
+                        n2p = n2_[static_cast<size_t>(b)].data();
                     const float *mp = nullptr;
                     const uint32_t *rp = nullptr;
                     int groups = 1;
@@ -928,23 +977,26 @@ public:
                         ++dit_calls;
                         if (gpu::device() == Device::Cuda) {
                             ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
-                                                        inner, ffn, hd, latent.data(), seq, 1e-6f,
-                                                        mp, qn, kn, r_cos, r_sin, rp, groups);
+                                                        inner, ffn, hd, latent.data(), seq, 1e-5f,
+                                                        mp, qn, kn, r_cos, r_sin, rp, groups, n1p,
+                                                        n2p);
                             if (ran && h3_cuda::last_on_device())
                                 ++cuda_hits;
                         }
                         if (!ran && official_metal::h3_available())
                             ran = official_metal::dit_residual(
                                 data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
-                                latent.data(), seq, 1e-6f, mp, qn, kn, r_cos, r_sin, rp, groups);
+                                latent.data(), seq, 1e-5f, mp, qn, kn, r_cos, r_sin, rp, groups,
+                                n1p, n2p);
                         if (!ran)
                             ran = metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
-                                                         inner, ffn, hd, latent.data(), seq, 1e-6f,
-                                                         mp, qn, kn, r_cos, r_sin, rp, groups);
+                                                         inner, ffn, hd, latent.data(), seq, 1e-5f,
+                                                         mp, qn, kn, r_cos, r_sin, rp, groups, n1p,
+                                                         n2p);
                         if (!ran)
                             h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
-                                             hd, latent.data(), seq, 1e-6f, mp, qn, kn, r_cos,
-                                             r_sin, rp, groups);
+                                             hd, latent.data(), seq, 1e-5f, mp, qn, kn, r_cos,
+                                             r_sin, rp, groups, n1p, n2p);
                     }
                     if (mp)
                         any_mod = true;
@@ -981,8 +1033,8 @@ public:
                                     ? fin_adaln_b_.data()
                                     : nullptr,
                                 1, td, 2 * hidden);
-                    sc = fmod.data();
-                    sh = fmod.data() + hidden;
+                    sh = fmod.data();
+                    sc = fmod.data() + hidden;
                 }
                 rms_adaln_final(vnorm.data(), vin, fn, sc, sh, tokens, hidden, 1e-5f);
                 std::vector<float> v96(static_cast<size_t>(tokens) * patch, 0.f);
@@ -1212,6 +1264,9 @@ public:
         }
         out.note += vel_path ? " sampler=euler" : " sampler=res";
         out.note += vel_path ? " head=vel" : " head=tile";
+        out.note += (refiner_[0].ok(hidden, inner, ffn, hd) && refiner_[1].ok(hidden, inner, ffn, hd))
+                        ? " refiner=on"
+                        : " refiner=off";
         out.note += " text_tokens=" + std::to_string(text_tokens);
         if (text_tokens > 0)
             out.note += text_.from_checkpoint()
@@ -1282,6 +1337,11 @@ public:
                    ? "cuda"
                    : metal_h3::backend_name())
            << " adaln=" << adaln_.tag()
+           << " refiner="
+           << (refiner_[0].ok(cfg_.h3.hidden, cfg_.h3.inner, cfg_.h3.ffn, cfg_.h3.head_dim) &&
+                       refiner_[1].ok(cfg_.h3.hidden, cfg_.h3.inner, cfg_.h3.ffn, cfg_.h3.head_dim)
+                   ? "on"
+                   : "off")
            << " int8=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " nax=" << (metal_h3::available() ? metal_h3::backend_name() : "off")
            << " official=" << official_metal::status()
@@ -1448,11 +1508,28 @@ private:
         load_f("final_layer.audio_out.bias", aud_out_b_);
         q_norm_.assign(static_cast<size_t>(n_blocks), {});
         k_norm_.assign(static_cast<size_t>(n_blocks), {});
+        n1_.assign(static_cast<size_t>(n_blocks), {});
+        n2_.assign(static_cast<size_t>(n_blocks), {});
         for (int i = 0; i < n_blocks; ++i) {
             const std::string p = "blocks." + std::to_string(i) + ".";
             load_f(p + "attn.q_norm.weight", q_norm_[static_cast<size_t>(i)]);
             load_f(p + "attn.k_norm.weight", k_norm_[static_cast<size_t>(i)]);
+            load_f(p + "norm1.weight", n1_[static_cast<size_t>(i)]);
+            load_f(p + "norm2.weight", n2_[static_cast<size_t>(i)]);
         }
+        for (int rb = 0; rb < 2; ++rb) {
+            const std::string p = "token_refiner.blocks." + std::to_string(rb) + ".";
+            RefinerW &rw = refiner_[static_cast<size_t>(rb)];
+            load_f(p + "norm1.weight", rw.norm1);
+            load_f(p + "norm2.weight", rw.norm2);
+            load_f(p + "attn.qkv_proj.weight", rw.qkv);
+            load_f(p + "attn.q_norm.weight", rw.qn);
+            load_f(p + "attn.k_norm.weight", rw.kn);
+            load_f(p + "attn.out_proj.weight", rw.out);
+            load_f(p + "mlp.fc1.weight", rw.fc1);
+            load_f(p + "mlp.fc2.weight", rw.fc2);
+        }
+        load_f("token_refiner.final_norm.weight", refiner_final_);
         adaln_.bind(files, n_blocks, cfg_.h3.hidden);
         transformer_dir_ = dir;
         block_bytes_ = slot;
@@ -1516,7 +1593,9 @@ private:
     std::vector<float> fin_norm_, fin_adaln_w_, fin_adaln_b_;
     std::vector<float> vid_out_w_, vid_out_b_, aud_out_w_, aud_out_b_;
     H3AdalnStore adaln_;
-    std::vector<std::vector<float>> q_norm_, k_norm_;
+    std::vector<std::vector<float>> q_norm_, k_norm_, n1_, n2_;
+    RefinerW refiner_[2];
+    std::vector<float> refiner_final_;
     H3TextEncoder text_;
     H3VisionEncoder vision_;
     Tokenizer h3_tok_;

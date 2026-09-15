@@ -3251,6 +3251,63 @@ static void test_h3_cuda_dit() {
     CHECK(h3_cuda::workspace_bytes() == 0);
 }
 
+static void test_h3_official_contracts() {
+    using namespace mvllm;
+    const int H = 8, Inn = 4, Ffn = 8, T = 3, hd = 2;
+    const int64_t qkv_n = static_cast<int64_t>(3) * Inn * H;
+    const int64_t out_n = static_cast<int64_t>(H) * Inn;
+    const int64_t fc1_n = static_cast<int64_t>(2) * Ffn * H;
+    const int64_t fc2_n = static_cast<int64_t>(H) * Ffn;
+    std::vector<uint8_t> blob(static_cast<size_t>(2 * (qkv_n + out_n + fc1_n + fc2_n)));
+    uint16_t *bf = reinterpret_cast<uint16_t *>(blob.data());
+    for (int64_t i = 0; i < qkv_n + out_n + fc1_n + fc2_n; ++i)
+        bf[i] = bf16_encode(((i * 17) % 11 - 5) * 0.05f);
+    std::vector<float> mod(static_cast<size_t>(6) * H);
+    for (int i = 0; i < 6 * H; ++i)
+        mod[static_cast<size_t>(i)] = ((i % 5) - 2) * 0.02f;
+    std::vector<float> qn(static_cast<size_t>(hd), 1.f), kn(static_cast<size_t>(hd), 1.f);
+    std::vector<float> n1(static_cast<size_t>(H)), n2(static_cast<size_t>(H));
+    for (int i = 0; i < H; ++i) {
+        n1[static_cast<size_t>(i)] = 0.8f + 0.05f * static_cast<float>(i);
+        n2[static_cast<size_t>(i)] = 1.1f - 0.03f * static_cast<float>(i);
+    }
+    std::vector<float> xc(static_cast<size_t>(T) * H), xg(static_cast<size_t>(T) * H);
+    for (int i = 0; i < T * H; ++i)
+        xc[static_cast<size_t>(i)] = xg[static_cast<size_t>(i)] = ((i % 7) - 3) * 0.1f;
+    std::vector<float> x0 = xc;
+    h3_dit_block_cpu(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn, Ffn, hd,
+                     xc.data(), T, 1e-5f, mod.data(), qn.data(), kn.data(), nullptr, nullptr,
+                     nullptr, 1, n1.data(), n2.data());
+    CHECK(h3_cuda::init());
+    CHECK(h3_cuda::dit_residual(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H, Inn,
+                                Ffn, hd, xg.data(), T, 1e-5f, mod.data(), qn.data(), kn.data(),
+                                nullptr, nullptr, nullptr, 1, n1.data(), n2.data()));
+    bool match = true;
+    float drift = 0.f;
+    for (int i = 0; i < T * H; ++i) {
+        match = match && std::fabs(xc[static_cast<size_t>(i)] - xg[static_cast<size_t>(i)]) < 2e-4f;
+        drift += std::fabs(xc[static_cast<size_t>(i)] - x0[static_cast<size_t>(i)]);
+    }
+    CHECK(match);
+    CHECK(drift > 1e-4f);
+    h3_cuda::shutdown();
+
+    std::vector<float> x(static_cast<size_t>(T) * H, 0.2f);
+    std::vector<float> qkv(static_cast<size_t>(3 * Inn * H), 0.05f);
+    std::vector<float> out(static_cast<size_t>(H * Inn), 0.04f);
+    std::vector<float> fc1(static_cast<size_t>(2 * Ffn * H), 0.03f);
+    std::vector<float> fc2(static_cast<size_t>(H * Ffn), 0.02f);
+    std::vector<float> ones(static_cast<size_t>(H), 1.f);
+    std::vector<float> qnh(static_cast<size_t>(hd), 1.f);
+    const std::vector<float> before = x;
+    h3_token_refiner_block(x.data(), T, H, Inn, Ffn, hd, ones.data(), qkv.data(), qnh.data(),
+                           qnh.data(), out.data(), ones.data(), fc1.data(), fc2.data(), 1e-5f);
+    float rdelta = 0.f;
+    for (int i = 0; i < T * H; ++i)
+        rdelta += std::fabs(x[static_cast<size_t>(i)] - before[static_cast<size_t>(i)]);
+    CHECK(rdelta > 1e-4f);
+}
+
 static void test_llama_dims_helpers() {
     const bool llama_dims_nlayers = N_LAYERS == 16;
     CHECK(llama_dims_nlayers);
@@ -5692,6 +5749,7 @@ int main() {
     test_metal_ops_tier();
     test_metal_h3_tier();
     test_h3_cuda_dit();
+    test_h3_official_contracts();
     test_llama_dims_helpers();
     test_offload_generate();
     test_glm53_container();

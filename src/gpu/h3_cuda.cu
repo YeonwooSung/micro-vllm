@@ -38,6 +38,7 @@ dim3 grid2(int gx, int gy) {
 struct DitWs {
     uint8_t *blob;
     float *x, *xn, *qkv, *ctx, *attn, *h1, *gated, *down, *scores, *mod, *qn, *kn, *cos, *sin;
+    float *nw1, *nw2;
     uint32_t *rmap;
     int cap_T, cap_H, cap_I, cap_ffn, cap_hd, cap_G, cap_heads;
     int64_t cap_blob;
@@ -62,6 +63,8 @@ void ws_release(DitWs &w) {
     dfree(w.kn);
     dfree(w.cos);
     dfree(w.sin);
+    dfree(w.nw1);
+    dfree(w.nw2);
     dfree(w.rmap);
     w = DitWs{};
 }
@@ -91,6 +94,8 @@ size_t ws_bytes() {
     n += sizeof(float) * hd;          // kn
     n += sizeof(float) * T * 48;      // cos
     n += sizeof(float) * T * 48;      // sin
+    n += sizeof(float) * H;           // nw1
+    n += sizeof(float) * H;           // nw2
     n += sizeof(uint32_t) * T;        // rmap
     return n;
 }
@@ -155,11 +160,13 @@ bool ws_ensure(int T, int H, int I, int ffn, int hd, int64_t blob_n, int groups,
     nxt.kn = dalloc<float>(static_cast<size_t>(nhd));
     nxt.cos = dalloc<float>(static_cast<size_t>(nT) * 48);
     nxt.sin = dalloc<float>(static_cast<size_t>(nT) * 48);
+    nxt.nw1 = dalloc<float>(static_cast<size_t>(nH));
+    nxt.nw2 = dalloc<float>(static_cast<size_t>(nH));
     nxt.rmap = dalloc<uint32_t>(static_cast<size_t>(nT));
 
     const bool ok = nxt.blob && nxt.x && nxt.xn && nxt.qkv && nxt.ctx && nxt.attn && nxt.h1 &&
                     nxt.gated && nxt.down && nxt.scores && nxt.mod && nxt.qn && nxt.kn && nxt.cos &&
-                    nxt.sin && nxt.rmap;
+                    nxt.sin && nxt.nw1 && nxt.nw2 && nxt.rmap;
     if (!ok) {
         ws_release(nxt);
         return false;
@@ -184,10 +191,11 @@ __device__ inline int d_group(const uint32_t *row_map, int t, int groups) {
     return (g >= 0 && g < groups) ? g : 0;
 }
 
-// RMSNorm with ones, then y = y * (1 + scale) + shift when has_mod.
+// RMSNorm (optional learned weight), then y = y * (1 + scale) + shift when has_mod.
+// Official slots: attn scale=1/shift=0, MLP scale=4/shift=3.
 __global__ void k_adaln(const float *x, const float *mod, float *y, int T, int H, float eps,
                         int has_mod, int scale_slot, int shift_slot, const uint32_t *row_map,
-                        int groups) {
+                        int groups, const float *nw) {
     int t = blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= T)
         return;
@@ -201,8 +209,13 @@ __global__ void k_adaln(const float *x, const float *mod, float *y, int T, int H
         const int g = d_group(row_map, t, groups);
         const float *s = mod + (static_cast<size_t>(g) * 6 + scale_slot) * H;
         const float *b = mod + (static_cast<size_t>(g) * 6 + shift_slot) * H;
+        for (int i = 0; i < H; ++i) {
+            const float n = nw ? nw[i] : 1.f;
+            ys[i] = xs[i] * inv * n * (1.f + s[i]) + b[i];
+        }
+    } else if (nw) {
         for (int i = 0; i < H; ++i)
-            ys[i] = xs[i] * inv * (1.f + s[i]) + b[i];
+            ys[i] = xs[i] * inv * nw[i];
     } else {
         for (int i = 0; i < H; ++i)
             ys[i] = xs[i] * inv;
@@ -501,7 +514,7 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
                                         const float *adaln_mod, const float *q_norm,
                                         const float *k_norm, const float *rope_cos,
                                         const float *rope_sin, const uint32_t *row_map,
-                                        int adaln_groups) {
+                                        int adaln_groups, const float *norm1, const float *norm2) {
     if (!blob || !x || hidden <= 0 || inner <= 0 || ffn <= 0 || tokens <= 0)
         return 1;
     if (qkv_bytes < 2 || out_bytes < 2 || fc1_bytes < 2 || fc2_bytes < 2)
@@ -565,8 +578,12 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
             reinterpret_cast<const uint16_t *>(g_ws.blob + qkv_bytes + out_bytes + fc1_bytes);
         const uint32_t *dmap = use_map ? g_ws.rmap : nullptr;
 
-        k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 0, 1, dmap,
-                                  groups);
+        if (norm1)
+            ok = ok && ck(cudaMemcpy(g_ws.nw1, norm1, sizeof(float) * static_cast<size_t>(H),
+                                     cudaMemcpyHostToDevice));
+        const float *dn1 = norm1 ? g_ws.nw1 : nullptr;
+        k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 1, 0, dmap, groups,
+                                  dn1);
         k_gemm_bf16_tiled<<<grid2(3 * I, T), dim3(16, 16)>>>(g_ws.xn, w_qkv, g_ws.qkv, T, H, 3 * I);
         if (do_q || do_k)
             k_qk_rmsnorm<<<grid2(heads, T), dim3(16, 16)>>>(g_ws.qkv, g_ws.qn, g_ws.kn, T, I, hd,
@@ -593,8 +610,12 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
             k_residual_gate<<<grid1(T * H), 64>>>(g_ws.x, g_ws.attn, g_ws.mod, T * H, H, has_mod, 2,
                                                   dmap, groups);
 
-            k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 3, 4, dmap,
-                                      groups);
+            if (norm2)
+                ok = ok && ck(cudaMemcpy(g_ws.nw2, norm2, sizeof(float) * static_cast<size_t>(H),
+                                         cudaMemcpyHostToDevice));
+            const float *dn2 = norm2 ? g_ws.nw2 : nullptr;
+            k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 4, 3, dmap,
+                                      groups, dn2);
             k_gemm_bf16_tiled<<<grid2(2 * ffn, T), dim3(16, 16)>>>(g_ws.xn, w_fc1, g_ws.h1, T, H,
                                                                   2 * ffn);
             k_swiglu_pack<<<grid2(ffn, T), dim3(16, 16)>>>(g_ws.h1, g_ws.gated, T, ffn);

@@ -29,7 +29,8 @@ bool dit_residual(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes, int
                   int64_t fc2_bytes, int hidden, int inner, int ffn, int head_dim, float *x,
                   int tokens, float eps, const float *adaln_mod, const float *q_norm,
                   const float *k_norm, const float *rope_cos, const float *rope_sin,
-                  const uint32_t *row_map = nullptr, int adaln_groups = 1);
+                  const uint32_t *row_map = nullptr, int adaln_groups = 1,
+                  const float *norm1 = nullptr, const float *norm2 = nullptr);
 
 // y[S,O] = x[S,I] @ W[O,I]^T. W is row-major BF16. CPU fallback if no device.
 bool gemm_bf16(float *y, const float *x, const uint16_t *w, int S, int I, int O);

@@ -363,7 +363,15 @@ void h3_dit_block_cpu(const uint8_t *blob, int64_t qkv_bytes, int64_t out_bytes,
                       int tokens, float eps, const float *adaln_mod = nullptr,
                       const float *q_norm = nullptr, const float *k_norm = nullptr,
                       const float *rope_cos = nullptr, const float *rope_sin = nullptr,
-                      const uint32_t *row_map = nullptr, int adaln_groups = 1);
+                      const uint32_t *row_map = nullptr, int adaln_groups = 1,
+                      const float *norm1 = nullptr, const float *norm2 = nullptr);
+
+// Official token_refiner block: RMS → QKV → QK-RMS → SDPA → add (no gate/RoPE),
+// then RMS → SwiGLU MLP → add. Weights are F32 [O,I].
+void h3_token_refiner_block(float *x, int tokens, int hidden, int inner, int ffn, int head_dim,
+                            const float *norm1, const float *qkv_w, const float *q_norm,
+                            const float *k_norm, const float *out_w, const float *norm2,
+                            const float *fc1_w, const float *fc2_w, float eps);
 
 void attnres_mix(const std::vector<std::vector<float>> &snapshots, const float *prefix,
                  const float *res_norm, const float *res_proj, float *hidden, int n, float eps);
