@@ -6,6 +6,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 namespace mvllm {
 namespace {
@@ -177,6 +178,110 @@ void h3_token_pool_mean(const float *a, const float *b, float *out, int hidden) 
     }
     for (int i = 0; i < hidden; ++i)
         out[i] = 0.5f * (a[i] + b[i]);
+}
+
+uint32_t h3_token_reduce_baseline_index(const H3TokenReduce &cfg, uint32_t reduced_row) {
+    if (reduced_row < cfg.video_target_start || reduced_row >= cfg.reduced_sequence)
+        return UINT32_MAX;
+    uint32_t first = 0, second = 0;
+    h3_token_pool_sources(cfg, reduced_row, &first, &second);
+    if (first == second)
+        return UINT32_MAX;
+    uint32_t index = 0;
+    for (uint32_t row = cfg.video_target_start; row < reduced_row; ++row) {
+        uint32_t a = 0, b = 0;
+        h3_token_pool_sources(cfg, row, &a, &b);
+        if (a != b)
+            ++index;
+    }
+    return index;
+}
+
+void h3_token_reduce_enter(const H3TokenReduce &cfg, const float *full, float *reduced,
+                           float *original, float *baseline, int hidden) {
+    if (!cfg.enabled || !full || !reduced || !original || hidden < 1)
+        return;
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(float);
+    std::memcpy(original, full, static_cast<size_t>(cfg.sequence) * row_bytes);
+    uint32_t baseline_row = 0;
+    for (uint32_t row = 0; row < cfg.reduced_sequence; ++row) {
+        uint32_t first = 0, second = 0;
+        h3_token_pool_sources(cfg, row, &first, &second);
+        const float *a = full + static_cast<size_t>(first) * hidden;
+        const float *b = full + static_cast<size_t>(second) * hidden;
+        float *out = reduced + static_cast<size_t>(row) * hidden;
+        h3_token_pool_mean(a, b, out, hidden);
+        if (baseline && row >= cfg.video_target_start && first != second) {
+            std::memcpy(baseline + static_cast<size_t>(baseline_row) * hidden, out, row_bytes);
+            ++baseline_row;
+        }
+    }
+}
+
+void h3_token_reduce_leave(const H3TokenReduce &cfg, const float *reduced, const float *original,
+                           const float *baseline, float *full, int hidden) {
+    if (!cfg.enabled || !reduced || !original || !full || hidden < 1)
+        return;
+    const size_t row_bytes = static_cast<size_t>(hidden) * sizeof(float);
+    for (uint32_t row = 0; row < cfg.sequence; ++row) {
+        const uint32_t parent = h3_token_reduced_parent(cfg, row);
+        float *dst = full + static_cast<size_t>(row) * hidden;
+        const float *src = reduced + static_cast<size_t>(parent) * hidden;
+        if (row < cfg.video_target_start) {
+            std::memcpy(dst, src, row_bytes);
+            continue;
+        }
+        const uint32_t bidx = h3_token_reduce_baseline_index(cfg, parent);
+        if (bidx == UINT32_MAX || !baseline) {
+            std::memcpy(dst, src, row_bytes);
+            continue;
+        }
+        const float *base = baseline + static_cast<size_t>(bidx) * hidden;
+        const float *orig = original + static_cast<size_t>(row) * hidden;
+        for (int i = 0; i < hidden; ++i)
+            dst[i] = orig[i] + cfg.scale * (src[i] - base[i]);
+    }
+}
+
+void h3_token_reduce_row_map(const H3TokenReduce &cfg, const uint32_t *full_map,
+                             uint32_t *reduced_map) {
+    if (!cfg.enabled || !full_map || !reduced_map)
+        return;
+    for (uint32_t row = 0; row < cfg.reduced_sequence; ++row) {
+        uint32_t first = 0, second = 0;
+        h3_token_pool_sources(cfg, row, &first, &second);
+        (void)second;
+        reduced_map[row] = full_map[first];
+    }
+}
+
+void h3_token_reduce_rope_tables(const H3TokenReduce &cfg, const H3Layout &layout,
+                                 const float *inv_freq, float spatial_scale,
+                                 std::vector<float> &cos, std::vector<float> &sin) {
+    const int seq = static_cast<int>(cfg.reduced_sequence);
+    cos.assign(static_cast<size_t>(seq) * kH3RopeHalf, 1.f);
+    sin.assign(static_cast<size_t>(seq) * kH3RopeHalf, 0.f);
+    if (!cfg.enabled || !inv_freq || seq < 1 ||
+        static_cast<uint32_t>(layout.positions.size()) < cfg.sequence)
+        return;
+    if (!(spatial_scale > 0.f))
+        spatial_scale = 1.f;
+    for (uint32_t row = 0; row < cfg.reduced_sequence; ++row) {
+        uint32_t first = 0, second = 0;
+        h3_token_pool_sources(cfg, row, &first, &second);
+        const H3Position &pa = layout.positions[static_cast<size_t>(first)];
+        const H3Position &pb = layout.positions[static_cast<size_t>(second)];
+        const float axes[3] = {0.5f * (pa.t + pb.t), 0.5f * (pa.h + pb.h) * spatial_scale,
+                               0.5f * (pa.w + pb.w) * spatial_scale};
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int f = 0; f < kH3RopeFreqs; ++f) {
+                const int idx = static_cast<int>(row) * kH3RopeHalf + axis * kH3RopeFreqs + f;
+                const float ang = axes[axis] * inv_freq[f];
+                cos[static_cast<size_t>(idx)] = std::cos(ang);
+                sin[static_cast<size_t>(idx)] = std::sin(ang);
+            }
+        }
+    }
 }
 
 } // namespace mvllm

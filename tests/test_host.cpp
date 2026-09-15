@@ -4118,6 +4118,34 @@ static void test_h3_checkpoint() {
         CHECK(en.generate_video(np, rbad, err) != Status::Ok);
         unsetenv("H3_REUSE_STEPS");
         err.clear();
+        np.denoise_reuse = 1;
+        np.core_reuse = 2;
+        np.steps = 4;
+        np.output_path = ndir + "/core.txt";
+        H3GenResult cr;
+        CHECK(en.generate_video(np, cr, err) == Status::Ok);
+        CHECK(cr.steps_run == 4);
+        CHECK(cr.blocks_streamed == 6);
+        CHECK(cr.note.find("core=2") != std::string::npos);
+        CHECK(cr.note.find("reduce=off") != std::string::npos);
+        np.core_reuse = 2;
+        np.denoise_reuse = 2;
+        np.output_path = ndir + "/corebad.txt";
+        H3GenResult cbad;
+        CHECK(en.generate_video(np, cbad, err) != Status::Ok);
+        err.clear();
+        np.denoise_reuse = 1;
+        np.core_reuse = 1;
+        np.token_reduction = true;
+        setenv("H3_TOKEN_REDUCTION_BLOCKS", "0:1", 1);
+        setenv("H3_TOKEN_REDUCTION_EARLY", "0", 1);
+        np.output_path = ndir + "/red.txt";
+        H3GenResult red;
+        CHECK(en.generate_video(np, red, err) == Status::Ok);
+        CHECK(red.note.find("reduce=on") != std::string::npos);
+        CHECK(red.note.find("core=1") != std::string::npos);
+        unsetenv("H3_TOKEN_REDUCTION_BLOCKS");
+        unsetenv("H3_TOKEN_REDUCTION_EARLY");
         if (std::strcmp(mvllm::h3_cuda::backend_name(), "cuda") != 0)
             CHECK(!mvllm::h3_cuda::last_on_device());
     }
@@ -7227,6 +7255,16 @@ int main() {
             CHECK(hp.width == 1280);
             CHECK(hp.seed == 7);
             CHECK(hp.audio_path == "a.wav");
+            char c0[] = "micro-vllm";
+            char c1[] = "video";
+            char c2[] = "--core-reuse";
+            char c3[] = "4";
+            char c4[] = "--token-reduction";
+            char *cv[] = {c0, c1, c2, c3, c4};
+            H3GenParams hc;
+            CHECK(apply_cli_video_flags(5, cv, hc, verr));
+            CHECK(hc.core_reuse == 4);
+            CHECK(hc.token_reduction);
         }
         Tokenizer ltk;
         ChatMessage lu;
@@ -7987,6 +8025,27 @@ int main() {
                                         err) == false);
         CHECK(h3_token_reduce_configure(cfg, true, 2, 2, 4, 3, 4, 7, "4:30", "0", "1.25", err));
         CHECK(cfg.early_steps == 0 && cfg.scale == 1.25f);
+        CHECK(h3_token_reduce_baseline_index(cfg, 2) == UINT32_MAX);
+        CHECK(h3_token_reduce_baseline_index(cfg, 3) == 0);
+        CHECK(h3_token_reduce_baseline_index(cfg, 4) == 1);
+        std::vector<float> full(7 * 2);
+        for (int i = 0; i < 14; ++i)
+            full[static_cast<size_t>(i)] = static_cast<float>(i);
+        std::vector<float> reduced(5 * 2), original(7 * 2), baseline(2 * 2), back(7 * 2);
+        h3_token_reduce_enter(cfg, full.data(), reduced.data(), original.data(), baseline.data(), 2);
+        CHECK_NEAR(reduced[3 * 2], 0.5f * (6.f + 8.f), 1e-6);
+        CHECK_NEAR(reduced[3 * 2 + 1], 0.5f * (7.f + 9.f), 1e-6);
+        h3_token_reduce_leave(cfg, reduced.data(), original.data(), baseline.data(), back.data(), 2);
+        for (int i = 0; i < 14; ++i)
+            CHECK_NEAR(back[static_cast<size_t>(i)], full[static_cast<size_t>(i)], 1e-6);
+        reduced[3 * 2] += 2.f;
+        h3_token_reduce_leave(cfg, reduced.data(), original.data(), baseline.data(), back.data(), 2);
+        CHECK_NEAR(back[3 * 2], full[3 * 2] + cfg.scale * 2.f, 1e-6);
+        CHECK_NEAR(back[4 * 2], full[4 * 2] + cfg.scale * 2.f, 1e-6);
+        uint32_t fmap[7] = {0, 1, 2, 3, 4, 5, 6};
+        uint32_t rmap[5] = {};
+        h3_token_reduce_row_map(cfg, fmap, rmap);
+        CHECK(rmap[3] == 3 && rmap[4] == 5);
     }
     {
         using namespace mvllm;

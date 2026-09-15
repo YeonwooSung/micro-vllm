@@ -1426,6 +1426,8 @@ void HttpServer::handle_client(int cfd) {
                 if (!extract_json_int(body, "dit_layers", hp.dit_layers))
                     extract_json_int(body, "layers", hp.dit_layers);
                 extract_json_int(body, "denoise_reuse", hp.denoise_reuse);
+                extract_json_int(body, "core_reuse", hp.core_reuse);
+                extract_json_bool(body, "token_reduction", hp.token_reduction);
                 H3GenResult out;
                 std::string gerr;
                 Status st = Status::Ok;

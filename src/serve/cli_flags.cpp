@@ -577,6 +577,26 @@ bool apply_cli_video_flags(int argc, char **argv, H3GenParams &hp, std::string &
                 hp.denoise_reuse = n;
             continue;
         }
+        if (eq(a, "--core-reuse")) {
+            const char *v = next_val(argc, argv, i);
+            if (!v)
+                continue;
+            ++i;
+            int n = 0;
+            if (!parse_int(v, n, "--core-reuse", err))
+                return false;
+            if (n >= 1)
+                hp.core_reuse = n;
+            continue;
+        }
+        if (eq(a, "--token-reduction")) {
+            hp.token_reduction = true;
+            continue;
+        }
+        if (eq(a, "--no-token-reduction")) {
+            hp.token_reduction = false;
+            continue;
+        }
     }
     return true;
 }

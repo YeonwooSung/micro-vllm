@@ -1,7 +1,10 @@
 #pragma once
 
+#include "h3_layout.hpp"
+
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mvllm {
 
@@ -32,5 +35,25 @@ uint32_t h3_token_reduced_parent(const H3TokenReduce &cfg, uint32_t full_row);
 
 // Mean of two hidden-wide rows. Identical pointers copy; otherwise out = 0.5 * (a + b).
 void h3_token_pool_mean(const float *a, const float *b, float *out, int hidden);
+
+// UINT32_MAX when the reduced row is not a paired video token.
+uint32_t h3_token_reduce_baseline_index(const H3TokenReduce &cfg, uint32_t reduced_row);
+
+// Snapshot full → original, pair-pool into reduced, and store paired video baselines.
+void h3_token_reduce_enter(const H3TokenReduce &cfg, const float *full, float *reduced,
+                           float *original, float *baseline, int hidden);
+
+// Restore full = original + scale * (reduced[parent] - baseline). Prefix rows copy reduced.
+void h3_token_reduce_leave(const H3TokenReduce &cfg, const float *reduced, const float *original,
+                           const float *baseline, float *full, int hidden);
+
+// reduced_map[row] = full_map[first of pair].
+void h3_token_reduce_row_map(const H3TokenReduce &cfg, const uint32_t *full_map,
+                             uint32_t *reduced_map);
+
+// RoPE tables for the reduced sequence (pair-averaged positions).
+void h3_token_reduce_rope_tables(const H3TokenReduce &cfg, const H3Layout &layout,
+                                 const float *inv_freq, float spatial_scale,
+                                 std::vector<float> &cos, std::vector<float> &sin);
 
 } // namespace mvllm

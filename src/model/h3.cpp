@@ -8,6 +8,7 @@
 #include "h3_mm.hpp"
 #include "h3_reuse.hpp"
 #include "h3_text.hpp"
+#include "h3_token_reduce.hpp"
 #include "h3_vae.hpp"
 #include "h3_tok.hpp"
 #include "h3_vision.hpp"
@@ -314,6 +315,13 @@ public:
         int reuse = hp.denoise_reuse > 0 ? hp.denoise_reuse : 1;
         if (reuse > 32)
             reuse = 32;
+        int core_reuse = hp.core_reuse > 0 ? hp.core_reuse : 1;
+        if (core_reuse > 6)
+            core_reuse = 6;
+        if (core_reuse > 1 && reuse > 1) {
+            err = "core reuse and denoiser reuse cannot be combined";
+            return Status::InvalidArgument;
+        }
 
         const int hidden = cfg_.h3.hidden > 0 ? cfg_.h3.hidden : 5376;
         const int inner = cfg_.h3.inner > 0 ? cfg_.h3.inner : 7168;
@@ -717,6 +725,29 @@ public:
         h3_dit_rope_tables(layout, inv_freq, spatial_scale, rope_cos, rope_sin);
         const float *r_cos = rope_cos.empty() ? nullptr : rope_cos.data();
         const float *r_sin = rope_sin.empty() ? nullptr : rope_sin.data();
+        auto env_text = [](const char *official, const char *mv) -> const char * {
+            const char *v = std::getenv(official);
+            if (v && v[0])
+                return v;
+            v = std::getenv(mv);
+            return (v && v[0]) ? v : nullptr;
+        };
+        const char *tr_env = env_text("H3_TOKEN_REDUCTION", "MVLLM_H3_TOKEN_REDUCTION");
+        const bool want_reduce = hp.token_reduction || (tr_env && std::strcmp(tr_env, "0") != 0);
+        const char *disable_tr =
+            env_text("H3_DISABLE_TOKEN_REDUCTION", "MVLLM_H3_DISABLE_TOKEN_REDUCTION");
+        H3TokenReduce treduce;
+        std::vector<float> red_cos, red_sin;
+        if (want_reduce) {
+            if (!h3_token_reduce_configure(
+                    treduce, true, pack_lt, pack_lh, pack_lw, static_cast<uint32_t>(video_off),
+                    static_cast<uint32_t>(tokens), static_cast<uint32_t>(seq),
+                    env_text("H3_TOKEN_REDUCTION_BLOCKS", "MVLLM_H3_TOKEN_REDUCTION_BLOCKS"),
+                    env_text("H3_TOKEN_REDUCTION_EARLY", "MVLLM_H3_TOKEN_REDUCTION_EARLY"),
+                    env_text("H3_TOKEN_REDUCTION_SCALE", "MVLLM_H3_TOKEN_REDUCTION_SCALE"), err))
+                return Status::InvalidArgument;
+            h3_token_reduce_rope_tables(treduce, layout, inv_freq, spatial_scale, red_cos, red_sin);
+        }
         const bool vel_vid = hidden > 0 &&
                              static_cast<int>(vid_in_w_.size()) >= hidden * patch &&
                              static_cast<int>(vid_out_w_.size()) >= patch * hidden;
@@ -895,6 +926,14 @@ public:
         std::vector<float> prev_az_vel;
         int last_evaluated = -1;
         int previous_evaluated = -1;
+        std::vector<float> core_input;
+        std::vector<float> core_residual;
+        bool core_ready = false;
+        int core_count = 0;
+        std::vector<float> tr_original;
+        std::vector<float> tr_baseline;
+        std::vector<float> tr_reduced;
+        std::vector<uint32_t> rmap_red;
         const int slot = 6 * hidden;
         auto layer_mrows = [&](int layer) {
             const int wr = adaln_.w_rows(layer);
@@ -989,7 +1028,58 @@ public:
                     temb.clear();
             }
             std::vector<float> prev = latent;
+            const bool use_tr =
+                treduce.enabled && !(disable_tr && disable_tr[0] && disable_tr[0] != '0');
+            const unsigned red_end =
+                (use_tr && treduce.early_steps && static_cast<unsigned>(s) < treduce.early_steps)
+                    ? treduce.early_end
+                    : treduce.end;
+            const bool eval_core = core_reuse == 1 || !core_ready || (core_count % core_reuse == 0) ||
+                                   s == steps - 1;
+            int run_seq = seq;
+            const float *run_cos = r_cos;
+            const float *run_sin = r_sin;
+            bool reducing = false;
+            auto enter_reduce = [&]() {
+                if (reducing || !use_tr)
+                    return;
+                tr_original.assign(latent.begin(), latent.end());
+                tr_reduced.assign(static_cast<size_t>(treduce.reduced_sequence) * hidden, 0.f);
+                tr_baseline.assign(static_cast<size_t>(treduce.baseline_rows) * hidden, 0.f);
+                h3_token_reduce_enter(treduce, latent.data(), tr_reduced.data(), tr_original.data(),
+                                      tr_baseline.data(), hidden);
+                latent.swap(tr_reduced);
+                run_seq = static_cast<int>(treduce.reduced_sequence);
+                run_cos = red_cos.empty() ? nullptr : red_cos.data();
+                run_sin = red_sin.empty() ? nullptr : red_sin.data();
+                rmap_red.resize(static_cast<size_t>(run_seq));
+                h3_token_reduce_row_map(treduce, rmap.data(), rmap_red.data());
+                reducing = true;
+            };
+            auto leave_reduce = [&]() {
+                if (!reducing)
+                    return;
+                tr_reduced.assign(static_cast<size_t>(seq) * hidden, 0.f);
+                h3_token_reduce_leave(treduce, latent.data(), tr_original.data(), tr_baseline.data(),
+                                      tr_reduced.data(), hidden);
+                latent.swap(tr_reduced);
+                run_seq = seq;
+                run_cos = r_cos;
+                run_sin = r_sin;
+                reducing = false;
+            };
+            if (!eval_core && core_ready &&
+                core_residual.size() == latent.size()) {
+                for (size_t i = 0; i < latent.size(); ++i)
+                    latent[i] += core_residual[i];
+            } else {
+            if (core_reuse > 1)
+                core_input = latent;
             for (int b = 0; b < layers; ++b) {
+                if (use_tr && static_cast<unsigned>(b) == treduce.begin)
+                    enter_reduce();
+                if (use_tr && static_cast<unsigned>(b) == red_end)
+                    leave_reduce();
                 const uint8_t *data = nullptr;
                 int64_t bytes = 0;
                 Status st = blocks_.acquire(b, &data, &bytes, err);
@@ -1023,11 +1113,13 @@ public:
                         if (mp) {
                             groups = h3_adaln_groups(mrows, hidden, temb_rows);
                             const int mods = (hidden > 0 && mrows >= slot) ? mrows / slot : 1;
+                            const uint32_t *src_map = reducing ? rmap_red.data() : rmap.data();
+                            rmap_use.resize(static_cast<size_t>(run_seq));
                             if (mods == 1 && groups > 1) {
-                                for (int t = 0; t < seq; ++t)
-                                    rmap_use[static_cast<size_t>(t)] = rmap[static_cast<size_t>(t)] / 3u;
+                                for (int t = 0; t < run_seq; ++t)
+                                    rmap_use[static_cast<size_t>(t)] = src_map[static_cast<size_t>(t)] / 3u;
                             } else {
-                                rmap_use = rmap;
+                                std::copy(src_map, src_map + run_seq, rmap_use.begin());
                             }
                             rp = (groups > 1) ? rmap_use.data() : nullptr;
                             if (groups > max_groups)
@@ -1042,26 +1134,26 @@ public:
                         ++dit_calls;
                         if (gpu::device() == Device::Cuda) {
                             ran = h3_cuda::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
-                                                        inner, ffn, hd, latent.data(), seq, 1e-5f,
-                                                        mp, qn, kn, r_cos, r_sin, rp, groups, n1p,
-                                                        n2p);
+                                                        inner, ffn, hd, latent.data(), run_seq,
+                                                        1e-5f, mp, qn, kn, run_cos, run_sin, rp,
+                                                        groups, n1p, n2p);
                             if (ran && h3_cuda::last_on_device())
                                 ++cuda_hits;
                         }
                         if (!ran && official_metal::h3_available())
                             ran = official_metal::dit_residual(
                                 data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn, hd,
-                                latent.data(), seq, 1e-5f, mp, qn, kn, r_cos, r_sin, rp, groups,
-                                n1p, n2p);
+                                latent.data(), run_seq, 1e-5f, mp, qn, kn, run_cos, run_sin, rp,
+                                groups, n1p, n2p);
                         if (!ran)
                             ran = metal_h3::dit_residual(data, qkv_b, out_b, fc1_b, fc2_b, hidden,
-                                                         inner, ffn, hd, latent.data(), seq, 1e-5f,
-                                                         mp, qn, kn, r_cos, r_sin, rp, groups, n1p,
-                                                         n2p);
+                                                         inner, ffn, hd, latent.data(), run_seq,
+                                                         1e-5f, mp, qn, kn, run_cos, run_sin, rp,
+                                                         groups, n1p, n2p);
                         if (!ran)
                             h3_dit_block_cpu(data, qkv_b, out_b, fc1_b, fc2_b, hidden, inner, ffn,
-                                             hd, latent.data(), seq, 1e-5f, mp, qn, kn, r_cos,
-                                             r_sin, rp, groups, n1p, n2p);
+                                             hd, latent.data(), run_seq, 1e-5f, mp, qn, kn,
+                                             run_cos, run_sin, rp, groups, n1p, n2p);
                     }
                     if (mp)
                         any_mod = true;
@@ -1078,6 +1170,15 @@ public:
                 }
                 blocks_.release(b);
             }
+            leave_reduce();
+            if (core_reuse > 1 && core_input.size() == latent.size()) {
+                core_residual.resize(latent.size());
+                for (size_t i = 0; i < latent.size(); ++i)
+                    core_residual[i] = latent[i] - core_input[i];
+                core_ready = true;
+            }
+            }
+            ++core_count;
             if (computed && vel_path) {
                 std::vector<float> vnorm(static_cast<size_t>(tokens) * hidden);
                 const float *vin = latent.data() + static_cast<size_t>(video_off) * hidden;
@@ -1352,6 +1453,8 @@ public:
         out.note += " rng=pcg";
         out.note += cond_rows > 0 ? " cond_aug=on" : " cond_aug=off";
         out.note += " reuse=" + std::to_string(reuse) + " evals=" + std::to_string(n_eval);
+        out.note += " core=" + std::to_string(core_reuse);
+        out.note += treduce.enabled ? " reduce=on" : " reduce=off";
         out.note += vel_path ? " head=vel" : " head=tile";
         out.note += (refiner_[0].ok(hidden, inner, ffn, hd) && refiner_[1].ok(hidden, inner, ffn, hd))
                         ? " refiner=on"

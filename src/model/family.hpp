@@ -84,6 +84,8 @@ struct H3GenParams {
     int steps = 20;
     int dit_layers = 50;
     int denoise_reuse = 1;
+    int core_reuse = 1;
+    bool token_reduction = false;
     bool ssd_streaming = true;
     uint64_t seed = 42;
     std::string prompt;

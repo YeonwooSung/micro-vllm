@@ -32,6 +32,7 @@ bool apply_cli_gen_flags(int argc, char **argv, GenParams &gp, CliGenExtras &ex,
 
 // Apply `micro-vllm video` flags onto hp. Repeatable --ref-image.
 // Width/height/frames/steps/layers apply only if >0. --denoise-reuse if N>=0.
+// --core-reuse if N>=1. --token-reduction / --no-token-reduction.
 // Returns false only on a bad numeric flag.
 bool apply_cli_video_flags(int argc, char **argv, H3GenParams &hp, std::string &err);
 

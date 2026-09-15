@@ -526,7 +526,11 @@ every step. Start latents use two official PCG streams seeded with the
 same `seed` (video and audio independently). Condition patch rows get
 `0.999 z + 0.001 N` (`h3_augment_span`; each span re-seeds; Ref2VA audio
 would use `seed+1`). Token reduction pair-pools target video along W
-(`h3_token_reduce_*`; default blocks 4:30, early 10:40).
+between blocks `begin:end` (default 4:30, early 10:40) and expands with
+`original + scale*(reduced-baseline)`. Core reuse (1/2/4/6) caches the
+full-grid residual and skips the DiT stack on other steps; last step
+always evaluates. `core_reuse>1` cannot combine with `denoise_reuse>1`.
+`--token-reduction` / `H3_TOKEN_REDUCTION` and `--core-reuse` default off/1.
 
 MoE pick: unused-scan top-k; NaN scores never win (`moe_router_pick`
 falls back to slot index). Nucleus sampling uses the official max-heap
