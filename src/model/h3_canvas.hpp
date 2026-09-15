@@ -30,4 +30,7 @@ uint32_t h3_rng_u32(H3Rng &rng);
 float h3_rng_normal(H3Rng &rng);
 void h3_rng_fill_normal(H3Rng &rng, float *values, int count);
 
+// Official 0.999 clean + 0.001 seeded PCG normal. Re-seeds per call.
+void h3_augment_span(float *values, int count, uint64_t seed);
+
 } // namespace mvllm

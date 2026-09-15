@@ -134,4 +134,13 @@ void h3_rng_fill_normal(H3Rng &rng, float *values, int count) {
         values[i] = h3_rng_normal(rng);
 }
 
+void h3_augment_span(float *values, int count, uint64_t seed) {
+    if (!values || count <= 0)
+        return;
+    H3Rng rng;
+    h3_rng_seed(rng, seed);
+    for (int i = 0; i < count; ++i)
+        values[i] = 0.999f * values[i] + 0.001f * h3_rng_normal(rng);
+}
+
 } // namespace mvllm

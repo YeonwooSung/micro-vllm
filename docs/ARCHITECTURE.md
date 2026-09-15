@@ -521,7 +521,10 @@ step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
 `H3_REUSE_STEPS` / `MVLLM_H3_REUSE_STEPS` list `0,3,6,…`). Generate
 Euler-updates every step; skipped steps linearly extrapolate the last two
 velocities (ratio clamped to [-2, 2]). Default `denoise_reuse=1` evaluates
-every step. Token reduction pair-pools target video along W
+every step. Start latents use two official PCG streams seeded with the
+same `seed` (video and audio independently). Condition patch rows get
+`0.999 z + 0.001 N` (`h3_augment_span`; each span re-seeds; Ref2VA audio
+would use `seed+1`). Token reduction pair-pools target video along W
 (`h3_token_reduce_*`; default blocks 4:30, early 10:40).
 
 MoE pick: unused-scan top-k; NaN scores never win (`moe_router_pick`

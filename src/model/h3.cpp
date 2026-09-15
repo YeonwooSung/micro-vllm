@@ -2,6 +2,7 @@
 #include "h3_adaln.hpp"
 #include "h3_adaln_store.hpp"
 #include "h3_audio_vae.hpp"
+#include "h3_canvas.hpp"
 #include "h3_dit_schedule.hpp"
 #include "h3_layout.hpp"
 #include "h3_mm.hpp"
@@ -44,21 +45,6 @@ const char *kH3StreamSuffix[4] = {
 bool ends_with(const std::string &s, const char *suf) {
     const size_t n = std::strlen(suf);
     return s.size() >= n && s.compare(s.size() - n, n, suf) == 0;
-}
-
-uint64_t splitmix64(uint64_t &s) {
-    uint64_t z = (s += 0x9E3779B97F4A7C15ull);
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-    return z ^ (z >> 31);
-}
-
-float gauss01(uint64_t &s) {
-    float u = static_cast<float>(splitmix64(s) >> 40) * (1.f / 16777216.f);
-    float v = static_cast<float>(splitmix64(s) >> 40) * (1.f / 16777216.f);
-    if (u < 1e-7f)
-        u = 1e-7f;
-    return std::sqrt(-2.f * std::log(u)) * std::cos(6.283185307179586f * v);
 }
 
 struct LoadedRgb {
@@ -347,9 +333,12 @@ public:
         const int nlat = std::max(vg.latent_t * vg.latent_h * vg.latent_w, 1);
         const int64_t zN = static_cast<int64_t>(C) * nlat;
         std::vector<float> z(static_cast<size_t>(zN), 0.f);
-        uint64_t rng = hp.seed ? hp.seed : 42ull;
-        for (int64_t i = 0; i < zN; ++i)
-            z[static_cast<size_t>(i)] = gauss01(rng);
+        const uint64_t seed = hp.seed;
+        {
+            H3Rng video_rng;
+            h3_rng_seed(video_rng, seed);
+            h3_rng_fill_normal(video_rng, z.data(), static_cast<int>(z.size()));
+        }
 
         const bool can_patch = vg.latent_h >= 2 && vg.latent_w >= 2 && (vg.latent_h % 2 == 0) &&
                                (vg.latent_w % 2 == 0);
@@ -450,9 +439,9 @@ public:
             }
         }
         if (!audio_from_ref) {
-            uint64_t arng = rng ^ 0xA5A5A5A5ull;
-            for (float &v : az)
-                v = gauss01(arng);
+            H3Rng audio_rng;
+            h3_rng_seed(audio_rng, seed);
+            h3_rng_fill_normal(audio_rng, az.data(), static_cast<int>(az.size()));
         }
         int audio_rows = audio_t * kH3AudioStereo;
         std::vector<float> arows(static_cast<size_t>(audio_rows) * AC, 0.f);
@@ -657,6 +646,7 @@ public:
                     pack_ok = false;
                     break;
                 }
+                h3_augment_span(prows.data(), static_cast<int>(prows.size()), seed);
                 packed_cond.insert(packed_cond.end(), prows.begin(), prows.end());
                 packed_rows += cells;
             }
@@ -1371,6 +1361,8 @@ public:
                 out.note += std::string(" sdpa=") + sdpa;
         }
         out.note += vel_path ? " sampler=euler" : " sampler=res";
+        out.note += " rng=pcg";
+        out.note += cond_rows > 0 ? " cond_aug=on" : " cond_aug=off";
         out.note += " reuse=" + std::to_string(reuse) + " evals=" + std::to_string(n_eval);
         out.note += vel_path ? " head=vel" : " head=tile";
         out.note += (refiner_[0].ok(hidden, inner, ffn, hd) && refiner_[1].ok(hidden, inner, ffn, hd))

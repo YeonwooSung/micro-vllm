@@ -4066,6 +4066,8 @@ static void test_h3_checkpoint() {
         np.output_path = ndir + "/s8.txt";
         CHECK(en.generate_video(np, b, err) == Status::Ok);
         CHECK(a.note.find("sampler=euler") != std::string::npos);
+        CHECK(a.note.find("rng=pcg") != std::string::npos);
+        CHECK(a.note.find("cond_aug=off") != std::string::npos);
         CHECK(a.note.find("head=vel") != std::string::npos);
         CHECK(a.note.find("reuse=1") != std::string::npos);
         CHECK(a.note.find("evals=2") != std::string::npos);
@@ -6355,6 +6357,8 @@ int main() {
         CHECK(h3e->generate_video(hp, hout, herr) == Status::Ok);
         CHECK(hout.note.find("ref2va") != std::string::npos ||
               hout.note.find("picture=") != std::string::npos);
+        CHECK(hout.note.find("rng=pcg") != std::string::npos);
+        CHECK(hout.note.find("cond_aug=on") != std::string::npos);
     }
     {
         using namespace mvllm;
@@ -7432,6 +7436,28 @@ int main() {
         h3_rng_seed(a, 7);
         h3_rng_seed(b, 7);
         CHECK(h3_rng_u32(a) == h3_rng_u32(b));
+        H3Rng video, audio;
+        h3_rng_seed(video, 42);
+        h3_rng_seed(audio, 42);
+        float vv[8], av[8];
+        h3_rng_fill_normal(video, vv, 8);
+        h3_rng_fill_normal(audio, av, 8);
+        for (int i = 0; i < 8; ++i)
+            CHECK(vv[i] == av[i]);
+        H3Rng nsrc;
+        h3_rng_seed(nsrc, 42);
+        const float nfirst = h3_rng_normal(nsrc);
+        float span[4] = {1.f, 1.f, 1.f, 1.f};
+        h3_augment_span(span, 4, 42);
+        CHECK_NEAR(span[0], 0.999f + 0.001f * nfirst, 1e-6);
+        float left[2] = {2.f, 3.f};
+        float right[2] = {2.f, 3.f};
+        float other[2] = {2.f, 3.f};
+        h3_augment_span(left, 2, 9);
+        h3_augment_span(right, 2, 9);
+        h3_augment_span(other, 2, 10);
+        CHECK(left[0] == right[0] && left[1] == right[1]);
+        CHECK(std::fabs(other[0] - left[0]) > 1e-8f);
     }
     {
         using namespace mvllm;
