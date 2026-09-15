@@ -979,26 +979,14 @@ public:
                 }
             }
             if (hoist_adaln) {
-                std::vector<float> hid(static_cast<size_t>(temb_rows) * static_cast<size_t>(th),
-                                       0.f);
                 temb.assign(static_cast<size_t>(temb_rows) * static_cast<size_t>(td), 0.f);
-                quant::matmul_f32(hid.data(), tfeat.data(), time_in_w_.data(), temb_rows, tdim, th);
-                for (int r = 0; r < temb_rows; ++r) {
-                    float *hr = hid.data() + static_cast<size_t>(r) * th;
-                    for (int i = 0; i < th && i < static_cast<int>(time_in_b_.size()); ++i)
-                        hr[i] += time_in_b_[static_cast<size_t>(i)];
-                    for (int i = 0; i < th; ++i)
-                        hr[i] = hr[i] * quant::sigmoid(hr[i]);
-                }
-                quant::matmul_f32(temb.data(), hid.data(), time_out_w_.data(), temb_rows, th, td);
-                for (int r = 0; r < temb_rows; ++r) {
-                    float *tr = temb.data() + static_cast<size_t>(r) * td;
-                    for (int i = 0; i < td && i < static_cast<int>(time_out_b_.size()); ++i)
-                        tr[i] += time_out_b_[static_cast<size_t>(i)];
-                    // Official AdaLN / final_layer consume SiLU(proj_out).
-                    for (int i = 0; i < td; ++i)
-                        tr[i] = tr[i] * quant::sigmoid(tr[i]);
-                }
+                const float *bin =
+                    static_cast<int>(time_in_b_.size()) >= th ? time_in_b_.data() : nullptr;
+                const float *bout =
+                    static_cast<int>(time_out_b_.size()) >= td ? time_out_b_.data() : nullptr;
+                if (!h3_time_embed(tfeat.data(), temb_rows, tdim, time_in_w_.data(), bin, th,
+                                   time_out_w_.data(), bout, td, temb.data()))
+                    temb.clear();
             }
             std::vector<float> prev = latent;
             for (int b = 0; b < layers; ++b) {

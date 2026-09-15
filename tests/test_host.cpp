@@ -7821,6 +7821,17 @@ int main() {
         h3_silu(x, 2);
         CHECK_NEAR(x[0], 1.f / (1.f + std::exp(-1.f)), 1e-6);
         CHECK_NEAR(x[1], 0.f, 1e-6);
+        {
+            float f32s[1] = {1.234567f};
+            float bfs[1] = {1.234567f};
+            h3_silu(f32s, 1);
+            h3_silu_bf16(bfs, 1);
+            const float q = bf16_round(1.234567f);
+            const float expect =
+                bf16_round(q * (1.f / (1.f + std::exp(-q))));
+            CHECK_NEAR(bfs[0], expect, 1e-8);
+            CHECK(std::fabs(f32s[0] - bfs[0]) > 0.f);
+        }
         const float feat[2] = {1.f, 0.5f};
         const float win[4] = {1.f, 0.f, 0.f, 1.f};
         const float bin[2] = {0.1f, -0.2f};
@@ -7828,21 +7839,26 @@ int main() {
         const float bout[2] = {0.f, 0.3f};
         const float wad[4] = {1.f, 0.5f, 0.f, 2.f};
         const float bad[2] = {0.f, -0.1f};
+        float hid[2] = {1.1f, 0.3f};
+        h3_silu(hid, 2);
+        float expect[2] = {0.5f * hid[0] + hid[1], -hid[0] + 0.25f * hid[1] + 0.3f};
+        h3_silu_bf16(expect, 2);
         float temb[2] = {}, mod[2] = {};
         CHECK(h3_time_embed(feat, 1, 2, win, bin, 2, wout, bout, 2, temb));
-        CHECK_NEAR(temb[0], 0.375678211f, 1e-5);
-        CHECK_NEAR(temb[1], -0.184072331f, 1e-5);
+        CHECK_NEAR(temb[0], expect[0], 1e-6);
+        CHECK_NEAR(temb[1], expect[1], 1e-6);
         CHECK(h3_adaln_mod(temb, 1, 2, wad, bad, 2, mod));
-        CHECK_NEAR(mod[0], 0.283642054f, 1e-5);
-        CHECK_NEAR(mod[1], -0.468144655f, 1e-5);
+        CHECK_NEAR(mod[0], 1.f * temb[0] + 0.5f * temb[1], 1e-6);
+        CHECK_NEAR(mod[1], 2.f * temb[1] - 0.1f, 1e-6);
         CHECK(!h3_time_embed(feat, 0, 2, win, bin, 2, wout, bout, 2, temb));
         const float ident[4] = {1.f, 0.f, 0.f, 1.f};
         const float fx[2] = {1.f, 0.f};
         float t2[2] = {};
         CHECK(h3_time_embed(fx, 1, 2, ident, nullptr, 2, ident, nullptr, 2, t2));
         const float s1 = 1.f / (1.f + std::exp(-1.f));
-        const float s2 = s1 / (1.f + std::exp(-s1));
-        CHECK_NEAR(t2[0], s2, 1e-5);
+        float s2[1] = {s1};
+        h3_silu_bf16(s2, 1);
+        CHECK_NEAR(t2[0], s2[0], 1e-6);
         CHECK_NEAR(t2[1], 0.f, 1e-6);
     }
     {

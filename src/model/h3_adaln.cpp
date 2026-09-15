@@ -1,4 +1,5 @@
 #include "h3_adaln.hpp"
+#include "../quant/bf16.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -28,6 +29,15 @@ void h3_silu(float *x, int n) {
         return;
     for (int i = 0; i < n; ++i)
         x[i] = silu_one(x[i]);
+}
+
+void h3_silu_bf16(float *x, int n) {
+    if (!x || n < 1)
+        return;
+    for (int i = 0; i < n; ++i) {
+        const float q = bf16_round(x[i]);
+        x[i] = bf16_round(silu_one(q));
+    }
 }
 
 void h3_linear(float *y, const float *x, const float *w, const float *b, int rows, int in,
@@ -62,7 +72,8 @@ bool h3_time_embed(const float *features, int rows, int time_input, const float 
                 time_hidden);
     h3_linear(temb, hidden.data(), w_out, b_out, rows, time_hidden, time_dim);
     for (int r = 0; r < rows; ++r)
-        h3_silu(temb + static_cast<std::size_t>(r) * static_cast<std::size_t>(time_dim), time_dim);
+        h3_silu_bf16(temb + static_cast<std::size_t>(r) * static_cast<std::size_t>(time_dim),
+                     time_dim);
     return true;
 }
 

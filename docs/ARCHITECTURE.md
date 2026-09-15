@@ -514,8 +514,9 @@ deltas every `COLI_KA_GAP` seconds (`COLI_VISIBLE_KEEPALIVE=1` paints `"."`).
 H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.
 
-H3 AdaLN time embed (official two-SiLU MLP): `SiLU(W_out SiLU(W_in x+b)+b)`
-then per-block `W_adaln @ temb + b`. Serving reuse walks the full sigma
+H3 AdaLN time embed (official two-SiLU MLP): first SiLU stays F32,
+`proj_out` is cast to BF16, then `SiLU_bf16` (`h3_silu_bf16` /
+`h3_time_embed`). Per-block `W_adaln @ temb + b`. Serving reuse walks the full sigma
 grid (`h3_serving_schedule_build(steps)`). The mask keeps step 0, the last
 step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
 `H3_REUSE_STEPS` / `MVLLM_H3_REUSE_STEPS` list `0,3,6,…`). Generate

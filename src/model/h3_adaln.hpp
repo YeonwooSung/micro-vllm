@@ -28,11 +28,15 @@ inline int h3_adaln_group_index(const unsigned int *row_map, int token, int grou
 // SiLU: x * sigmoid(x) = x / (1 + exp(-x)).
 void h3_silu(float *x, int n);
 
+// Official second AdaLN SiLU: BF16-round x, SiLU in F32, BF16-round the result.
+void h3_silu_bf16(float *x, int n);
+
 // y[rows, out] = x[rows, in] @ W[out, in]^T + b[out]. b may be null (zero).
 void h3_linear(float *y, const float *x, const float *w, const float *b, int rows, int in,
                int out);
 
-// temb[rows, time_dim] = SiLU(W_out @ SiLU(W_in @ features + b_in) + b_out).
+// temb[rows, time_dim] = SiLU_bf16(W_out @ SiLU(W_in @ features + b_in) + b_out).
+// First SiLU stays F32; proj_out is quantized to BF16 before the second SiLU.
 bool h3_time_embed(const float *features, int rows, int time_input, const float *w_in,
                    const float *b_in, int time_hidden, const float *w_out, const float *b_out,
                    int time_dim, float *temb);
