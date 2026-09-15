@@ -343,12 +343,16 @@ Time embeddings apply SiLU after both `proj_in` and `proj_out` before
 AdaLN. Generate packs z through the patch head each step and updates
 `z += (σ-σ_next)·v` (serving Euler). Missing heads keep the synth tile
 fallback (`head=tile`, RES on hidden). Text/cond tokens stay frozen.
-Default video-patch cap is 512 (`MVLLM_H3_LATENT_CAP`, `0` = none); a
-smaller cap keeps a spatial prefix of the 2×2 patch grid so unpatchify
-still writes a contiguous latent block. Text tokens default to 128
-(`MVLLM_H3_TEXT_CAP`). `--frames N` still runs the VAE on an aligned
+Default is the full 2×2 patch grid (`MVLLM_H3_LATENT_CAP` unset or `0`);
+a positive cap keeps a spatial prefix so unpatchify still writes a
+contiguous latent block. Official 864×480 is 6885 tokens. Text tokens
+are uncapped by default (`MVLLM_H3_TEXT_CAP` unset or `0`); a positive
+cap keeps a prefix. FL2VA/Ref2VA vision-span tags (0) plus language
+tags (1) feed AdaLN `row_map`. `MVLLM_H3_SKIP_TEXT` still swaps in the
+synth encoder for smoke hosts. `--frames N` still runs the VAE on an aligned
 length (`h3_align_frames`) and then uniformly subsamples the RGB to N.
-`describe`/note report `sampler=euler|res`, `head=vel|tile`, `text_tokens=`, `latent_slimmed=`,
+`describe`/note report `sampler=euler|res`, `head=vel|tile`, `text_tokens=`,
+`text_tags=vision|lang`, `text=skip`, `latent_slimmed=`,
 and `dit` is `CUDA` only when every residual used the device kernels.
 
 K3/GLM COLIKV1: crash-safe F32 KV file (`COLIKV1\\0` + header + per-token L/R

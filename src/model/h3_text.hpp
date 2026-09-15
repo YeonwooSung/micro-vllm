@@ -92,7 +92,8 @@ private:
     io::StHit embed_hit_;
 };
 
+// max_tokens<=0 keeps the full prompt (official). A positive cap keeps a prefix.
 void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids,
-                            int max_tokens = 64);
+                            int max_tokens = 0);
 
 } // namespace mvllm

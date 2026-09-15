@@ -68,15 +68,13 @@ void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<i
     ids.clear();
     if (vocab < 2)
         vocab = 256;
-    if (max_tokens < 1)
-        max_tokens = 64;
     if (prompt.empty()) {
         ids.push_back(1);
         return;
     }
     for (unsigned char c : prompt)
         ids.push_back(1 + static_cast<int>(c) % (vocab - 1));
-    if (static_cast<int>(ids.size()) > max_tokens)
+    if (max_tokens > 0 && static_cast<int>(ids.size()) > max_tokens)
         ids.resize(static_cast<size_t>(max_tokens));
 }
 

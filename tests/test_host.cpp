@@ -3292,6 +3292,19 @@ static void test_h3_official_contracts() {
     CHECK(drift > 1e-4f);
     h3_cuda::shutdown();
 
+    if (metal_h3::available()) {
+        std::vector<float> xm = x0;
+        CHECK(metal_h3::dit_residual(blob.data(), qkv_n * 2, out_n * 2, fc1_n * 2, fc2_n * 2, H,
+                                     Inn, Ffn, hd, xm.data(), T, 1e-5f, mod.data(), qn.data(),
+                                     kn.data(), nullptr, nullptr, nullptr, 1, n1.data(),
+                                     n2.data()));
+        bool metal_match = true;
+        for (int i = 0; i < T * H; ++i)
+            metal_match = metal_match &&
+                          std::fabs(xc[static_cast<size_t>(i)] - xm[static_cast<size_t>(i)]) < 2e-4f;
+        CHECK(metal_match);
+    }
+
     std::vector<float> x(static_cast<size_t>(T) * H, 0.2f);
     std::vector<float> qkv(static_cast<size_t>(3 * Inn * H), 0.05f);
     std::vector<float> out(static_cast<size_t>(H * Inn), 0.04f);
@@ -3976,7 +3989,7 @@ static void test_h3_checkpoint() {
     CHECK(hr2.note.find("sdpa=online") != std::string::npos);
     CHECK(hr2.note.find("sampler=res") != std::string::npos);
     // 256x256 / 16 spatial, VAE align 22 → latent 7x16x16, 2x2 patch = 448.
-    // Default cap is 512 so this no longer slims (old cap 256 broke unpatchify).
+    // Default is no cap so this keeps the full grid (set LATENT_CAP to slim).
     CHECK(hr2.note.find("latent_tokens=448") != std::string::npos);
     CHECK(hr2.note.find("latent_slimmed=") == std::string::npos);
     unsetenv("MVLLM_H3_CUDA_SDPA");
@@ -3988,6 +4001,29 @@ static void test_h3_checkpoint() {
     CHECK(hr3.note.find("latent_slimmed=448") != std::string::npos);
     CHECK(hr3.note.find("latent_tokens=224") != std::string::npos);
     unsetenv("MVLLM_H3_LATENT_CAP");
+
+    {
+        unsetenv("MVLLM_H3_TEXT_CAP");
+        const std::string long_prompt(200, 'a');
+        hp.prompt = long_prompt;
+        hp.width = 32;
+        hp.height = 32;
+        hp.frames = 5;
+        hp.steps = 2;
+        hp.output_path = dir + "/out_text_full.txt";
+        H3GenResult hrf;
+        CHECK(eh.generate_video(hp, hrf, err) == Status::Ok);
+        CHECK(hrf.note.find("text_tokens=200") != std::string::npos);
+        CHECK(hrf.note.find("text=skip") == std::string::npos);
+        CHECK(hrf.note.find("text=enc") != std::string::npos);
+        setenv("MVLLM_H3_TEXT_CAP", "32", 1);
+        hp.output_path = dir + "/out_text_cap.txt";
+        H3GenResult hrc;
+        CHECK(eh.generate_video(hp, hrc, err) == Status::Ok);
+        CHECK(hrc.note.find("text_tokens=32") != std::string::npos);
+        unsetenv("MVLLM_H3_TEXT_CAP");
+        hp.prompt = "fox";
+    }
 
     {
         std::string ndir = tmpdir();
@@ -4032,6 +4068,7 @@ static void test_h3_checkpoint() {
         CHECK(a.note.find("sampler=euler") != std::string::npos);
         CHECK(a.note.find("head=vel") != std::string::npos);
         CHECK(a.note.find("text_tokens=") != std::string::npos);
+        CHECK(a.note.find("text=skip") == std::string::npos);
         auto l2_of = [](const std::string &path) {
             std::ifstream in(path);
             std::string line;
@@ -5910,6 +5947,12 @@ int main() {
         std::vector<int> ids;
         h3_text_ids_from_prompt("a red fox", enc.config().vocab, ids);
         CHECK(!ids.empty());
+        const std::string longp(80, 'x');
+        std::vector<int> full, slim;
+        h3_text_ids_from_prompt(longp, enc.config().vocab, full);
+        CHECK(static_cast<int>(full.size()) == 80);
+        h3_text_ids_from_prompt(longp, enc.config().vocab, slim, 16);
+        CHECK(static_cast<int>(slim.size()) == 16);
         std::vector<float> hid;
         enc.encode(ids, hid);
         CHECK(static_cast<int>(hid.size()) == static_cast<int>(ids.size()) * enc.config().hidden);
@@ -6103,7 +6146,30 @@ int main() {
         }
         CHECK(saw_start && saw_pad && saw_end);
         CHECK(seq.tags[static_cast<size_t>(seq.spans[0].start)] == 0);
+        CHECK(seq.tags[static_cast<size_t>(seq.spans[0].start - 1)] == 0);
         CHECK(static_cast<int>(seq.positions.size()) == 3 * static_cast<int>(seq.ids.size()));
+        {
+            H3Layout mlay;
+            CHECK(h3_layout_build(static_cast<int>(seq.ids.size()), 2, 2, 2, 1, 5, mlay));
+            H3SigmaSchedule msch;
+            CHECK(h3_serving_schedule_build(4, msch));
+            H3DitSchedule mdit;
+            CHECK(mdit.prepare(msch, false, false));
+            std::vector<uint32_t> mrows(static_cast<size_t>(mlay.seq_len), 99);
+            CHECK(mdit.row_map(0, mlay, seq.tags.data(), static_cast<int>(seq.tags.size()),
+                               mrows.data(), mlay.seq_len));
+            const int vis0 = seq.spans[0].start - 1;
+            CHECK(vis0 >= 0);
+            CHECK(mrows[static_cast<size_t>(vis0)] % 3u == 0u);
+            bool saw_lang = false;
+            for (size_t i = 0; i < seq.tags.size(); ++i) {
+                if (seq.tags[i] == 1) {
+                    CHECK(mrows[i] % 3u == 1u);
+                    saw_lang = true;
+                }
+            }
+            CHECK(saw_lang);
+        }
         H3RefPres pres;
         pres.kind = H3PresKind::Image;
         pres.vision = &vo;

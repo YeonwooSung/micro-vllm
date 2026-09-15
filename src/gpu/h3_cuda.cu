@@ -581,6 +581,8 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
         if (norm1)
             ok = ok && ck(cudaMemcpy(g_ws.nw1, norm1, sizeof(float) * static_cast<size_t>(H),
                                      cudaMemcpyHostToDevice));
+        if (!ok)
+            return 2;
         const float *dn1 = norm1 ? g_ws.nw1 : nullptr;
         k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 1, 0, dmap, groups,
                                   dn1);
@@ -613,6 +615,8 @@ extern "C" int h3_cuda_dit_residual_dev(const uint8_t *blob, int64_t qkv_bytes, 
             if (norm2)
                 ok = ok && ck(cudaMemcpy(g_ws.nw2, norm2, sizeof(float) * static_cast<size_t>(H),
                                          cudaMemcpyHostToDevice));
+            if (!ok)
+                return 2;
             const float *dn2 = norm2 ? g_ws.nw2 : nullptr;
             k_adaln<<<grid1(T), 64>>>(g_ws.x, g_ws.mod, g_ws.xn, T, H, eps, has_mod, 4, 3, dmap,
                                       groups, dn2);

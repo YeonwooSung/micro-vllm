@@ -371,8 +371,9 @@ public:
                         rows[static_cast<size_t>(i) * patch + d] =
                             z[static_cast<size_t>(d % C) * nlat + i];
             }
-            // 256x256 official is 448 patches; the old default 256 broke unpatchify.
-            int cap = 512;
+            // Official 864x480 is 6885 patches. Default is no cap; set
+            // MVLLM_H3_LATENT_CAP=N to keep a spatial prefix (0 = none).
+            int cap = tokens;
             if (const char *ce = std::getenv("MVLLM_H3_LATENT_CAP")) {
                 const int v = std::atoi(ce);
                 if (v == 0)
@@ -465,6 +466,14 @@ public:
 
         int text_tokens = 0;
         std::vector<float> tproj;
+        std::vector<uint8_t> text_tags;
+        // Official has no text cap. MVLLM_H3_TEXT_CAP=N keeps a prefix (0/unset = none).
+        int text_cap = 0;
+        if (const char *te = std::getenv("MVLLM_H3_TEXT_CAP")) {
+            const int v = std::atoi(te);
+            if (v > 0)
+                text_cap = v;
+        }
         if (text_.ready() && !hp.prompt.empty()) {
             std::vector<float> th;
             const std::vector<LoadedRgb> *vis_src = nullptr;
@@ -498,39 +507,34 @@ public:
                     mm_ok = h3_mm_build_fl2va(hp.prompt, vouts.data(), static_cast<int>(vouts.size()),
                                               nullptr, text_.config().vocab, seq);
                 }
-                if (mm_ok && !seq.ids.empty())
+                if (mm_ok && !seq.ids.empty()) {
                     text_.encode_mm(seq.ids, seq.spans.empty() ? nullptr : seq.spans.data(),
                                     static_cast<int>(seq.spans.size()),
                                     seq.positions.empty() ? nullptr : seq.positions.data(),
                                     seq.tags.empty() ? nullptr : seq.tags.data(), th);
+                    if (!seq.tags.empty())
+                        text_tags = seq.tags;
+                }
             }
             if (th.empty()) {
                 std::vector<int> tids;
-                int id_cap = 128;
-                if (const char *te = std::getenv("MVLLM_H3_TEXT_CAP")) {
-                    const int v = std::atoi(te);
-                    if (v == 0)
-                        id_cap = 4096;
-                    else if (v > 0)
-                        id_cap = v;
-                }
-                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, id_cap);
+                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, text_cap);
                 text_.encode(tids, th);
+                text_tags.clear();
             }
-            text_.release_embed();
+            // Official Qwen embed is tens of GiB; synth tables stay so later
+            // generate_video calls can still encode.
+            if (text_.from_checkpoint())
+                text_.release_embed();
             const int thid = text_.config().hidden;
             if (!th.empty() && thid > 0) {
                 text_tokens = static_cast<int>(th.size() / static_cast<size_t>(thid));
-                int text_cap = 128;
-                if (const char *te = std::getenv("MVLLM_H3_TEXT_CAP")) {
-                    const int v = std::atoi(te);
-                    if (v == 0)
-                        text_cap = text_tokens;
-                    else if (v > 0)
-                        text_cap = v;
-                }
-                if (text_tokens > text_cap)
+                if (text_cap > 0 && text_tokens > text_cap)
                     text_tokens = text_cap;
+                if (static_cast<int>(text_tags.size()) >= text_tokens)
+                    text_tags.resize(static_cast<size_t>(text_tokens));
+                else
+                    text_tags.clear();
                 tproj.assign(static_cast<size_t>(text_tokens) * hidden, 0.f);
                 AccTimer tm(t_emm_);
                 if (!cond_w_.empty() && static_cast<int>(cond_w_.size()) >= hidden * thid) {
@@ -658,7 +662,13 @@ public:
                 AccTimer t(t_emm_);
                 cond_rows = packed_rows;
                 clatent.assign(static_cast<size_t>(cond_rows) * hidden, 0.f);
-                expand_patch_rows(packed_cond.data(), cond_rows, patch, hidden, clatent.data());
+                if (static_cast<int>(vid_in_w_.size()) >= hidden * patch)
+                    linear_bias(clatent.data(), packed_cond.data(), vid_in_w_.data(),
+                                vid_in_b_.size() >= static_cast<size_t>(hidden) ? vid_in_b_.data()
+                                                                               : nullptr,
+                                cond_rows, patch, hidden);
+                else
+                    expand_patch_rows(packed_cond.data(), cond_rows, patch, hidden, clatent.data());
             }
         }
 
@@ -883,7 +893,14 @@ public:
                 temb_rows = static_cast<int>(dit.time_rows());
                 if (temb_rows < 1)
                     temb_rows = 1;
-                if (!(layout_ok && dit.row_map(s, layout, nullptr, 0, rmap.data(), seq)))
+                const uint8_t *tagp = nullptr;
+                int tagn = 0;
+                if (layout_ok && static_cast<int>(text_tags.size()) == layout.text_rows &&
+                    layout.text_rows > 0) {
+                    tagp = text_tags.data();
+                    tagn = layout.text_rows;
+                }
+                if (!(layout_ok && dit.row_map(s, layout, tagp, tagn, rmap.data(), seq)))
                     std::fill(rmap.begin(), rmap.end(), 0u);
             } else {
                 tfeat.assign(static_cast<size_t>(tdim), 0.f);
@@ -891,10 +908,20 @@ public:
                 std::fill(rmap.begin(), rmap.end(), 0u);
                 if (layout_ok) {
                     for (const H3Segment &seg : layout.segments) {
+                        if (seg.kind == H3SegKind::Text) {
+                            for (int r = seg.start; r < seg.stop && r < seq; ++r) {
+                                const int ti = r - seg.start;
+                                uint32_t tag = 1;
+                                if (ti >= 0 && ti < static_cast<int>(text_tags.size()))
+                                    tag = text_tags[static_cast<size_t>(ti)];
+                                if (tag >= static_cast<uint32_t>(kH3DitModalities))
+                                    tag = 1;
+                                rmap[static_cast<size_t>(r)] = tag;
+                            }
+                            continue;
+                        }
                         uint32_t tag = 0;
-                        if (seg.kind == H3SegKind::Text)
-                            tag = 1;
-                        else if (seg.kind == H3SegKind::Audio || seg.kind == H3SegKind::RefAudio)
+                        if (seg.kind == H3SegKind::Audio || seg.kind == H3SegKind::RefAudio)
                             tag = 2;
                         for (int r = seg.start; r < seg.stop && r < seq; ++r)
                             rmap[static_cast<size_t>(r)] = tag;
@@ -1018,23 +1045,27 @@ public:
                 const float *vin = latent.data() + static_cast<size_t>(video_off) * hidden;
                 const float *fn = fin_norm_.size() >= static_cast<size_t>(hidden) ? fin_norm_.data()
                                                                                  : nullptr;
-                const float *sc = nullptr;
-                const float *sh = nullptr;
-                std::vector<float> fmod;
-                if (!temb.empty() && td > 0 &&
-                    static_cast<int>(fin_adaln_w_.size()) >= 2 * hidden * td) {
+                auto project_final_mod = [&](uint32_t row, std::vector<float> &fmod) -> bool {
+                    if (temb.empty() || td <= 0 ||
+                        static_cast<int>(fin_adaln_w_.size()) < 2 * hidden * td)
+                        return false;
                     fmod.assign(static_cast<size_t>(2) * hidden, 0.f);
-                    const uint32_t vr = have_sched ? dit.video_row(s) : 0;
-                    const int row = (vr < static_cast<uint32_t>(temb.size() / td)) ? static_cast<int>(vr)
-                                                                                   : 0;
-                    linear_bias(fmod.data(), temb.data() + static_cast<size_t>(row) * td,
+                    const int r = (row < static_cast<uint32_t>(temb.size() / td)) ? static_cast<int>(row)
+                                                                                 : 0;
+                    linear_bias(fmod.data(), temb.data() + static_cast<size_t>(r) * td,
                                 fin_adaln_w_.data(),
                                 fin_adaln_b_.size() >= static_cast<size_t>(2) * hidden
                                     ? fin_adaln_b_.data()
                                     : nullptr,
                                 1, td, 2 * hidden);
-                    sh = fmod.data();
-                    sc = fmod.data() + hidden;
+                    return true;
+                };
+                std::vector<float> vmod;
+                const float *sc = nullptr;
+                const float *sh = nullptr;
+                if (project_final_mod(have_sched ? dit.video_row(s) : 0u, vmod)) {
+                    sh = vmod.data();
+                    sc = vmod.data() + hidden;
                 }
                 rms_adaln_final(vnorm.data(), vin, fn, sc, sh, tokens, hidden, 1e-5f);
                 std::vector<float> v96(static_cast<size_t>(tokens) * patch, 0.f);
@@ -1074,7 +1105,14 @@ public:
                 if (vel_aud && audio_rows > 0) {
                     std::vector<float> anorm(static_cast<size_t>(audio_rows) * hidden);
                     const float *ain = latent.data() + static_cast<size_t>(audio_off) * hidden;
-                    rms_adaln_final(anorm.data(), ain, fn, sc, sh, audio_rows, hidden, 1e-5f);
+                    std::vector<float> amod;
+                    const float *asc = sc;
+                    const float *ash = sh;
+                    if (project_final_mod(have_sched ? dit.audio_row(s) : 0u, amod)) {
+                        ash = amod.data();
+                        asc = amod.data() + hidden;
+                    }
+                    rms_adaln_final(anorm.data(), ain, fn, asc, ash, audio_rows, hidden, 1e-5f);
                     std::vector<float> a32(static_cast<size_t>(audio_rows) * AC, 0.f);
                     linear_bias(a32.data(), anorm.data(), aud_out_w_.data(),
                                 aud_out_b_.size() >= static_cast<size_t>(AC) ? aud_out_b_.data()
@@ -1268,10 +1306,25 @@ public:
                         ? " refiner=on"
                         : " refiner=off";
         out.note += " text_tokens=" + std::to_string(text_tokens);
-        if (text_tokens > 0)
-            out.note += text_.from_checkpoint()
-                            ? (text_.streamed() ? " text=qwen-stream" : " text=qwen")
-                            : " text=enc";
+        if (text_tokens > 0) {
+            const char *skip = std::getenv("MVLLM_H3_SKIP_TEXT");
+            if (skip && skip[0] && skip[0] != '0')
+                out.note += " text=skip";
+            else
+                out.note += text_.from_checkpoint()
+                                ? (text_.streamed() ? " text=qwen-stream" : " text=qwen")
+                                : " text=enc";
+        }
+        if (!text_tags.empty()) {
+            bool vis = false;
+            for (uint8_t t : text_tags) {
+                if (t == 0) {
+                    vis = true;
+                    break;
+                }
+            }
+            out.note += vis ? " text_tags=vision" : " text_tags=lang";
+        }
         out.note += avae_.from_checkpoint ? " audio=real" : " audio=synth";
         out.note += " audio_t=" + std::to_string(audio_t);
         out.note += audio_from_ref ? " audio=ref" : " pack=text+audio+video";
