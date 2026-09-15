@@ -5,6 +5,7 @@
 #include "h3_dit_schedule.hpp"
 #include "h3_layout.hpp"
 #include "h3_mm.hpp"
+#include "h3_reuse.hpp"
 #include "h3_text.hpp"
 #include "h3_vae.hpp"
 #include "h3_tok.hpp"
@@ -325,7 +326,8 @@ public:
             layers = cfg_.h3.dit_layers;
         int steps = hp.steps > 0 ? hp.steps : cfg_.h3.default_steps;
         int reuse = hp.denoise_reuse > 0 ? hp.denoise_reuse : 1;
-        int evals = (steps + reuse - 1) / reuse;
+        if (reuse > 32)
+            reuse = 32;
 
         const int hidden = cfg_.h3.hidden > 0 ? cfg_.h3.hidden : 5376;
         const int inner = cfg_.h3.inner > 0 ? cfg_.h3.inner : 7168;
@@ -833,19 +835,40 @@ public:
 
         int streamed = 0;
         int computed = 0;
-        std::vector<float> sigmas(static_cast<size_t>(evals) + 1, 0.f);
-        std::vector<float> asigmas(static_cast<size_t>(evals) + 1, 0.f);
+        std::vector<uint8_t> selected(static_cast<size_t>(std::max(steps, 0)), 1);
+        int n_eval = steps;
+        if (vel_path && steps >= 1) {
+            n_eval = h3_dit_reuse_schedule(steps, reuse, selected.data(), steps);
+            if (n_eval < 0) {
+                std::fill(selected.begin(), selected.end(), static_cast<uint8_t>(1));
+                n_eval = steps;
+            } else if (reuse > 1) {
+                const char *custom = std::getenv("H3_REUSE_STEPS");
+                if (custom == nullptr || custom[0] == '\0')
+                    custom = std::getenv("MVLLM_H3_REUSE_STEPS");
+                const int custom_count = h3_parse_reuse_steps(steps, custom, selected.data());
+                if (custom_count < 0) {
+                    err = "H3_REUSE_STEPS must be increasing and include 0 and " +
+                          std::to_string(steps - 1);
+                    return Status::InvalidArgument;
+                }
+                if (custom_count > 0)
+                    n_eval = custom_count;
+            }
+        }
+        std::vector<float> sigmas(static_cast<size_t>(std::max(steps, 0)) + 1, 0.f);
+        std::vector<float> asigmas(static_cast<size_t>(std::max(steps, 0)) + 1, 0.f);
         const float vshift =
             cfg_.h3.video_sigma_shift > 0.f ? cfg_.h3.video_sigma_shift : kH3VideoSigmaShift;
         const float ashift = cfg_.h3.audio_sigma_shift > 0.f ? cfg_.h3.audio_sigma_shift
                                                              : kH3AudioSigmaShift;
         H3SigmaSchedule sch;
-        if (vel_path && evals >= 2 && h3_serving_schedule_build(evals, sch, vshift, ashift)) {
+        if (vel_path && steps >= 2 && h3_serving_schedule_build(steps, sch, vshift, ashift)) {
             sigmas = sch.video;
             asigmas = sch.audio;
-        } else {
-            h3_sigma_video(evals, sigmas.data(), vshift);
-            h3_sigma_video(evals, asigmas.data(), ashift);
+        } else if (steps >= 1) {
+            h3_sigma_video(steps, sigmas.data(), vshift);
+            h3_sigma_video(steps, asigmas.data(), ashift);
         }
         const int tdim = cfg_.h3.time_input > 0 ? cfg_.h3.time_input : 256;
         const bool do_adaln = adaln_.mode() != H3AdalnMode::Off &&
@@ -858,7 +881,7 @@ public:
         bool have_sched = false;
         if (hoist_adaln && tdim == kH3TimeInput) {
             if (sch.steps < 1)
-                h3_schedule_build(evals, sch, vshift, ashift);
+                h3_schedule_build(steps, sch, vshift, ashift);
             if (sch.steps > 0 &&
                 dit.prepare(sch, layout.img_cond_rows > 0, layout.audio_cond_rows > 0))
                 have_sched = true;
@@ -874,6 +897,14 @@ public:
         int cuda_hits = 0;
         std::vector<float> old_vid;
         std::vector<float> old_aud;
+        std::vector<float> z_vel(z.size(), 0.f);
+        std::vector<float> az_vel(az.size(), 0.f);
+        std::vector<float> last_z_vel;
+        std::vector<float> prev_z_vel;
+        std::vector<float> last_az_vel;
+        std::vector<float> prev_az_vel;
+        int last_evaluated = -1;
+        int previous_evaluated = -1;
         const int slot = 6 * hidden;
         auto layer_mrows = [&](int layer) {
             const int wr = adaln_.w_rows(layer);
@@ -881,9 +912,38 @@ public:
                 return h3_adaln_out(hidden);
             return slot;
         };
-        for (int s = 0; s < evals; ++s) {
+        for (int s = 0; s < steps; ++s) {
             if (hp.on_progress)
-                hp.on_progress(s, evals, "denoise");
+                hp.on_progress(s, steps, "denoise");
+            const bool evaluate = !vel_path || selected[static_cast<size_t>(s)] != 0;
+            if (!evaluate) {
+                if (last_evaluated >= 0) {
+                    const bool have_prev = previous_evaluated >= 0;
+                    h3_dit_extrapolate_velocity(
+                        z_vel.data(), last_z_vel.data(),
+                        have_prev && !prev_z_vel.empty() ? prev_z_vel.data() : nullptr,
+                        static_cast<int>(z.size()), sigmas[static_cast<size_t>(s)],
+                        sigmas[static_cast<size_t>(last_evaluated)],
+                        have_prev ? sigmas[static_cast<size_t>(previous_evaluated)] : 0.f,
+                        have_prev);
+                    if (vel_aud && audio_rows > 0 && !last_az_vel.empty())
+                        h3_dit_extrapolate_velocity(
+                            az_vel.data(), last_az_vel.data(),
+                            have_prev && !prev_az_vel.empty() ? prev_az_vel.data() : nullptr,
+                            static_cast<int>(az.size()), asigmas[static_cast<size_t>(s)],
+                            asigmas[static_cast<size_t>(last_evaluated)],
+                            have_prev ? asigmas[static_cast<size_t>(previous_evaluated)] : 0.f,
+                            have_prev);
+                    h3_euler_step(z.data(), z_vel.data(), static_cast<int>(z.size()),
+                                  sigmas[static_cast<size_t>(s)],
+                                  sigmas[static_cast<size_t>(s) + 1]);
+                    if (vel_aud && audio_rows > 0)
+                        h3_euler_step(az.data(), az_vel.data(), static_cast<int>(az.size()),
+                                      asigmas[static_cast<size_t>(s)],
+                                      asigmas[static_cast<size_t>(s) + 1]);
+                }
+                continue;
+            }
             pack_condition();
             if (vel_path)
                 pack_from_latents();
@@ -1073,7 +1133,7 @@ public:
                             vid_out_b_.size() >= static_cast<size_t>(patch) ? vid_out_b_.data()
                                                                            : nullptr,
                             tokens, hidden, patch);
-                std::vector<float> z_vel(z.size(), 0.f);
+                std::fill(z_vel.begin(), z_vel.end(), 0.f);
                 if (can_patch && tokens == pack_lt * (pack_lh / 2) * (pack_lw / 2)) {
                     if (pack_lt == vg.latent_t && pack_lh == vg.latent_h && pack_lw == vg.latent_w)
                         h3_dit_unpatchify(v96.data(), C, vg.latent_t, vg.latent_h, vg.latent_w,
@@ -1118,11 +1178,21 @@ public:
                                 aud_out_b_.size() >= static_cast<size_t>(AC) ? aud_out_b_.data()
                                                                             : nullptr,
                                 audio_rows, hidden, AC);
-                    std::vector<float> az_vel(az.size(), 0.f);
+                    std::fill(az_vel.begin(), az_vel.end(), 0.f);
                     h3_dit_unpack_audio(a32.data(), AC, audio_t, az_vel.data());
                     h3_euler_step(az.data(), az_vel.data(), static_cast<int>(az.size()),
                                   asigmas[static_cast<size_t>(s)],
                                   asigmas[static_cast<size_t>(s) + 1]);
+                }
+                if (reuse > 1) {
+                    if (last_evaluated >= 0) {
+                        prev_z_vel = last_z_vel;
+                        prev_az_vel = last_az_vel;
+                        previous_evaluated = last_evaluated;
+                    }
+                    last_z_vel = z_vel;
+                    last_az_vel = az_vel;
+                    last_evaluated = s;
                 }
             } else if (computed) {
                 // Synth fallback: no official patch/final heads. Treat DiT hidden
@@ -1138,7 +1208,7 @@ public:
                     std::vector<float> nxt(static_cast<size_t>(n));
                     const float *oldp = oldd.size() == static_cast<size_t>(n) ? oldd.data() : nullptr;
                     if (h3_res_step(nxt.data(), prev.data() + base, latent.data() + base, oldp, n,
-                                    sig, s, evals) == 1) {
+                                    sig, s, steps) == 1) {
                         oldd.assign(latent.data() + base, latent.data() + base + n);
                         std::memcpy(prev.data() + base, nxt.data(),
                                     static_cast<size_t>(n) * sizeof(float));
@@ -1191,13 +1261,13 @@ public:
             out_frames = want;
         }
         if (hp.on_progress)
-            hp.on_progress(evals, evals, "vae");
+            hp.on_progress(steps, steps, "vae");
         vae_.geom = vg;
         std::vector<float> pcm;
         avae_.decode(az.data(), audio_t, pcm);
 
         out.blocks_streamed = streamed;
-        out.steps_run = evals;
+        out.steps_run = steps;
         out.frames = out_frames;
         out.width = vg.width;
         out.height = vg.height;
@@ -1301,6 +1371,7 @@ public:
                 out.note += std::string(" sdpa=") + sdpa;
         }
         out.note += vel_path ? " sampler=euler" : " sampler=res";
+        out.note += " reuse=" + std::to_string(reuse) + " evals=" + std::to_string(n_eval);
         out.note += vel_path ? " head=vel" : " head=tile";
         out.note += (refiner_[0].ok(hidden, inner, ffn, hd) && refiner_[1].ok(hidden, inner, ffn, hd))
                         ? " refiner=on"

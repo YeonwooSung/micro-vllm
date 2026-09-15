@@ -4067,6 +4067,8 @@ static void test_h3_checkpoint() {
         CHECK(en.generate_video(np, b, err) == Status::Ok);
         CHECK(a.note.find("sampler=euler") != std::string::npos);
         CHECK(a.note.find("head=vel") != std::string::npos);
+        CHECK(a.note.find("reuse=1") != std::string::npos);
+        CHECK(a.note.find("evals=2") != std::string::npos);
         CHECK(a.note.find("text_tokens=") != std::string::npos);
         CHECK(a.note.find("text=skip") == std::string::npos);
         auto l2_of = [](const std::string &path) {
@@ -4080,6 +4082,40 @@ static void test_h3_checkpoint() {
             return 0.f;
         };
         CHECK(std::fabs(l2_of(ndir + "/s2.txt") - l2_of(ndir + "/s8.txt")) > 1e-6f);
+        unsetenv("H3_REUSE_STEPS");
+        unsetenv("MVLLM_H3_REUSE_STEPS");
+        np.steps = 4;
+        np.denoise_reuse = 2;
+        np.output_path = ndir + "/r2.txt";
+        H3GenResult r2;
+        CHECK(en.generate_video(np, r2, err) == Status::Ok);
+        CHECK(r2.steps_run == 4);
+        CHECK(r2.blocks_streamed == 6);
+        CHECK(r2.note.find("reuse=2") != std::string::npos);
+        CHECK(r2.note.find("evals=3") != std::string::npos);
+        np.denoise_reuse = 1;
+        np.output_path = ndir + "/r1.txt";
+        H3GenResult r1;
+        CHECK(en.generate_video(np, r1, err) == Status::Ok);
+        CHECK(r1.steps_run == 4);
+        CHECK(r1.blocks_streamed == 8);
+        CHECK(r1.note.find("evals=4") != std::string::npos);
+        CHECK(std::fabs(l2_of(ndir + "/r2.txt") - l2_of(ndir + "/r1.txt")) > 1e-6f);
+        setenv("H3_REUSE_STEPS", "0,3", 1);
+        np.denoise_reuse = 2;
+        np.output_path = ndir + "/rc.txt";
+        H3GenResult rc;
+        CHECK(en.generate_video(np, rc, err) == Status::Ok);
+        CHECK(rc.steps_run == 4);
+        CHECK(rc.blocks_streamed == 4);
+        CHECK(rc.note.find("evals=2") != std::string::npos);
+        unsetenv("H3_REUSE_STEPS");
+        setenv("H3_REUSE_STEPS", "0,2", 1);
+        np.output_path = ndir + "/rbad.txt";
+        H3GenResult rbad;
+        CHECK(en.generate_video(np, rbad, err) != Status::Ok);
+        unsetenv("H3_REUSE_STEPS");
+        err.clear();
         if (std::strcmp(mvllm::h3_cuda::backend_name(), "cuda") != 0)
             CHECK(!mvllm::h3_cuda::last_on_device());
     }
@@ -7805,6 +7841,19 @@ int main() {
         CHECK(sel[0] && sel[3] && sel[6] && sel[19] && !sel[1]);
         CHECK(h3_parse_reuse_steps(20, "0,3,6", sel) == -1);
         CHECK(h3_parse_reuse_steps(20, "0,3,3,19", sel) == -1);
+        CHECK(h3_dit_extrapolation_ratio(0.5f, 0.75f, 1.f, false) == 0.f);
+        CHECK_NEAR(h3_dit_extrapolation_ratio(0.5f, 0.75f, 1.f, true), 1.f, 1e-6);
+        CHECK(h3_dit_extrapolation_ratio(0.75f, 0.75f, 0.75f, true) == 0.f);
+        CHECK(h3_dit_extrapolation_ratio(10.f, 1.f, 0.9f, true) == 2.f);
+        CHECK(h3_dit_extrapolation_ratio(-10.f, 1.f, 0.9f, true) == -2.f);
+        const float last_v[2] = {1.f, 2.f};
+        const float prev_v[2] = {0.f, 1.f};
+        float out_v[2] = {0.f, 0.f};
+        h3_dit_extrapolate_velocity(out_v, last_v, prev_v, 2, 0.5f, 0.75f, 1.f, false);
+        CHECK(out_v[0] == 1.f && out_v[1] == 2.f);
+        h3_dit_extrapolate_velocity(out_v, last_v, prev_v, 2, 0.5f, 0.75f, 1.f, true);
+        CHECK_NEAR(out_v[0], 2.f, 1e-6);
+        CHECK_NEAR(out_v[1], 3.f, 1e-6);
     }
     {
         using namespace mvllm;

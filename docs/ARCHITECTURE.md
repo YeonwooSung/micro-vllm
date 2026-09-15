@@ -515,9 +515,13 @@ H3 INT8 linear (CPU): one F32 scale per output channel on W, one per row on
 X, `y = (w_sc[o]*x_sc[s])*dot_i32`.
 
 H3 AdaLN time embed (official two-SiLU MLP): `SiLU(W_out SiLU(W_in x+b)+b)`
-then per-block `W_adaln @ temb + b`. Serving reuse mask keeps step 0, the
-last step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
-`0,3,6,…` list). Token reduction pair-pools target video along W
+then per-block `W_adaln @ temb + b`. Serving reuse walks the full sigma
+grid (`h3_serving_schedule_build(steps)`). The mask keeps step 0, the last
+step, and every `reuse_interval` (`h3_dit_reuse_schedule`; optional
+`H3_REUSE_STEPS` / `MVLLM_H3_REUSE_STEPS` list `0,3,6,…`). Generate
+Euler-updates every step; skipped steps linearly extrapolate the last two
+velocities (ratio clamped to [-2, 2]). Default `denoise_reuse=1` evaluates
+every step. Token reduction pair-pools target video along W
 (`h3_token_reduce_*`; default blocks 4:30, early 10:40).
 
 MoE pick: unused-scan top-k; NaN scores never win (`moe_router_pick`
