@@ -13,6 +13,16 @@ namespace mvllm {
 int h3_align_frames(int frames);
 int h3_video_latent_t(int frames);
 int h3_encoder_latent_t(int frames);
+
+// Official generate range (h3.c h3_valid_params / h3_generate).
+constexpr int kH3MinRequestedFrames = 5;
+constexpr int kH3MaxAlignedFrames = 362;
+// Official decoder first chunk is 22 frames (latent_t=7). Generate refuses
+// a request that aligns below that. Synth VAE keeps the 5-frame T=2 path.
+constexpr int kH3MinGenerateAlignedFrames = 22;
+// requested < 5 or aligned > 362 is always invalid. official_decoder also
+// rejects aligned < 22. why, if set, receives a static official-style message.
+bool h3_generate_accepts_frames(int requested, bool official_decoder, const char **why = nullptr);
 void h3_latent_canvas(int width, int height, int spatial, int *lw, int *lh);
 
 struct H3VaeGeom {

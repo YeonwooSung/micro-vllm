@@ -80,7 +80,7 @@ struct GenResult {
 struct H3GenParams {
     int width = 864;
     int height = 480;
-    int frames = 56;
+    int frames = 56; // requested; generate aligns to 5+17k and emits that many
     int steps = 20;
     int dit_layers = 50;
     int denoise_reuse = 1;

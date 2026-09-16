@@ -135,6 +135,7 @@ Model directory, first match:
 ./scripts/run glm serve --port 8000
 ./scripts/run dsv4 info
 ./scripts/run h3 --prompt "a red fox" -o out.mp4 --width 864 --height 480 --frames 56
+# H3 --frames aligns up to 5+17k and emits that many (8→22, 56 stays 56).
 ./scripts/run k3 smoke
 ```
 

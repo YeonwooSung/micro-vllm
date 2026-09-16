@@ -26,6 +26,7 @@ void usage() {
         << "  micro-vllm mux      --model DIR [--kv-slots N]\n"
         << "  micro-vllm video    --model DIR --prompt TEXT [-o FILE]\n"
         << "                      [--width W] [--height H] [--frames N] [--seed S] [--audio PATH]\n"
+        << "                      (H3 --frames aligns up to 5+17k and emits that many; 8→22)\n"
         << "                      [--ref-image PATH]... [--first-frame PATH] [--last-frame PATH]\n"
         << "\n"
         << "Families: llama | kimi_k3 | glm53 | dsv4 | h3 | qwen36 | qwen38 | olmoe | inkling\n"

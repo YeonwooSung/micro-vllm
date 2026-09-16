@@ -357,8 +357,13 @@ one conditional DiT pass. T2VA / FL2VA prompt tails use the checkpoint
 tokenizer keeps the synth byte-id fallback (`text_ids=byte`). FL2VA/Ref2VA vision-span tags (0) plus language
 tags (1) feed AdaLN `row_map`. `MVLLM_H3_SKIP_TEXT` still swaps in the
 synth encoder for smoke hosts. Official VAE unpack writes RGB at `(f,y,x)` (`h3_vae_unpack_3072`).
-`--frames N` still runs the VAE on an aligned
-length (`h3_align_frames`) and then uniformly subsamples the RGB to N.
+`--frames N` aligns upward to `5+17k` (`h3_align_frames`, official
+`h3_align_frame_count`) and emits that many RGB frames. Official generate
+refuses a request whose aligned length is below 22 (one trained decoder
+chunk; `h3_align_frames(8)=22`, `latent_t=7`, `audio_t=37`). Synth VAE
+still accepts the 5-frame T=2 path. The old uniform subsample back to N
+is gone — it dropped 2–3 frames between outputs and read as
+identity/brightness flicker.
 `describe`/note report `sampler=euler|res`, `head=vel|tile`, `text_tokens=`,
 `text_tags=vision|lang`, `text=skip`, `latent_slimmed=`,
 and `dit` is `CUDA` only when every residual used the device kernels.

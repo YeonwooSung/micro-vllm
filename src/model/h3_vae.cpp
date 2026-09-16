@@ -1630,6 +1630,22 @@ int h3_align_frames(int frames) {
     return F;
 }
 
+bool h3_generate_accepts_frames(int requested, bool official_decoder, const char **why) {
+    if (requested < kH3MinRequestedFrames || h3_align_frames(requested) > kH3MaxAlignedFrames) {
+        if (why)
+            *why = "frames must align within the released 5..362 range";
+        return false;
+    }
+    if (official_decoder && h3_align_frames(requested) < kH3MinGenerateAlignedFrames) {
+        if (why)
+            *why = "generation requires at least one trained 22-frame decoder chunk";
+        return false;
+    }
+    if (why)
+        *why = nullptr;
+    return true;
+}
+
 int h3_video_latent_t(int frames) {
     const int F = h3_align_frames(frames);
     if (F <= 5)

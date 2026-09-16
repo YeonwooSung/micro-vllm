@@ -3987,6 +3987,16 @@ static void test_h3_checkpoint() {
     CHECK(hr.vae_used);
     CHECK(hr.frames == 5);
     CHECK(hr.width == 32 && hr.height == 32);
+    CHECK(hr.note.find("requested_frames=5") != std::string::npos);
+    CHECK(hr.note.find("aligned_frames=5") != std::string::npos);
+    {
+        H3GenParams bad = hp;
+        bad.frames = 4;
+        H3GenResult br;
+        std::string berr;
+        CHECK(eh.generate_video(bad, br, berr) == Status::InvalidArgument);
+        CHECK(berr.find("5..362") != std::string::npos);
+    }
 
     setenv("MVLLM_H3_CUDA_SDPA", "online", 1);
     hp.steps = 8;
@@ -3998,7 +4008,10 @@ static void test_h3_checkpoint() {
     CHECK(eh.generate_video(hp, hr2, err) == Status::Ok);
     CHECK(hr2.steps_run == 8);
     CHECK(hr2.width == 256 && hr2.height == 256);
-    CHECK(hr2.frames == 8);
+    // Official emit: request 8 aligns to 22 (VAE first chunk).
+    CHECK(hr2.frames == 22);
+    CHECK(hr2.note.find("requested_frames=8") != std::string::npos);
+    CHECK(hr2.note.find("aligned_frames=22") != std::string::npos);
     CHECK(hr2.note.find("sdpa=online") != std::string::npos);
     CHECK(hr2.note.find("sampler=res") != std::string::npos);
     // 256x256 / 16 spatial, VAE align 22 → latent 7x16x16, 2x2 patch = 448.
@@ -5274,11 +5287,33 @@ static void test_h3_vae() {
     CHECK(h3_align_frames(1) == 5);
     CHECK(h3_align_frames(5) == 5);
     CHECK(h3_align_frames(6) == 22);
+    CHECK(h3_align_frames(8) == 22);
+    CHECK(h3_align_frames(22) == 22);
+    CHECK(h3_align_frames(23) == 39);
     CHECK(h3_align_frames(56) == 56);
+    CHECK(h3_align_frames(361) == 362);
+    CHECK(h3_align_frames(362) == 362);
     CHECK(h3_video_latent_t(5) == 2);
+    CHECK(h3_video_latent_t(8) == 7);
     CHECK(h3_video_latent_t(22) == 7);
+    CHECK(h3_video_latent_t(23) == 12);
     CHECK(h3_video_latent_t(56) == 17);
     CHECK(h3_encoder_latent_t(56) == 14);
+    CHECK(h3_encoder_latent_t(22) == 6);
+    {
+        const char *why = nullptr;
+        CHECK(!h3_generate_accepts_frames(4, false, &why));
+        CHECK(why && std::strstr(why, "5..362"));
+        CHECK(h3_generate_accepts_frames(5, false, &why));
+        CHECK(why == nullptr);
+        CHECK(!h3_generate_accepts_frames(5, true, &why));
+        CHECK(why && std::strstr(why, "22-frame"));
+        CHECK(h3_generate_accepts_frames(8, true, &why));
+        CHECK(why == nullptr);
+        CHECK(h3_generate_accepts_frames(22, true, &why));
+        CHECK(!h3_generate_accepts_frames(363, false, &why));
+        CHECK(why && std::strstr(why, "5..362"));
+    }
     int lw = 0, lh = 0;
     h3_latent_canvas(864, 480, 16, &lw, &lh);
     CHECK(lw == 54 && lh == 30);
@@ -5898,6 +5933,8 @@ int main() {
     {
         using namespace mvllm;
         CHECK(h3_audio_t(5) == 8);
+        CHECK(h3_audio_t(8) == 37);
+        CHECK(h3_audio_t(22) == 37);
         CHECK(h3_audio_t(56) == 93);
         CHECK(h3_audio_pad_samples(1) == 800);
         CHECK(h3_audio_pad_samples(800) == 800);

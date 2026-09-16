@@ -337,6 +337,11 @@ public:
         const int req_w = hp.width > 0 ? hp.width : cfg_.h3.default_width;
         const int req_h = hp.height > 0 ? hp.height : cfg_.h3.default_height;
         const int req_f = hp.frames > 0 ? hp.frames : cfg_.h3.default_frames;
+        const char *frame_why = nullptr;
+        if (!h3_generate_accepts_frames(req_f, vae_.official_decode, &frame_why)) {
+            err = frame_why ? frame_why : "invalid frames";
+            return Status::InvalidArgument;
+        }
         H3VaeGeom vg = h3_vae_geom(req_w, req_h, req_f, cfg_.h3.vae_spatial, cfg_.h3.vae_latent_ch);
         const int C = vg.latent_ch > 0 ? vg.latent_ch : 24;
         const int nlat = std::max(vg.latent_t * vg.latent_h * vg.latent_w, 1);
@@ -1332,19 +1337,10 @@ public:
 
         std::vector<float> rgb(static_cast<size_t>(vg.frames) * vg.height * vg.width * 3, 0.f);
         vae_.decode(z.data(), vg, rgb.data());
-        int out_frames = vg.frames;
-        if (hp.frames > 0 && hp.frames < vg.frames) {
-            const int want = hp.frames;
-            const size_t fpix = static_cast<size_t>(vg.height) * vg.width * 3;
-            std::vector<float> slim(static_cast<size_t>(want) * fpix);
-            for (int i = 0; i < want; ++i) {
-                const int src = i * vg.frames / want;
-                std::memcpy(slim.data() + static_cast<size_t>(i) * fpix,
-                            rgb.data() + static_cast<size_t>(src) * fpix, fpix * sizeof(float));
-            }
-            rgb.swap(slim);
-            out_frames = want;
-        }
+        // Official generate emits the aligned 5+17k length (8 → 22). The old
+        // uniform subsample back to the request dropped 2–3 frames between
+        // outputs and read as identity/brightness flicker.
+        const int out_frames = vg.frames;
         if (hp.on_progress)
             hp.on_progress(steps, steps, "vae");
         vae_.geom = vg;
@@ -1467,6 +1463,8 @@ public:
                         : " refiner=off";
         out.note += " text_tokens=" + std::to_string(text_tokens);
         out.note += h3_tok_.loaded() ? " text_ids=bpe" : " text_ids=byte";
+        out.note += " requested_frames=" + std::to_string(req_f);
+        out.note += " aligned_frames=" + std::to_string(vg.frames);
         if (text_tokens > 0) {
             const char *skip = std::getenv("MVLLM_H3_SKIP_TEXT");
             if (skip && skip[0] && skip[0] != '0')
