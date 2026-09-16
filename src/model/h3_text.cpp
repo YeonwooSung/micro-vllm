@@ -1,4 +1,5 @@
 #include "h3_text.hpp"
+#include "../tok/tokenizer.hpp"
 #include "family.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/h3_cuda.hpp"
@@ -76,6 +77,22 @@ void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<i
         ids.push_back(1 + static_cast<int>(c) % (vocab - 1));
     if (max_tokens > 0 && static_cast<int>(ids.size()) > max_tokens)
         ids.resize(static_cast<size_t>(max_tokens));
+}
+
+bool h3_prompt_token_ids(const Tokenizer *tok, const std::string &prompt, int vocab,
+                         std::vector<int> &ids, int max_tokens, bool pad_empty) {
+    ids.clear();
+    if (tok && tok->loaded()) {
+        if (tok->encode(prompt, ids) != Status::Ok)
+            return false;
+        if (ids.empty() && pad_empty)
+            ids.push_back(kH3PadTokenId);
+        if (max_tokens > 0 && static_cast<int>(ids.size()) > max_tokens)
+            ids.resize(static_cast<size_t>(max_tokens));
+        return true;
+    }
+    h3_text_ids_from_prompt(prompt, vocab, ids, max_tokens);
+    return true;
 }
 
 void H3TextEncoder::release_embed() {

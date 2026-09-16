@@ -12,6 +12,7 @@
 #include "h3_vae.hpp"
 #include "h3_tok.hpp"
 #include "h3_vision.hpp"
+#include "../tok/tokenizer.hpp"
 #include "../gpu/backend.hpp"
 #include "../gpu/h3_cuda.hpp"
 #include "../gpu/metal_h3.hpp"
@@ -501,10 +502,12 @@ public:
                         pres[i].vision_count = 1;
                     }
                     mm_ok = h3_mm_build_ref2va(hp.prompt, pres.data(), static_cast<int>(pres.size()),
-                                               nullptr, text_.config().vocab, seq);
+                                               h3_tok_.loaded() ? &h3_tok_ : nullptr,
+                                               text_.config().vocab, seq);
                 } else if (mm_ok) {
                     mm_ok = h3_mm_build_fl2va(hp.prompt, vouts.data(), static_cast<int>(vouts.size()),
-                                              nullptr, text_.config().vocab, seq);
+                                              h3_tok_.loaded() ? &h3_tok_ : nullptr,
+                                              text_.config().vocab, seq);
                 }
                 if (mm_ok && !seq.ids.empty()) {
                     text_.encode_mm(seq.ids, seq.spans.empty() ? nullptr : seq.spans.data(),
@@ -517,7 +520,10 @@ public:
             }
             if (th.empty()) {
                 std::vector<int> tids;
-                h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, text_cap);
+                const Tokenizer *tok = h3_tok_.loaded() ? &h3_tok_ : nullptr;
+                if (!h3_prompt_token_ids(tok, hp.prompt, text_.config().vocab, tids, text_cap,
+                                         true))
+                    h3_text_ids_from_prompt(hp.prompt, text_.config().vocab, tids, text_cap);
                 text_.encode(tids, th);
                 text_tags.clear();
             }
@@ -1460,6 +1466,7 @@ public:
                         ? " refiner=on"
                         : " refiner=off";
         out.note += " text_tokens=" + std::to_string(text_tokens);
+        out.note += h3_tok_.loaded() ? " text_ids=bpe" : " text_ids=byte";
         if (text_tokens > 0) {
             const char *skip = std::getenv("MVLLM_H3_SKIP_TEXT");
             if (skip && skip[0] && skip[0] != '0')

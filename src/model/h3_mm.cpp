@@ -11,12 +11,8 @@ namespace {
 bool tokenize_append(const Tokenizer *tok, const std::string &text, int vocab,
                      std::vector<int> &ids) {
     std::vector<int> tmp;
-    if (tok && tok->loaded()) {
-        if (tok->encode(text, tmp) != Status::Ok)
-            return false;
-    } else {
-        h3_text_ids_from_prompt(text, vocab, tmp);
-    }
+    if (!h3_prompt_token_ids(tok, text, vocab, tmp, 0, false))
+        return false;
     ids.insert(ids.end(), tmp.begin(), tmp.end());
     return true;
 }

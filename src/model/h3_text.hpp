@@ -92,8 +92,18 @@ private:
     io::StHit embed_hit_;
 };
 
+class Tokenizer;
+
+// Official T2VA empty-prompt pad (`H3_PAD_TOKEN_ID`).
+constexpr int kH3PadTokenId = 151643;
+
 // max_tokens<=0 keeps the full prompt (official). A positive cap keeps a prefix.
 void h3_text_ids_from_prompt(const std::string &prompt, int vocab, std::vector<int> &ids,
                             int max_tokens = 0);
+
+// Official T2VA uses the FL2VA/Ref2VA tokenizer.json (`pad_empty=1`).
+// Multimodal prompt tails use `pad_empty=0`. No tokenizer → byte fallback.
+bool h3_prompt_token_ids(const Tokenizer *tok, const std::string &prompt, int vocab,
+                         std::vector<int> &ids, int max_tokens = 0, bool pad_empty = false);
 
 } // namespace mvllm

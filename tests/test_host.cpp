@@ -6045,6 +6045,28 @@ int main() {
         CHECK(static_cast<int>(full.size()) == 80);
         h3_text_ids_from_prompt(longp, enc.config().vocab, slim, 16);
         CHECK(static_cast<int>(slim.size()) == 16);
+        std::vector<int> via_helper;
+        CHECK(h3_prompt_token_ids(nullptr, "a red fox", enc.config().vocab, via_helper));
+        CHECK(via_helper == ids);
+        std::string tdir = tmpdir();
+        write_file(tdir + "/tokenizer.json",
+                   R"({"model":{"type":"BPE","vocab":{"a":7},"merges":[]}})");
+        Tokenizer bpe;
+        std::string berr;
+        CHECK(bpe.load(tdir, berr) == Status::Ok);
+        CHECK(bpe.loaded());
+        std::vector<int> bpe_ids;
+        CHECK(h3_prompt_token_ids(&bpe, "a", 256, bpe_ids));
+        CHECK(bpe_ids.size() == 1);
+        CHECK(bpe_ids[0] == 7);
+        CHECK(bpe_ids != ids);
+        std::vector<int> pad_ids;
+        CHECK(h3_prompt_token_ids(&bpe, "", 256, pad_ids, 0, true));
+        CHECK(pad_ids.size() == 1);
+        CHECK(pad_ids[0] == kH3PadTokenId);
+        std::vector<int> nopad;
+        CHECK(h3_prompt_token_ids(&bpe, "", 256, nopad, 0, false));
+        CHECK(nopad.empty());
         std::vector<float> hid;
         enc.encode(ids, hid);
         CHECK(static_cast<int>(hid.size()) == static_cast<int>(ids.size()) * enc.config().hidden);

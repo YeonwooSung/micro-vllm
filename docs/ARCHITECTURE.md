@@ -351,7 +351,10 @@ Default is the full 2×2 patch grid (`MVLLM_H3_LATENT_CAP` unset or `0`);
 a positive cap keeps a spatial prefix so unpatchify still writes a
 contiguous latent block. Official 864×480 is 6885 tokens. Text tokens
 are uncapped by default (`MVLLM_H3_TEXT_CAP` unset or `0`); a positive
-cap keeps a prefix. FL2VA/Ref2VA vision-span tags (0) plus language
+cap keeps a prefix. Official generate has no classifier-free guidance:
+one conditional DiT pass. T2VA / FL2VA prompt tails use the checkpoint
+`tokenizer.json` (`text_ids=bpe`, T2VA `pad_empty` → id 151643). Missing
+tokenizer keeps the synth byte-id fallback (`text_ids=byte`). FL2VA/Ref2VA vision-span tags (0) plus language
 tags (1) feed AdaLN `row_map`. `MVLLM_H3_SKIP_TEXT` still swaps in the
 synth encoder for smoke hosts. Official VAE unpack writes RGB at `(f,y,x)` (`h3_vae_unpack_3072`).
 `--frames N` still runs the VAE on an aligned
