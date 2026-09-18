@@ -5390,6 +5390,26 @@ static void test_h3_vae() {
     CHECK(h3_vae_decoded_t(1, 5) == 4);
     CHECK(h3_vae_decoded_t(17, kH3VaeFirstChunkFrames) == 17 + kH3VaeFrameOffset + 3);
     CHECK(h3_vae_decoded_t(16, kH3VaeFirstChunkFrames) == 16 + kH3VaeFrameOffset);
+    // Official first-chunk table (h3_video_vae.c unpack_frame_range):
+    // frames 0..16 → decoded_t = frame+3 (slots 3..19);
+    // frames 17..21 → decoded_t = frame+6 (slots 23..27). Skips 20..22
+    // so the overlap tail reads latent t=5..6 and matches the next
+    // chunk's start (local slot 3). 1-based f16–17 is still patch 4;
+    // the +3 skip is 1-based f17–18.
+    const int kOff22[] = {3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13,
+                          14, 15, 16, 17, 18, 19, 23, 24, 25, 26, 27};
+    for (int f = 0; f < kH3VaeFirstChunkFrames; ++f) {
+        CHECK(h3_vae_decoded_t(f, 5) == f + kH3VaeFrameOffset);
+        CHECK(h3_vae_decoded_t(f, kH3VaeFirstChunkFrames) == kOff22[f]);
+        int pt = -1, wt = -1;
+        h3_vae_unpack_slot(f, kH3VaeFirstChunkFrames, &pt, &wt);
+        CHECK(pt == kOff22[f] / 4);
+        CHECK(wt == kOff22[f] % 4);
+    }
+    CHECK(h3_vae_decoded_t(16, kH3VaeFirstChunkFrames) / 4 == 4);
+    CHECK(h3_vae_decoded_t(16, kH3VaeFirstChunkFrames) % 4 == 3);
+    CHECK(h3_vae_decoded_t(17, kH3VaeFirstChunkFrames) / 4 == 5);
+    CHECK(h3_vae_decoded_t(17, kH3VaeFirstChunkFrames) % 4 == 3);
     CHECK(h3_vae_tile_count(32) == 1);
     CHECK(h3_vae_tile_count(480) > 1);
     CHECK(h3_vae_tile_count(864) > 1);
@@ -5425,6 +5445,35 @@ static void test_h3_vae() {
         if (at(u3, 0, 0, x, 0) + at(u3, 0, 0, x, 1) + at(u3, 0, 0, x, 2) > 0.f)
             ++interior;
     CHECK(interior == 31);
+
+    // Tag each (patch_t, within_t) at pixel (0,0) and check the 22-frame
+    // first-chunk unpack reads official slots, including the +3 skip.
+    {
+        std::vector<float> tagged(static_cast<size_t>(pad_t) * olh * olw * P, 0.f);
+        auto mark = [&](int pt, int wt) {
+            const int ti = pt * olh * olw;
+            const int comp = ((0 * 4 + wt) * 16 + 0) * 16 + 0;
+            tagged[static_cast<size_t>(ti) * P + static_cast<size_t>(comp)] =
+                static_cast<float>(pt * 4 + wt + 1) / 32.f;
+        };
+        for (int pt = 0; pt < pad_t; ++pt)
+            for (int wt = 0; wt < 4; ++wt)
+                mark(pt, wt);
+        std::vector<float> u22(static_cast<size_t>(kH3VaeFirstChunkFrames) * 32 * 32 * 3, 0.f);
+        h3_vae_unpack_3072(tagged.data(), pad_t, olh, olw, kH3VaeFirstChunkFrames, 32, 32, im, is,
+                           kH3VaeFrameOffset, u22.data());
+        auto at22 = [&](int f) {
+            return u22[static_cast<size_t>(f) * 32 * 32 * 3];
+        };
+        for (int f = 0; f < kH3VaeFirstChunkFrames; ++f) {
+            const int expect = kOff22[f];
+            const float want = static_cast<float>(expect + 1) / 32.f;
+            CHECK(std::fabs(at22(f) - want) < 1e-6f);
+        }
+        // Without +3, frame 17 would read slot 20 (patch 5 wt 0).
+        CHECK(std::fabs(at22(17) - (23.f + 1.f) / 32.f) < 1e-6f);
+        CHECK(std::fabs(at22(17) - (20.f + 1.f) / 32.f) > 1e-6f);
+    }
 
     std::string odir = tmpdir();
     const int hid = 64;

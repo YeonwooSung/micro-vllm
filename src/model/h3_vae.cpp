@@ -762,6 +762,10 @@ void mix_decode(const float *z_raw, const H3VaeGeom &g, const float *A, const fl
     }
 }
 
+void official_unpack_3072(const float *rows, int pad_t, int lh, int lw, int frames, int height,
+                          int width, const float *im_mean, const float *im_std, int frame_offset,
+                          int output_frames, float *rgb);
+
 void unpatch_proj(const float *tok, int N, int hid, const float *proj_w, const float *proj_b, int P,
                   const H3VaeGeom &g, const float *im_mean, const float *im_std, bool official3072,
                   float *rgb) {
@@ -781,24 +785,8 @@ void unpatch_proj(const float *tok, int N, int hid, const float *proj_w, const f
     };
 
     if (official3072 && P >= 3072) {
-        for (int f = 0; f < F; ++f) {
-            const int lt = clampi(f / 4, 0, T - 1);
-            const int wt = f % 4;
-            for (int y = 0; y < H; ++y) {
-                const int ly = clampi(y / 16, 0, lh - 1);
-                const int y0 = y % 16;
-                for (int x = 0; x < W; ++x) {
-                    const int lx = clampi(x / 16, 0, lw - 1);
-                    const int x0 = x % 16;
-                    const int ti = lt * lh * lw + ly * lw + lx;
-                    float *pix = rgb + ((static_cast<size_t>(f) * H + y) * W + x) * 3;
-                    for (int c = 0; c < 3; ++c) {
-                        const int comp = ((c * 4 + wt) * 16 + y0) * 16 + x0;
-                        pix[c] = denorm(patch[static_cast<size_t>(ti) * P + comp], c);
-                    }
-                }
-            }
-        }
+        official_unpack_3072(patch.data(), T, lh, lw, F, H, W, im_mean, im_std, kH3VaeFrameOffset, F,
+                             rgb);
         return;
     }
 
@@ -918,9 +906,8 @@ void official_unpack_3072(const float *rows, int pad_t, int lh, int lw, int fram
     const int P = kH3VaeOutPatch;
     const int patches = pad_t * lh * lw;
     for (int f = 0; f < frames; ++f) {
-        int decoded_t = h3_vae_decoded_t(f, output_frames, frame_offset);
-        int patch_t = decoded_t / 4;
-        int within_t = decoded_t % 4;
+        int patch_t = 0, within_t = 0;
+        h3_vae_unpack_slot(f, output_frames, &patch_t, &within_t, frame_offset);
         if (patch_t < 0)
             patch_t = 0;
         if (patch_t >= pad_t)
@@ -1678,6 +1665,14 @@ int h3_vae_decoded_t(int frame, int output_frames, int offset) {
     if (output_frames == kH3VaeFirstChunkFrames && frame >= 17)
         decoded_t += 3;
     return decoded_t;
+}
+
+void h3_vae_unpack_slot(int frame, int output_frames, int *patch_t, int *within_t, int offset) {
+    const int decoded_t = h3_vae_decoded_t(frame, output_frames, offset);
+    if (patch_t)
+        *patch_t = decoded_t / 4;
+    if (within_t)
+        *within_t = decoded_t % 4;
 }
 
 int h3_vae_tile_count(int pixel_extent, int tile_pixels) {

@@ -49,9 +49,16 @@ constexpr int kH3VaeTileOverlap = 64;
 constexpr int kH3VaeRopeHalf = 24;
 constexpr int kH3VaeOutPatch = 3072; // 3 * 4 * 16 * 16
 
-// decoded_t used to index 3072-d patches. first-chunk extra +3 when
-// output_frames==22 and frame>=17.
+// decoded_t used to index 3072-d patches. Official unpack_frame_range:
+// decoded_t = frame + offset (3), then +3 more when output_frames==22
+// and frame>=17 so the overlap tail (17..21) reads latent t=5..6 and
+// lines up with the next chunk's start (local slot 3).
 int h3_vae_decoded_t(int frame, int output_frames, int offset = kH3VaeFrameOffset);
+// patch_t = decoded_t/4, within_t = decoded_t%4. Official first-chunk
+// table: frames 0..16 → slots 3..19; frames 17..21 → slots 23..27
+// (skips 20..22 = patch 5 wt 0..2).
+void h3_vae_unpack_slot(int frame, int output_frames, int *patch_t, int *within_t,
+                        int offset = kH3VaeFrameOffset);
 int h3_vae_tile_count(int pixel_extent, int tile_pixels = kH3VaeTilePixels);
 // rows are [T*H*W, 3072] patch-major (registers not included).
 void h3_vae_unpack_3072(const float *rows, int latent_t, int latent_h, int latent_w, int frames,

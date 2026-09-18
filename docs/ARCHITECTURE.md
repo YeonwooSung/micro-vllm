@@ -357,6 +357,12 @@ one conditional DiT pass. T2VA / FL2VA prompt tails use the checkpoint
 tokenizer keeps the synth byte-id fallback (`text_ids=byte`). FL2VA/Ref2VA vision-span tags (0) plus language
 tags (1) feed AdaLN `row_map`. `MVLLM_H3_SKIP_TEXT` still swaps in the
 synth encoder for smoke hosts. Official VAE unpack writes RGB at `(f,y,x)` (`h3_vae_unpack_3072`).
+First-chunk (`output_frames==22`) uses `decoded_t=frame+3`, then
+`decoded_t+=3` when `frame>=17` so the overlap tail reads latent t=5–6
+and lines up with the next chunk's start (local slot 3). Slots 20–22
+(patch 5 wt 0–2) are skipped; 1-based f16–17 is still inside patch 4,
+the +3 skip is 1-based f17–18. The transformer fallback
+(`unpatch_proj`) uses the same table, not `f/4`.
 `--frames N` aligns upward to `5+17k` (`h3_align_frames`, official
 `h3_align_frame_count`) and emits that many RGB frames. Official generate
 refuses a request whose aligned length is below 22 (one trained decoder
