@@ -19,6 +19,7 @@
 #include "../gpu/official_metal.hpp"
 #include "../gpu/vk_ops.hpp"
 #include "../io/av_mux.hpp"
+#include "../io/h3_resize.hpp"
 #include "../io/image.hpp"
 #include "../io/safetensors.hpp"
 #include "../quant/quant.hpp"
@@ -66,27 +67,6 @@ bool load_rgb(const std::string &path, const float *rgb, int w, int h, LoadedRgb
         return false;
     std::string e;
     return decode_image_url(path, out.rgb, out.w, out.h, e) == Status::Ok && out.w > 0 && out.h > 0;
-}
-
-void resize_nearest(const float *src, int sh, int sw, int dh, int dw, std::vector<float> &dst) {
-    dst.assign(static_cast<size_t>(std::max(dh, 0)) * static_cast<size_t>(std::max(dw, 0)) * 3, 0.f);
-    if (!src || sh < 1 || sw < 1 || dh < 1 || dw < 1)
-        return;
-    for (int y = 0; y < dh; ++y) {
-        int sy = static_cast<int>(static_cast<int64_t>(y) * sh / dh);
-        if (sy >= sh)
-            sy = sh - 1;
-        for (int x = 0; x < dw; ++x) {
-            int sx = static_cast<int>(static_cast<int64_t>(x) * sw / dw);
-            if (sx >= sw)
-                sx = sw - 1;
-            const float *s = src + (static_cast<size_t>(sy) * sw + sx) * 3;
-            float *d = dst.data() + (static_cast<size_t>(y) * dw + x) * 3;
-            d[0] = s[0];
-            d[1] = s[1];
-            d[2] = s[2];
-        }
-    }
 }
 
 void fit_multiple32(const float *src, int sh, int sw, std::vector<float> &dst, int &oh, int &ow) {
@@ -343,6 +323,19 @@ public:
             return Status::InvalidArgument;
         }
         H3VaeGeom vg = h3_vae_geom(req_w, req_h, req_f, cfg_.h3.vae_spatial, cfg_.h3.vae_latent_ch);
+        if (want_fl) {
+            for (size_t i = 0; i < fl_imgs.size(); ++i) {
+                LoadedRgb &im = fl_imgs[i];
+                const bool last = have_last && (i + 1 == fl_imgs.size());
+                const H3ImageFit fit = last ? H3ImageFit::Cover : H3ImageFit::Stretch;
+                std::vector<float> fitted;
+                if (h3_fit_rgb_f32(im.rgb.data(), im.h, im.w, vg.height, vg.width, fit, fitted)) {
+                    im.rgb.swap(fitted);
+                    im.h = vg.height;
+                    im.w = vg.width;
+                }
+            }
+        }
         const int C = vg.latent_ch > 0 ? vg.latent_ch : 24;
         const int nlat = std::max(vg.latent_t * vg.latent_h * vg.latent_w, 1);
         const int64_t zN = static_cast<int64_t>(C) * nlat;
@@ -637,7 +630,13 @@ public:
                 if (want_fl) {
                     eh = vg.height;
                     ew = vg.width;
-                    resize_nearest(im.rgb.data(), im.h, im.w, eh, ew, ergb);
+                    ergb = im.rgb;
+                    if (im.h != eh || im.w != ew) {
+                        const bool last = have_last && (i + 1 == cond_src->size());
+                        if (!h3_fit_rgb_f32(im.rgb.data(), im.h, im.w, eh, ew,
+                                            last ? H3ImageFit::Cover : H3ImageFit::Stretch, ergb))
+                            pack_ok = false;
+                    }
                 } else {
                     fit_multiple32(im.rgb.data(), im.h, im.w, ergb, eh, ew);
                 }

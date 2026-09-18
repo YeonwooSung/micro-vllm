@@ -5410,6 +5410,20 @@ static void test_h3_vae() {
     CHECK(h3_vae_decoded_t(16, kH3VaeFirstChunkFrames) % 4 == 3);
     CHECK(h3_vae_decoded_t(17, kH3VaeFirstChunkFrames) / 4 == 5);
     CHECK(h3_vae_decoded_t(17, kH3VaeFirstChunkFrames) % 4 == 3);
+    // Official RoPE kFramePerToken {1,4,4,4,4} matches first-chunk used
+    // slots per latent t (t=0 and t=5 are the 1-frame groups).
+    {
+        int used[7] = {};
+        for (int f = 0; f < kH3VaeFirstChunkFrames; ++f) {
+            int pt = -1, wt = -1;
+            h3_vae_unpack_slot(f, kH3VaeFirstChunkFrames, &pt, &wt);
+            CHECK(pt >= 0 && pt < 7);
+            ++used[pt];
+        }
+        const int kPerTok[] = {1, 4, 4, 4, 4, 1, 4};
+        for (int t = 0; t < 7; ++t)
+            CHECK(used[t] == kPerTok[t]);
+    }
     CHECK(h3_vae_tile_count(32) == 1);
     CHECK(h3_vae_tile_count(480) > 1);
     CHECK(h3_vae_tile_count(864) > 1);
@@ -7871,6 +7885,25 @@ int main() {
         CHECK(h3_resize_rgb_f32(fab, 1, 2, 2, 4, 4, fup, err) == Status::Ok);
         CHECK_NEAR(fup[3], 0.25, 1e-5);
         CHECK_NEAR(fup[6], 0.75, 1e-5);
+
+        // Official FL2VA: first=stretch, last=cover.
+        std::vector<float> wide(static_cast<size_t>(2) * 4 * 3, 0.f);
+        for (int x = 0; x < 4; ++x)
+            wide[static_cast<size_t>(x) * 3] = static_cast<float>(x);
+        std::vector<float> stretch, cover;
+        CHECK(h3_fit_rgb_f32(wide.data(), 2, 4, 2, 2, H3ImageFit::Stretch, stretch));
+        CHECK(h3_fit_rgb_f32(wide.data(), 2, 4, 2, 2, H3ImageFit::Cover, cover));
+        CHECK(stretch.size() == 2 * 2 * 3);
+        CHECK(cover.size() == 2 * 2 * 3);
+        CHECK(std::fabs(stretch[0] - cover[0]) > 1e-5f);
+        CHECK_NEAR(cover[0], 1.f, 1e-5); // center-crop drops the left column
+        CHECK_NEAR(cover[3], 2.f, 1e-5);
+        std::vector<float> same;
+        CHECK(h3_fit_rgb_f32(wide.data(), 2, 4, 2, 4, H3ImageFit::Cover, same));
+        CHECK(same.size() == wide.size());
+        for (size_t i = 0; i < wide.size(); ++i)
+            CHECK_NEAR(same[i], wide[i], 1e-6);
+        CHECK(!h3_fit_rgb_f32(nullptr, 2, 4, 2, 2, H3ImageFit::Stretch, stretch));
     }
     {
         using namespace mvllm;

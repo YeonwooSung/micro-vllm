@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <limits>
 #include <new>
 
@@ -183,6 +184,41 @@ Status h3_resize_rgb_f32(const float *input, int frames, int in_w, int in_h, int
                          out.data() + static_cast<size_t>(f) * out_frame, out_w, out_h);
     }
     return Status::Ok;
+}
+
+bool h3_fit_rgb_f32(const float *src, int src_h, int src_w, int dst_h, int dst_w, H3ImageFit fit,
+                    std::vector<float> &dst) {
+    dst.clear();
+    if (!src || src_h < 1 || src_w < 1 || dst_h < 1 || dst_w < 1)
+        return false;
+    std::string err;
+    if (fit == H3ImageFit::Stretch)
+        return h3_resize_rgb_f32(src, 1, src_w, src_h, dst_w, dst_h, dst, err) == Status::Ok;
+
+    const double scale =
+        std::max(static_cast<double>(dst_w) / static_cast<double>(src_w),
+                 static_cast<double>(dst_h) / static_cast<double>(src_h));
+    int mid_w = static_cast<int>(std::lround(static_cast<double>(src_w) * scale));
+    int mid_h = static_cast<int>(std::lround(static_cast<double>(src_h) * scale));
+    if (mid_w < dst_w)
+        mid_w = dst_w;
+    if (mid_h < dst_h)
+        mid_h = dst_h;
+    std::vector<float> mid;
+    if (h3_resize_rgb_f32(src, 1, src_w, src_h, mid_w, mid_h, mid, err) != Status::Ok)
+        return false;
+    dst.assign(static_cast<size_t>(dst_h) * static_cast<size_t>(dst_w) * 3, 0.f);
+    const int x0 = (mid_w - dst_w) / 2;
+    const int y0 = (mid_h - dst_h) / 2;
+    for (int y = 0; y < dst_h; ++y) {
+        const float *srow =
+            mid.data() + (static_cast<size_t>(y + y0) * static_cast<size_t>(mid_w) +
+                          static_cast<size_t>(x0)) *
+                             3;
+        float *drow = dst.data() + static_cast<size_t>(y) * static_cast<size_t>(dst_w) * 3;
+        std::memcpy(drow, srow, static_cast<size_t>(dst_w) * 3 * sizeof(float));
+    }
+    return true;
 }
 
 } // namespace mvllm

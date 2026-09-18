@@ -362,7 +362,14 @@ First-chunk (`output_frames==22`) uses `decoded_t=frame+3`, then
 and lines up with the next chunk's start (local slot 3). Slots 20–22
 (patch 5 wt 0–2) are skipped; 1-based f16–17 is still inside patch 4,
 the +3 skip is 1-based f17–18. The transformer fallback
-(`unpatch_proj`) uses the same table, not `f/4`.
+(`unpatch_proj`) uses the same table, not `f/4`. Those used slots are
+`{1,4,4,4,4,1,4}` per latent t — the same cycle as DiT RoPE
+`kFramePerToken`. Mid-clip brightness pops on T2VA / first≠last sit on
+patch boundaries and the t=5 1-frame group; first=last pins the time
+axis and drops those MAEs, so they are unpinned DiT/sampler, not unpack.
+Official FL2VA reads `first_frame` with stretch and `last_frame` with
+cover (`h3_fit_rgb_f32`); both Qwen vision and the cond VAE see that
+render-sized canvas (not a nearest-neighbor stretch of the source).
 `--frames N` aligns upward to `5+17k` (`h3_align_frames`, official
 `h3_align_frame_count`) and emits that many RGB frames. Official generate
 refuses a request whose aligned length is below 22 (one trained decoder
